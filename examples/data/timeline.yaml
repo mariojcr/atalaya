@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# The timeline: metric lanes below the events and logs.
+#   lanes      title (single or {en, es}), PromQL (one series) and unit
+#   log_lanes  services with a log lane; without a list, the six with the most lines
+lanes:
+  - { title: { en: "CPU (%)", es: "CPU (%)" }, query: '100 * (1 - avg(rate(node_cpu_seconds_total{job="node-exporter",mode="idle"}[5m])))', unit: percent }
+  - { title: { en: "Memory (%)", es: "Memoria (%)" }, query: '100 * (1 - sum(node_memory_MemAvailable_bytes{job="node-exporter"}) / sum(node_memory_MemTotal_bytes{job="node-exporter"}))', unit: percent }

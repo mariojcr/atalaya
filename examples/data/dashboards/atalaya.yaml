@@ -1,0 +1,241 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# atalaya's own dashboard: the collector on each node and ClickHouse, where everything is stored.
+title: Atalaya
+description: The collector on each node (scraping, sending and disk spool) and the ClickHouse that stores it all.
+refresh: 1m
+time: 6h
+variables:
+  - name: node
+    label: Node
+    query: label_values(atalaya_collector_points_total, instance)
+    multi: true
+    includeAll: true
+    sort: 1
+sections:
+  - title: Collector
+    widgets:
+      - title: Targets scraped
+        description: Targets that answered the last scrape, across all selected nodes.
+        type: stat
+        grid: [0, 0, 4, 4]
+        unit: none
+        stat: {graph: area}
+        queries:
+          - expr: sum(up{instance=~"$node"})
+      - title: Targets down
+        description: Targets that did not answer the last scrape.
+        type: stat
+        grid: [4, 0, 4, 4]
+        unit: none
+        color: thresholds
+        thresholds: {steps: [[null, green], [1, red]]}
+        stat: {colorMode: background}
+        queries:
+          - expr: count(up{instance=~"$node"} == 0) or vector(0)
+      - title: Points per second
+        description: Values scraped and sent to ClickHouse.
+        type: stat
+        grid: [8, 0, 4, 4]
+        unit: short
+        stat: {graph: area}
+        queries:
+          - expr: sum(rate(atalaya_collector_points_total{instance=~"$node"}[$__rate_interval]))
+      - title: Log lines per second
+        type: stat
+        grid: [12, 0, 4, 4]
+        unit: short
+        stat: {graph: area}
+        queries:
+          - expr: sum(rate(atalaya_collector_log_lines_total{instance=~"$node"}[$__rate_interval]))
+      - title: Send errors
+        description: Failed sends to ClickHouse in the range (failed batches go to the disk spool and are retried).
+        type: stat
+        grid: [16, 0, 4, 4]
+        unit: none
+        decimals: 0
+        color: thresholds
+        thresholds: {steps: [[null, green], [1, orange]]}
+        queries:
+          - expr: sum(increase(atalaya_collector_send_errors_total{instance=~"$node"}[$__range]))
+      - title: Disk spool
+        description: Data waiting to be sent. Should be zero; if it grows, ClickHouse is not accepting writes.
+        type: stat
+        grid: [20, 0, 4, 4]
+        unit: bytes
+        color: thresholds
+        thresholds: {steps: [[null, green], [1, orange], [104857600, red]]}
+        queries:
+          - expr: sum(atalaya_collector_spool_bytes{instance=~"$node"})
+      - title: Target status
+        description: Whether each target answered (green) or not (red) on each scrape.
+        type: timeline
+        grid: [0, 4, 24, 8]
+        mappings:
+          - {value: "1", text: Up, color: green}
+          - {value: "0", text: Down, color: red}
+        queries:
+          - expr: up{instance=~"$node"}
+            legend: "{{instance}} · {{job}}"
+      - title: Points scraped per node
+        type: timeseries
+        grid: [0, 12, 12, 8]
+        unit: short
+        style: {fill: 10}
+        queries:
+          - expr: sum by (instance) (rate(atalaya_collector_points_total{instance=~"$node"}[$__rate_interval]))
+            legend: "{{instance}}"
+      - title: Scrape duration
+        description: How long each target takes to answer. node-exporter with the systemd collector is the slowest.
+        type: timeseries
+        grid: [12, 12, 12, 8]
+        unit: s
+        legend: {mode: table, calcs: [mean, max], placement: right}
+        queries:
+          - expr: scrape_duration_seconds{instance=~"$node"}
+            legend: "{{instance}} · {{job}}"
+      - title: Rows sent to ClickHouse
+        type: timeseries
+        grid: [0, 20, 12, 8]
+        unit: short
+        style: {fill: 10}
+        queries:
+          - expr: sum by (instance) (rate(atalaya_collector_rows_sent_total{instance=~"$node"}[$__rate_interval]))
+            legend: "{{instance}}"
+      - title: Sends and errors
+        description: Batches sent, failed, spooled to disk and dropped (spool full).
+        type: timeseries
+        grid: [12, 20, 12, 8]
+        unit: ops
+        queries:
+          - expr: sum(rate(atalaya_collector_batches_sent_total{instance=~"$node"}[$__rate_interval]))
+            legend: Sent
+          - expr: sum(rate(atalaya_collector_send_errors_total{instance=~"$node"}[$__rate_interval]))
+            legend: Errors
+          - expr: sum(rate(atalaya_collector_spooled_batches_total{instance=~"$node"}[$__rate_interval]))
+            legend: Spooled
+          - expr: sum(rate(atalaya_collector_dropped_batches_total{instance=~"$node"}[$__rate_interval]))
+            legend: Dropped
+        series:
+          - {match: Errors, color: "#F2495C"}
+          - {match: Spooled, color: "#FF9830"}
+          - {match: Dropped, color: "#C4162A", dash: true}
+  - title: ClickHouse
+    widgets:
+      - title: Uptime
+        type: stat
+        grid: [0, 0, 4, 4]
+        unit: dtdurations
+        queries:
+          - expr: ClickHouseAsyncMetrics_Uptime{job="clickhouse"}
+      - title: Memory in use
+        description: Memory allocated by ClickHouse (MemoryTracking).
+        type: stat
+        grid: [4, 0, 4, 4]
+        unit: bytes
+        stat: {graph: area}
+        queries:
+          - expr: ClickHouseMetrics_MemoryTracking{job="clickhouse"}
+      - title: Disk used
+        type: gauge
+        grid: [8, 0, 4, 4]
+        unit: percentunit
+        decimals: 1
+        min: 0
+        max: 1
+        color: thresholds
+        thresholds: {steps: [[null, green], [0.75, orange], [0.9, red]]}
+        queries:
+          - expr: sum(ClickHouseAsyncMetrics_DiskUsed{job="clickhouse"}) / sum(ClickHouseAsyncMetrics_DiskTotal{job="clickhouse"})
+      - title: Stored data
+        description: Compressed size of all MergeTree tables.
+        type: stat
+        grid: [12, 0, 4, 4]
+        unit: bytes
+        stat: {graph: area}
+        queries:
+          - expr: ClickHouseAsyncMetrics_TotalBytesOfMergeTreeTables{job="clickhouse"}
+      - title: Active parts
+        description: Many small parts mean inserts are too frequent.
+        type: stat
+        grid: [16, 0, 4, 4]
+        unit: short
+        decimals: 0
+        stat: {graph: area}
+        queries:
+          - expr: ClickHouseAsyncMetrics_TotalPartsOfMergeTreeTables{job="clickhouse"}
+      - title: Failed queries
+        type: stat
+        grid: [20, 0, 4, 4]
+        unit: none
+        decimals: 0
+        color: thresholds
+        thresholds: {steps: [[null, green], [1, orange]]}
+        queries:
+          - expr: sum(increase(ClickHouseProfileEvents_FailedQuery{job="clickhouse"}[$__range]))
+      - title: Queries per second
+        type: timeseries
+        grid: [0, 4, 12, 8]
+        unit: ops
+        queries:
+          - expr: rate(ClickHouseProfileEvents_SelectQuery{job="clickhouse"}[$__rate_interval])
+            legend: SELECT
+          - expr: rate(ClickHouseProfileEvents_InsertQuery{job="clickhouse"}[$__rate_interval])
+            legend: INSERT
+          - expr: rate(ClickHouseProfileEvents_FailedQuery{job="clickhouse"}[$__rate_interval])
+            legend: Failed
+        series:
+          - {match: Failed, color: "#F2495C"}
+      - title: Inserted rows
+        type: timeseries
+        grid: [12, 4, 12, 8]
+        unit: short
+        style: {fill: 10}
+        queries:
+          - expr: rate(ClickHouseProfileEvents_InsertedRows{job="clickhouse"}[$__rate_interval])
+            legend: Rows/s
+      - title: Memory
+        type: timeseries
+        grid: [0, 12, 12, 8]
+        unit: bytes
+        queries:
+          - expr: ClickHouseMetrics_MemoryTracking{job="clickhouse"}
+            legend: In use
+          - expr: ClickHouseMetrics_MergesMutationsMemoryTracking{job="clickhouse"}
+            legend: Merges
+          - expr: ClickHouseAsyncMetrics_OSMemoryAvailable{job="clickhouse"}
+            legend: Free on the system
+        series:
+          - {match: Free on the system, dash: true}
+      - title: Merges and parts
+        description: Running merges and active parts; inserts are throttled (DelayedInserts) when there are too many parts.
+        type: timeseries
+        grid: [12, 12, 12, 8]
+        unit: short
+        queries:
+          - expr: ClickHouseMetrics_Merge{job="clickhouse"}
+            legend: Running merges
+          - expr: ClickHouseMetrics_DelayedInserts{job="clickhouse"}
+            legend: Delayed inserts
+          - expr: ClickHouseMetrics_PartsActive{job="clickhouse"}
+            legend: Active parts
+        series:
+          - {match: Delayed inserts, color: "#FF9830"}
+      - title: Connections
+        type: timeseries
+        grid: [0, 20, 12, 7]
+        unit: short
+        queries:
+          - expr: ClickHouseMetrics_HTTPConnection{job="clickhouse"}
+            legend: HTTP
+          - expr: ClickHouseMetrics_TCPConnection{job="clickhouse"}
+            legend: Native (TCP)
+      - title: Server load
+        type: timeseries
+        grid: [12, 20, 12, 7]
+        unit: short
+        queries:
+          - expr: ClickHouseAsyncMetrics_LoadAverage1{job="clickhouse"}
+            legend: Load 1 min
+          - expr: ClickHouseMetrics_Query{job="clickhouse"}
+            legend: Running queries

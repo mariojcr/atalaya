@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# Weekly updates, one pull request per ecosystem: the base images pinned by
+# digest in the Dockerfile, the crates in Cargo.lock and the actions pinned by
+# commit SHA in the workflows. Security updates still come as soon as they are
+# published.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      base-images:
+        patterns: ["*"]
+    # Only new digests of the same Rust version: a new version goes together with
+    # rust-toolchain.toml, by hand
+    ignore:
+      - dependency-name: "*rust"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+    commit-message:
+      prefix: build
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      crates:
+        patterns: ["*"]
+    commit-message:
+      prefix: build
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

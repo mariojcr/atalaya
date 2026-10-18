@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+[workspace]
+members = ["collector", "server"]
+resolver = "3"
+
+# One version for both binaries: a release tags them together (see docs/releasing.md)
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Mario Campos <https://github.com/mariojcr>"]
+license = "Apache-2.0"
+repository = "https://github.com/mariojcr/atalaya"
+
+# What both crates use, so they build against the same versions
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+strip = true

@@ -1,0 +1,356 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# Host hardware: the collector's own metrics (service `host`, read from sysfs).
+# Temperatures, CPU energy (RAPL), fans, GPU (amdgpu), battery and ECC memory
+# errors.
+title: Hardware
+description: Temperatures, CPU power, fans, GPU, battery and memory errors of each host, read from sysfs by atalaya-collector.
+refresh: 30s
+time: 6h
+variables:
+  - name: host
+    label: Host
+    query: label_values(host_temperature_celsius, instance)
+    includeAll: true
+    sort: 1
+sections:
+  - title: Now
+    widgets:
+      - title: CPU
+        description: CPU package temperature (coretemp "Package id 0" on Intel, k10temp "Tctl" on AMD).
+        type: bargauge
+        grid: [0, 0, 8, 6]
+        unit: celsius
+        decimals: 0
+        min: 20
+        max: 105
+        color: thresholds
+        thresholds: {steps: [[null, green], [75, orange], [90, red]]}
+        bargauge: {reduce: last, mode: gradient}
+        queries:
+          - expr: max by (instance) (host_temperature_celsius{instance=~"$host", label=~"Package id 0|Tctl"})
+            legend: "{{instance}}"
+            instant: true
+      - title: CPU power
+        description: CPU package power according to RAPL (5 min average). Does not include disks, motherboard or a discrete GPU.
+        type: bargauge
+        grid: [8, 0, 8, 6]
+        unit: watt
+        decimals: 1
+        min: 0
+        color: thresholds
+        thresholds: {steps: [[null, blue], [45, orange], [90, red]]}
+        bargauge: {reduce: last, mode: gradient}
+        queries:
+          - expr: sum by (instance) (rate(host_rapl_energy_joules_total{instance=~"$host", zone="package-0"}[5m]))
+            legend: "{{instance}}"
+            instant: true
+      - title: NVMe drives
+        description: Composite temperature of each NVMe drive. Above ~70 °C they start to throttle.
+        type: bargauge
+        grid: [16, 0, 8, 6]
+        unit: celsius
+        decimals: 0
+        min: 20
+        max: 85
+        color: thresholds
+        thresholds: {steps: [[null, green], [60, orange], [70, red]]}
+        bargauge: {reduce: last, mode: gradient}
+        queries:
+          - expr: max by (instance, device) (host_temperature_celsius{instance=~"$host", chip="nvme", label="Composite"})
+            legend: "{{instance}} {{device}}"
+            instant: true
+  - title: Temperatures
+    widgets:
+      - title: CPU
+        type: timeseries
+        grid: [0, 0, 12, 8]
+        unit: celsius
+        decimals: 0
+        queries:
+          - expr: max by (instance) (host_temperature_celsius{instance=~"$host", label=~"Package id 0|Tctl"})
+            legend: "{{instance}}"
+      - title: NVMe drives
+        type: timeseries
+        grid: [12, 0, 12, 8]
+        unit: celsius
+        decimals: 0
+        queries:
+          - expr: max by (instance, device) (host_temperature_celsius{instance=~"$host", chip="nvme", label="Composite"})
+            legend: "{{instance}} {{device}}"
+      - title: Cores
+        description: Each CPU core; useful to see whether load is spread out or a single core runs hot.
+        type: timeseries
+        grid: [0, 8, 12, 8]
+        unit: celsius
+        decimals: 0
+        legend: {show: false}
+        queries:
+          - expr: host_temperature_celsius{instance=~"$host", chip="coretemp", label=~"Core.*"}
+            legend: "{{instance}} {{label}}"
+      - title: Memory, motherboard, network and GPU
+        description: The remaining probes (memory modules, chipset, voltage regulators, network card, Wi-Fi, GPU, ACPI zones).
+        type: timeseries
+        grid: [12, 8, 12, 8]
+        unit: celsius
+        decimals: 0
+        queries:
+          # The AUXTIN inputs of some Super I/O chips are unconnected (floating readings)
+          - expr: host_temperature_celsius{instance=~"$host", chip!~"coretemp|k10temp|nvme", label!~"AUXTIN.*|PECI Agent 0 Calibration"}
+            legend: "{{instance}} {{chip}} {{label}}"
+  - title: Energy
+    widgets:
+      - title: CPU power
+        description: Whole package (package-0) per host, according to RAPL.
+        type: timeseries
+        grid: [0, 0, 12, 8]
+        unit: watt
+        decimals: 1
+        min: 0
+        queries:
+          - expr: sum by (instance) (rate(host_rapl_energy_joules_total{instance=~"$host", zone="package-0"}[5m]))
+            legend: "{{instance}}"
+      - title: Breakdown by domain
+        description: Cores, graphics/uncore and DRAM within the package (depending on what each CPU exposes).
+        type: timeseries
+        grid: [12, 0, 12, 8]
+        unit: watt
+        decimals: 1
+        min: 0
+        queries:
+          - expr: sum by (instance, zone) (rate(host_rapl_energy_joules_total{instance=~"$host", zone!="package-0"}[5m]))
+            legend: "{{instance}} {{zone}}"
+      - title: CPU energy in 24 h
+        description: Energy consumed by the CPU packages over the last 24 hours.
+        type: stat
+        grid: [0, 8, 6, 4]
+        unit: watth
+        decimals: 2
+        queries:
+          - expr: sum(increase(host_rapl_energy_joules_total{instance=~"$host", zone="package-0"}[24h])) / 3600
+      - title: Fans
+        type: timeseries
+        grid: [12, 8, 12, 8]
+        unit: rotrpm
+        decimals: 0
+        min: 0
+        queries:
+          - expr: host_fan_rpm{instance=~"$host"}
+            legend: "{{instance}} {{label}}"
+  - title: GPU
+    widgets:
+      - title: Utilization
+        type: stat
+        grid: [0, 0, 4, 4]
+        unit: percentunit
+        decimals: 0
+        stat: {graph: area}
+        queries:
+          - expr: max(host_gpu_busy_ratio{instance=~"$host"})
+      - title: GTT memory
+        description: "System memory used by the GPU (for integrated GPUs, almost all of what they use)."
+        type: gauge
+        grid: [4, 0, 4, 4]
+        unit: percentunit
+        decimals: 0
+        min: 0
+        max: 1
+        thresholds: {steps: [[null, green], [0.8, orange], [0.95, red]]}
+        queries:
+          - expr: sum(host_gpu_memory_used_bytes{instance=~"$host", pool="gtt"}) / sum(host_gpu_memory_total_bytes{instance=~"$host", pool="gtt"})
+      - title: Power
+        description: PPT of the integrated GPU (includes the part of the SoC it shares with the CPU).
+        type: stat
+        grid: [8, 0, 4, 4]
+        unit: watt
+        decimals: 1
+        stat: {graph: area}
+        queries:
+          - expr: sum(host_power_watts{instance=~"$host", chip="amdgpu"})
+      - title: Temperature
+        type: stat
+        grid: [12, 0, 4, 4]
+        unit: celsius
+        decimals: 0
+        stat: {graph: area}
+        queries:
+          - expr: max(host_temperature_celsius{instance=~"$host", chip="amdgpu"})
+      - title: Clock
+        type: stat
+        grid: [16, 0, 4, 4]
+        unit: hertz
+        decimals: 1
+        stat: {graph: area}
+        queries:
+          - expr: max(host_frequency_hertz{instance=~"$host", chip="amdgpu", label="sclk"})
+      - title: VRAM
+        description: Memory reserved for the GPU in the BIOS.
+        type: stat
+        grid: [20, 0, 4, 4]
+        unit: bytes
+        decimals: 1
+        queries:
+          - expr: sum(host_gpu_memory_used_bytes{instance=~"$host", pool="vram"})
+      - title: Utilization over time
+        type: timeseries
+        grid: [0, 4, 12, 8]
+        unit: percentunit
+        decimals: 0
+        min: 0
+        queries:
+          - expr: max by (instance) (host_gpu_busy_ratio{instance=~"$host"})
+            legend: "{{instance}}"
+      - title: GPU memory
+        type: timeseries
+        grid: [12, 4, 12, 8]
+        unit: bytes
+        decimals: 1
+        min: 0
+        queries:
+          - expr: sum by (instance, pool) (host_gpu_memory_used_bytes{instance=~"$host"})
+            legend: "{{instance}} {{pool}}"
+  - title: Battery and power
+    widgets:
+      - title: Charge
+        type: gauge
+        grid: [0, 0, 4, 4]
+        unit: percentunit
+        decimals: 0
+        min: 0
+        max: 1
+        thresholds: {steps: [[null, red], [0.2, orange], [0.5, green]]}
+        queries:
+          - expr: min(host_battery_charge_ratio{instance=~"$host"})
+      - title: Charger
+        description: 1 when the charger is connected.
+        type: stat
+        grid: [4, 0, 4, 4]
+        unit: none
+        decimals: 0
+        color: thresholds
+        thresholds: {steps: [[null, red], [1, green]]}
+        stat: {colorMode: background}
+        queries:
+          - expr: max(host_power_supply_online{instance=~"$host", type="Mains"})
+      - title: Battery
+        description: Positive while charging, negative while discharging.
+        type: stat
+        grid: [8, 0, 4, 4]
+        unit: watt
+        decimals: 1
+        stat: {graph: area}
+        queries:
+          - expr: sum(host_battery_power_watts{instance=~"$host"})
+      - title: Health
+        description: Current capacity compared to the design capacity.
+        type: stat
+        grid: [12, 0, 4, 4]
+        unit: percentunit
+        decimals: 0
+        queries:
+          - expr: min(host_battery_energy_full_watthours{instance=~"$host"} / host_battery_energy_full_design_watthours{instance=~"$host"})
+      - title: Memory errors (ECC)
+        description: Corrected and uncorrected errors since boot (only hosts with EDAC).
+        type: stat
+        grid: [16, 0, 8, 4]
+        unit: none
+        decimals: 0
+        color: thresholds
+        thresholds: {steps: [[null, green], [1, orange]]}
+        queries:
+          - expr: sum by (type) (host_memory_ecc_errors_total{instance=~"$host"})
+            legend: "{{type}}"
+      - title: Battery charge
+        type: timeseries
+        grid: [0, 4, 24, 6]
+        unit: percentunit
+        decimals: 0
+        min: 0
+        max: 1
+        queries:
+          - expr: host_battery_charge_ratio{instance=~"$host"}
+            legend: "{{instance}} {{supply}}"
+  - title: Disks
+    widgets:
+      - title: SMART health
+        description: "One smartctl reading per hour and disk (sleeping disks are not woken up). Reallocated, pending and uncorrectable are bad sectors: they should be 0 and not grow."
+        type: table
+        grid: [0, 0, 24, 11]
+        queries:
+          - expr: last_over_time(host_disk_smart_healthy{instance=~"$host"}[2h])
+            ref: A
+            instant: true
+          - expr: last_over_time(host_disk_temperature_celsius{instance=~"$host"}[2h])
+            ref: B
+            instant: true
+          - expr: last_over_time(host_disk_power_on_seconds_total{instance=~"$host"}[2h])
+            ref: C
+            instant: true
+          - expr: last_over_time(host_disk_endurance_used_ratio{instance=~"$host"}[2h])
+            ref: D
+            instant: true
+          - expr: max by (instance, serial) (last_over_time(host_disk_ata_attribute_raw{instance=~"$host", id="5"}[2h]))
+            ref: E
+            instant: true
+          - expr: max by (instance, serial) (last_over_time(host_disk_ata_attribute_raw{instance=~"$host", id=~"197|198"}[2h]))
+            ref: F
+            instant: true
+          - expr: last_over_time(host_nvme_media_errors_total{instance=~"$host"}[2h])
+            ref: G
+            instant: true
+          - expr: last_over_time(host_disk_capacity_bytes{instance=~"$host"}[2h])
+            ref: H
+            instant: true
+        table:
+          join: serial
+          columns:
+            - {field: instance, name: Host}
+            - {field: device, name: Disk}
+            - {field: model, name: Model}
+            - {field: kind, name: Type}
+            - {field: H, name: Size, unit: bytes, decimals: 1}
+            - {field: A, name: SMART OK, unit: bool_yes_no}
+            - {field: B, name: Temp., unit: celsius, decimals: 0}
+            - {field: C, name: Powered on, unit: dtdurations}
+            - {field: D, name: Wear, unit: percentunit, decimals: 0, min: 0, max: 1, cell: bar}
+            - {field: E, name: Reallocated, decimals: 0}
+            - {field: F, name: Pending/uncorr., decimals: 0}
+            - {field: G, name: NVMe errors, decimals: 0}
+          sort: {field: instance}
+      - title: SATA disk temperature
+        description: SATA HDDs and SSDs, one reading per hour (NVMe drives are above, every 15 s).
+        type: timeseries
+        grid: [0, 11, 12, 8]
+        unit: celsius
+        decimals: 0
+        queries:
+          - expr: last_over_time(host_disk_temperature_celsius{instance=~"$host", kind!="nvme"}[2h])
+            legend: "{{instance}} {{device}} {{model}}"
+      - title: Written to NVMe per day
+        type: timeseries
+        grid: [12, 11, 12, 8]
+        unit: bytes
+        decimals: 1
+        min: 0
+        queries:
+          - expr: increase(host_nvme_data_written_bytes_total{instance=~"$host"}[1d])
+            legend: "{{instance}} {{device}}"
+      - title: Head parks
+        description: "Load_Cycle_Count (attribute 193) of HDDs. WD Green drives park the head after 8 s idle; they are usually rated for ~300,000 cycles."
+        type: timeseries
+        grid: [0, 19, 12, 8]
+        unit: short
+        decimals: 0
+        queries:
+          - expr: last_over_time(host_disk_ata_attribute_raw{instance=~"$host", id="193", kind="hdd"}[2h])
+            legend: "{{instance}} {{device}} {{model}}"
+      - title: Sleeping disks
+        description: State of each disk at the hourly SMART reading (asleep = in standby, not read to avoid waking it).
+        type: timeline
+        grid: [12, 19, 12, 8]
+        mappings:
+          - {value: "0", text: Active, color: green}
+          - {value: "1", text: Asleep, color: blue}
+        queries:
+          - expr: last_over_time(host_disk_standby{instance=~"$host"}[2h])
+            legend: "{{instance}} {{device}}"

@@ -1,0 +1,40 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+SPDX-License-Identifier: Apache-2.0
+
+The two ClickHouse users atalaya runs with, next to the admin the image creates
+(CLICKHOUSE_USER, which applies the schema). Passwords come from the
+container's environment (see docker-compose.yml and README.md).
+
+  reader     the server: read-only, may change query settings (readonly 2)
+  collector  the collectors: inserts into atalaya.*, plus SELECT, which the
+             materialized views behind the 1-minute and 10-minute tiers run with
+-->
+<clickhouse>
+  <profiles>
+    <reader>
+      <readonly>2</readonly>
+      <max_execution_time>120</max_execution_time>
+    </reader>
+  </profiles>
+  <users>
+    <reader>
+      <password from_env="CLICKHOUSE_READER_PASSWORD"/>
+      <networks><ip>::/0</ip></networks>
+      <profile>reader</profile>
+      <quota>default</quota>
+      <grants>
+        <query>GRANT SELECT ON atalaya.*</query>
+      </grants>
+    </reader>
+    <collector>
+      <password from_env="CLICKHOUSE_COLLECTOR_PASSWORD"/>
+      <networks><ip>::/0</ip></networks>
+      <profile>default</profile>
+      <quota>default</quota>
+      <grants>
+        <query>GRANT SELECT, INSERT ON atalaya.*</query>
+      </grants>
+    </collector>
+  </users>
+</clickhouse>

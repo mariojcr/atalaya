@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# Pinned Rust version for CI and local builds; bumping it is an explicit change
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+
+name: Bug report
+description: Report a reproducible problem with the Atalaya server, UI or collector.
+body:
+  - type: markdown
+    attributes:
+      value: "Remove passwords, host names and internal addresses from examples and logs. For vulnerabilities, follow [SECURITY.md](https://github.com/mariojcr/atalaya/blob/main/SECURITY.md)."
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Server or UI
+        - Collector
+        - Both or not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Image tag (for example 0.1.0 or sha-abc1234) or commit.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: How it runs (Docker Compose, Nomad, systemd), ClickHouse version, OS and CPU architecture.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Use a minimal example with fictional data (a dashboard, a PromQL query, a collector.yaml).
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Optional. Redact secrets and internal addresses.
+      render: text

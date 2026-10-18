@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# Releases with Commitizen (https://commitizen-tools.github.io/commitizen/):
+# `cz bump` picks the next version from the Conventional Commits since the last
+# tag, updates Cargo.toml / Cargo.lock and CHANGELOG.md, commits and tags vX.Y.Z.
+# Pushing the tag runs .github/workflows/build.yml. See docs/releasing.md.
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "cargo"
+tag_format = "v$version"
+update_changelog_on_bump = true
+changelog_incremental = true
+major_version_zero = true
+bump_message = "chore(release): v$new_version"

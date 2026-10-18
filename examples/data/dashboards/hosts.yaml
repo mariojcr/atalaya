@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+title: Hosts
+# Variables: drop-downs at the top of the dashboard that add a filter to every widget
+variables:
+  - name: host
+    label: Host
+    field: resource.host.name
+    metric: node_load1
+widgets:
+  - title: Load average (1 min)
+    width: 12
+    query:
+      metric: node_load1
+      aggregation:
+        perSeriesAligner: ALIGN_MEAN
+        crossSeriesReducer: REDUCE_MEAN
+        groupByFields: [resource.host.name]
+  - title: CPU busy by mode (cores)
+    width: 12
+    type: area
+    query:
+      metric: node_cpu_seconds_total
+      filter:
+        metric.mode: "!idle"
+      aggregation:
+        perSeriesAligner: ALIGN_RATE
+        crossSeriesReducer: REDUCE_SUM
+        groupByFields: [metric.mode]
+  - title: Available memory
+    width: 8
+    query:
+      metric: node_memory_MemAvailable_bytes
+      aggregation:
+        crossSeriesReducer: REDUCE_SUM
+        groupByFields: [resource.host.name]
+  - title: Network received per interface
+    width: 8
+    type: area
+    query:
+      metric: node_network_receive_bytes_total
+      filter:
+        metric.device: "!~lo|veth.*"
+      aggregation:
+        perSeriesAligner: ALIGN_RATE
+        crossSeriesReducer: REDUCE_SUM
+        groupByFields: [resource.host.name, metric.device]
+  - title: Disk written
+    width: 8
+    type: bar
+    query:
+      metric: node_disk_written_bytes_total
+      aggregation:
+        perSeriesAligner: ALIGN_RATE
+        crossSeriesReducer: REDUCE_SUM
+        groupByFields: [resource.host.name]
+  - title: Load · 99th percentile per interval
+    width: 12
+    query:
+      metric: node_load1
+      aggregation:
+        perSeriesAligner: ALIGN_PERCENTILE_99
+        crossSeriesReducer: REDUCE_MAX
+        groupByFields: [resource.host.name]
+  - title: Points written by the collector
+    width: 12
+    query:
+      metric: atalaya_collector_points_total
+      aggregation:
+        perSeriesAligner: ALIGN_RATE
+        crossSeriesReducer: REDUCE_SUM
+        groupByFields: [resource.host.name]

@@ -1,0 +1,7 @@
+# Only what the build needs (see Dockerfile)
+*
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!collector/
+!server/

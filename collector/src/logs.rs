@@ -1,0 +1,494 @@
+// SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+// SPDX-License-Identifier: Apache-2.0
+
+//! Tails the logs of this node's Nomad allocations
+//! (<alloc_dir>/<alloc>/alloc/logs/<task>.<stdout|stderr>.<N>).
+//!
+//! Nomad numbers the files (it does not rename them): the highest index is
+//! followed and, on reaching its end with a later one available, reading moves
+//! to the next. Offsets are saved to disk. When starting without state, files
+//! that already existed are read from the end (the past is not re-sent); new
+//! allocations are read from the beginning.
+//!
+//! The podman driver writes each line as `<date> <stream> <F|P> <text>`;
+//! split lines (P…P F) are joined before sending.
+//!
+//! `alloc/` is shared with the tasks, which can write to it, and the collector
+//! runs as root: nothing a task puts there may make it read another file of the
+//! host into the task's logs. The `logs` directory is opened without following
+//! a symlink, and each file is looked up through that open directory (never
+//! by its path again, so swapping the directory afterwards changes nothing),
+//! again without following one. Only a regular file with a single link is
+//! read: a hard link would be some other file under a log's name.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use chrono::{DateTime, Utc};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+
+use crate::nomad::Nomad;
+use crate::sink::Sink;
+
+pub(crate) const MAX_READ: u64 = 4 << 20;
+const MAX_BODY: usize = 64 << 10;
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct State {
+    /// group (alloc/task/stream) → (file index, offset)
+    files: BTreeMap<String, (u64, u64)>,
+}
+
+pub struct Tailer {
+    alloc_dir: PathBuf,
+    state_path: PathBuf,
+    state: State,
+    /// Groups seen on the first pass: without state they are read from the end
+    initial: Option<HashSet<String>>,
+    partial: HashMap<String, String>,
+    /// Groups in the middle of a line longer than MAX_READ: discard up to the
+    /// next newline
+    skipping: HashSet<String>,
+    host: String,
+    pub lines: u64,
+    /// Lines truncated or dropped for being too long
+    pub truncated: u64,
+}
+
+struct Group {
+    alloc: String,
+    task: String,
+    stream: String,
+    files: Vec<(u64, PathBuf)>,
+}
+
+fn file_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?P<task>.+)\.(?P<stream>stdout|stderr)\.(?P<n>\d+)$").unwrap())
+}
+
+fn line_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?P<ts>\S+) (?P<stream>stdout|stderr) (?P<p>[FP]) ?(?P<text>.*)$").unwrap())
+}
+
+fn level_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)(?:level=|\[|\b)(trace|debug|dbg|info|inf|notice|warn|warning|wrn|error|err|fatal|ftl|crit|critical)(?:\]|\b)").unwrap())
+}
+
+fn normalize_level(s: &str) -> &'static str {
+    match s.to_ascii_lowercase().as_str() {
+        "trace" => "TRACE",
+        "debug" | "dbg" => "DEBUG",
+        "info" | "inf" | "notice" | "information" => "INFO",
+        "warn" | "warning" | "wrn" => "WARN",
+        "error" | "err" => "ERROR",
+        "fatal" | "ftl" | "crit" | "critical" | "panic" => "FATAL",
+        _ => "",
+    }
+}
+
+impl Tailer {
+    pub fn new(alloc_dir: PathBuf, state_dir: &Path, host: String) -> Self {
+        let state_path = state_dir.join("log-offsets.json");
+        let (state, initial) = match std::fs::read(&state_path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            Some(s) => (s, Some(HashSet::new())),
+            None => (State::default(), None),
+        };
+        Self {
+            alloc_dir,
+            state_path,
+            state,
+            initial,
+            partial: HashMap::new(),
+            skipping: HashSet::new(),
+            host,
+            lines: 0,
+            truncated: 0,
+        }
+    }
+
+    fn scan(&self) -> BTreeMap<String, Group> {
+        let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+        let Ok(allocs) = std::fs::read_dir(&self.alloc_dir) else { return groups };
+        for a in allocs.flatten() {
+            let alloc = a.file_name().to_string_lossy().to_string();
+            let dir = a.path().join("alloc/logs");
+            let Some(d) = open_dir(&dir) else { continue };
+            let Ok(files) = std::fs::read_dir(fd_path(&d)) else { continue };
+            for f in files.flatten() {
+                if !f.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let name = f.file_name().to_string_lossy().to_string();
+                let Some(c) = file_re().captures(&name) else { continue };
+                let (task, stream) = (c["task"].to_owned(), c["stream"].to_owned());
+                let n: u64 = c["n"].parse().unwrap_or(0);
+                let key = format!("{alloc}/{task}/{stream}");
+                groups
+                    .entry(key)
+                    .or_insert_with(|| Group {
+                        alloc: alloc.clone(),
+                        task,
+                        stream,
+                        files: Vec::new(),
+                    })
+                    .files
+                    .push((n, dir.join(f.file_name())));
+            }
+        }
+        for g in groups.values_mut() {
+            g.files.sort();
+        }
+        groups
+    }
+
+    /// Reads what is new in every file and sends it to the sink.
+    pub async fn poll(&mut self, nomad: &Nomad, sink: &Sink) {
+        let groups = self.scan();
+        // First pass without state: everything that exists starts at the end
+        if self.initial.is_none() {
+            for (key, g) in &groups {
+                if let Some((n, path)) = g.files.last() {
+                    let len = std::fs::symlink_metadata(path).map(|m| m.len()).unwrap_or(0);
+                    self.state.files.insert(key.clone(), (*n, len));
+                }
+            }
+            self.initial = Some(groups.keys().cloned().collect());
+        }
+        // Allocations garbage-collected by Nomad: drop them from the state (and their partial lines)
+        self.state.files.retain(|k, _| groups.contains_key(k));
+        self.partial.retain(|k, _| groups.contains_key(k));
+        self.skipping.retain(|k| groups.contains_key(k));
+
+        for (key, g) in &groups {
+            let (mut idx, mut pos) = self.state.files.get(key).copied().unwrap_or((g.files[0].0, 0));
+            let info = nomad.alloc(&g.alloc).await.unwrap_or_default();
+            loop {
+                let Some((_, path)) = g.files.iter().find(|(n, _)| *n == idx) else {
+                    // The file is gone: move to the next available one
+                    match g.files.iter().find(|(n, _)| *n > idx) {
+                        Some((n, _)) => {
+                            idx = *n;
+                            pos = 0;
+                            continue;
+                        }
+                        None => break,
+                    }
+                };
+                let (mut buf, start) = read_from(path, pos);
+                pos = start;
+                let has_next = g.files.iter().any(|(n, _)| *n > idx);
+                // Rest of a huge line: discard up to its newline
+                if self.skipping.contains(key.as_str()) {
+                    match buf.iter().position(|&b| b == b'\n') {
+                        Some(i) => {
+                            self.skipping.remove(key.as_str());
+                            pos += i as u64 + 1;
+                            buf.drain(..=i);
+                        }
+                        None => {
+                            pos += buf.len() as u64;
+                            if (buf.len() as u64) < MAX_READ {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // A line that does not fit in MAX_READ: emit it truncated and skip
+                // the rest (otherwise the same block would be re-read every pass)
+                if buf.len() as u64 >= MAX_READ && !buf.contains(&b'\n') && !has_next {
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    self.emit(key, g, &info, &head, sink);
+                    self.truncated += 1;
+                    self.skipping.insert(key.clone());
+                    pos += buf.len() as u64;
+                    continue;
+                }
+                // Complete lines only (the newline is searched in bytes so the
+                // offset does not drift with invalid UTF-8); when moving to the
+                // next file, the last one too.
+                let (complete, consumed): (&[u8], u64) = match buf.iter().rposition(|&b| b == b'\n') {
+                    Some(i) => (&buf[..=i], i as u64 + 1),
+                    None if has_next => (&buf[..], buf.len() as u64),
+                    None => (&[][..], 0),
+                };
+                for line in String::from_utf8_lossy(complete).lines() {
+                    self.emit(key, g, &info, line, sink);
+                }
+                pos += consumed;
+                if consumed == 0 && has_next {
+                    // End of this file: move to the next
+                    idx = g.files.iter().find(|(n, _)| *n > idx).map(|(n, _)| *n).unwrap_or(idx);
+                    pos = 0;
+                    continue;
+                }
+                if (buf.len() as u64) < MAX_READ || consumed == 0 {
+                    break;
+                }
+            }
+            self.state.files.insert(key.clone(), (idx, pos));
+        }
+    }
+
+    /// Current offsets, to be saved once what was read is safe
+    pub fn offsets(&self) -> State {
+        self.state.clone()
+    }
+
+    pub fn save(&self) {
+        self.save_offsets(&self.state);
+    }
+
+    pub fn save_offsets(&self, state: &State) {
+        if let Ok(b) = serde_json::to_vec(state) {
+            let tmp = self.state_path.with_extension("tmp");
+            if std::fs::write(&tmp, b).is_ok() {
+                let _ = std::fs::rename(tmp, &self.state_path);
+            }
+        }
+    }
+
+    fn emit(&mut self, key: &str, g: &Group, info: &crate::nomad::AllocInfo, line: &str, sink: &Sink) {
+        let (time, stream, text) = match line_re().captures(line) {
+            Some(c) => {
+                let text = c["text"].to_owned();
+                if &c["p"] == "P" {
+                    // Chunks of a long line (podman format): capped, since the
+                    // body is truncated to MAX_BODY anyway
+                    let p = self.partial.entry(key.to_owned()).or_default();
+                    if p.len() < MAX_BODY {
+                        p.push_str(&text);
+                    } else {
+                        self.truncated += 1;
+                    }
+                    return;
+                }
+                let full = match self.partial.remove(key) {
+                    Some(mut p) => {
+                        p.push_str(&text);
+                        p
+                    }
+                    None => text,
+                };
+                let time = DateTime::parse_from_rfc3339(&c["ts"])
+                    .map(|t| t.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                (time, c["stream"].to_owned(), full)
+            }
+            None => (Utc::now(), g.stream.clone(), line.to_owned()),
+        };
+        let service = if info.job.is_empty() { g.task.clone() } else { info.job.clone() };
+        let resource = json!({
+            "nomad.job": info.job,
+            "nomad.group": info.group,
+            "nomad.task": g.task,
+            "nomad.alloc": g.alloc,
+            "nomad.namespace": info.namespace,
+        });
+        if let Some(row) = build_row(&self.host, &service, &stream, time, text, resource) {
+            sink.push("logs", row);
+            self.lines += 1;
+        }
+    }
+}
+
+/// A log line in the logs table format: level (from JSON or from the text),
+/// attributes from JSON and the body truncated to MAX_BODY
+pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<Utc>, text: String, resource: Value) -> Option<Value> {
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let mut attributes = Map::new();
+    let mut level = String::new();
+    if text.starts_with('{')
+        && let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text)
+    {
+        for (k, v) in obj.into_iter().take(64) {
+            let s = match v {
+                Value::String(s) => s,
+                Value::Null => continue,
+                other => other.to_string(),
+            };
+            if level.is_empty() && matches!(k.as_str(), "level" | "lvl" | "severity" | "log.level" | "levelname") {
+                level = normalize_level(&s).to_owned();
+            }
+            attributes.insert(k, Value::String(s));
+        }
+    }
+    if level.is_empty() {
+        let head: String = text.chars().take(200).collect();
+        if let Some(c) = level_re().captures(&head) {
+            level = normalize_level(&c[1]).to_owned();
+        }
+    }
+    let mut body = text;
+    if body.len() > MAX_BODY {
+        let mut cut = MAX_BODY;
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+    }
+    Some(json!({
+        "Time": time.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+        "Service": service,
+        "Host": host,
+        "Stream": stream,
+        "Level": level,
+        "Body": body,
+        "Resource": resource,
+        "Attributes": attributes,
+    }))
+}
+
+/// A directory opened without following a symlink in its last component
+fn open_dir(path: &Path) -> Option<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()
+}
+
+/// The path of an open directory through its descriptor: names under it are
+/// looked up in that directory, like `openat`, whatever its path points to now
+fn fd_path(dir: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
+
+/// Reads at most MAX_READ bytes from `pos`. Returns the bytes and the offset
+/// they were read from (0 if the file was truncated). The file is looked up in
+/// its directory, opened without following a symlink, and only read if it is a
+/// regular file with a single link (a FIFO swapped in does not block the open).
+pub(crate) fn read_from(path: &Path, pos: u64) -> (Vec<u8>, u64) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return (Vec::new(), pos);
+    };
+    let Some(d) = open_dir(dir) else { return (Vec::new(), pos) };
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(fd_path(&d).join(name));
+    let Ok(mut f) = opened else { return (Vec::new(), pos) };
+    let Ok(meta) = f.metadata() else { return (Vec::new(), pos) };
+    if !meta.is_file() || meta.nlink() != 1 {
+        return (Vec::new(), pos);
+    }
+    let len = meta.len();
+    // File truncated or replaced: start from the beginning
+    let pos = if pos > len { 0 } else { pos };
+    if f.seek(SeekFrom::Start(pos)).is_err() {
+        return (Vec::new(), pos);
+    }
+    let mut buf = Vec::new();
+    let _ = f.take(MAX_READ).read_to_end(&mut buf);
+    (buf, pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn a_line_longer_than_max_read_does_not_stall_the_tailer() {
+        let root = std::env::temp_dir().join(format!("atalaya-logs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let logs = root.join("allocs/abc/alloc/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let file = logs.join("web.stdout.0");
+        std::fs::write(&file, b"").unwrap();
+        let spool = root.join("spool");
+        let sink = Sink::new(
+            "http://127.0.0.1:1/".into(),
+            "u".into(),
+            crate::sink::test_password(),
+            "atalaya".into(),
+            spool,
+            1 << 30,
+        )
+        .unwrap();
+        let nomad = Nomad::new("http://127.0.0.1:1".into(), "n".into(), None, None).unwrap();
+        let mut t = Tailer::new(root.join("allocs"), &root, "host-1".into());
+        t.poll(&nomad, &sink).await; // first pass: starts at the end
+        let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        f.write_all(b"before\n").unwrap();
+        f.write_all(&vec![b'x'; (MAX_READ + (1 << 20)) as usize]).unwrap();
+        t.poll(&nomad, &sink).await;
+        assert_eq!(t.lines, 2, "the normal line and the truncated start of the huge one");
+        assert_eq!(t.truncated, 1);
+        // The end of the huge line arrives, then a new line
+        f.write_all(b"xxx\nafter\n").unwrap();
+        t.poll(&nomad, &sink).await;
+        assert_eq!(t.lines, 3, "only the new one; the rest of the huge line is dropped");
+        let pos = t.offsets().files.values().next().unwrap().1;
+        assert_eq!(pos, std::fs::metadata(&file).unwrap().len(), "read to the end");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlink_in_the_shared_alloc_dir_is_not_followed() {
+        let root = std::env::temp_dir().join(format!("atalaya-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let secret = root.join("secret");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&secret, b"root only\n").unwrap();
+        // A task links a file of the host as one of its logs...
+        let logs = root.join("allocs/abc/alloc/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::os::unix::fs::symlink(&secret, logs.join("web.stdout.0")).unwrap();
+        std::fs::write(logs.join("web.stderr.0"), b"a real log\n").unwrap();
+        // ...or replaces its logs directory with a link to a directory of the host
+        std::fs::create_dir_all(root.join("allocs/def/alloc")).unwrap();
+        std::fs::create_dir_all(root.join("host-dir")).unwrap();
+        std::fs::write(root.join("host-dir/web.stdout.0"), b"not a log\n").unwrap();
+        std::os::unix::fs::symlink(root.join("host-dir"), root.join("allocs/def/alloc/logs")).unwrap();
+
+        let t = Tailer::new(root.join("allocs"), &root, "host-1".into());
+        let groups = t.scan();
+        assert_eq!(groups.keys().collect::<Vec<_>>(), ["abc/web/stderr"], "only the regular file");
+        // A file swapped for a symlink after the scan is not read either
+        assert!(read_from(&logs.join("web.stdout.0"), 0).0.is_empty());
+        assert_eq!(read_from(&logs.join("web.stderr.0"), 0).0, b"a real log\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hard_link_or_a_logs_directory_swapped_after_the_scan_is_not_read() {
+        let root = std::env::temp_dir().join(format!("atalaya-hardlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let logs = root.join("allocs/abc/alloc/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // A task hard-links a file of the host (same filesystem) as one of its logs
+        let secret = root.join("secret");
+        std::fs::write(&secret, b"root only\n").unwrap();
+        std::fs::hard_link(&secret, logs.join("web.stdout.0")).unwrap();
+        std::fs::write(logs.join("web.stderr.0"), b"a real log\n").unwrap();
+        assert!(read_from(&logs.join("web.stdout.0"), 0).0.is_empty(), "two links: not read");
+        assert_eq!(read_from(&logs.join("web.stderr.0"), 0).0, b"a real log\n");
+
+        // After the scan, the task swaps its logs directory for a link to a
+        // directory of the host holding a file with a log's name
+        let t = Tailer::new(root.join("allocs"), &root, "host-1".into());
+        let groups = t.scan();
+        assert!(groups.contains_key("abc/web/stderr"));
+        std::fs::create_dir_all(root.join("host-dir")).unwrap();
+        std::fs::write(root.join("host-dir/web.stderr.0"), b"not a log\n").unwrap();
+        std::fs::rename(&logs, root.join("allocs/abc/alloc/old-logs")).unwrap();
+        std::os::unix::fs::symlink(root.join("host-dir"), &logs).unwrap();
+        assert!(read_from(&logs.join("web.stderr.0"), 0).0.is_empty(), "the directory is a symlink now");
+        assert!(t.scan().is_empty(), "and the next scan skips it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

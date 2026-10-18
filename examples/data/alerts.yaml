@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# atalaya alerts. The server evaluates the rules every `every` and notifies the
+# channels when an alert fires or resolves (grouping whatever happens within
+# `group_wait`). State and history live in ATALAYA_DATA/alerts/.
+#
+# Rules: instant PromQL (each returned series is an alert, identified by its
+# labels) or log filters like those of /api/v1/logs (fires when the count in
+# `window` reaches `threshold`). `for` is how long the condition must hold
+# before firing ("0s": immediately). Texts accept {en, es}; `summary` accepts
+# {{label}} and {{value}}.
+#
+# Channels: secrets never go here, only the name of the environment variable
+# that holds them (e.g. in the service's environment).
+
+defaults:
+  every: 30s
+  for: 5m
+  group_wait: 30s
+  notify: [default]
+
+channels:
+  # Until a real channel is configured, notifications go to the server log
+  default:
+    type: log
+  # ntfy:
+  #   type: ntfy
+  #   url_env: ATALAYA_NTFY_URL        # https://ntfy.sh/my-topic (or your own server)
+  #   token_env: ATALAYA_NTFY_TOKEN    # optional
+  # telegram:
+  #   type: telegram
+  #   bot_token_env: ATALAYA_TELEGRAM_BOT_TOKEN
+  #   chat_id_env: ATALAYA_TELEGRAM_CHAT_ID
+  # webhook:
+  #   type: webhook
+  #   url_env: ATALAYA_WEBHOOK_URL     # receives {status, title, text, alerts[]}
+
+rules:
+
+  - id: node-down
+    title: { en: Host not reporting, es: Host sin reportar }
+    severity: critical
+    expr: up{job="node-exporter"} == 0
+    for: 3m
+    labels: [instance, job]
+    summary: { en: "node-exporter on {{instance}} has not answered for 3 min", es: "node-exporter en {{instance}} lleva 3 min sin responder" }
+
+  - id: target-down
+    title: { en: Service not reporting, es: Servicio sin reportar }
+    severity: warning
+    expr: up{job!="node-exporter"} == 0
+    for: 3m
+    labels: [instance, job]
+    summary: { en: "{{job}} on {{instance}} has not answered for 3 min", es: "{{job}} en {{instance}} lleva 3 min sin responder" }
+
+  - id: scrape-slow
+    title: { en: Slow scrape, es: Scrape lento }
+    severity: info
+    expr: scrape_duration_seconds > 10
+    for: 5m
+    labels: [instance, job]
+    summary: { en: "{{job}} on {{instance}} takes {{value}} s to answer", es: "{{job}} en {{instance}} tarda {{value}} s en responder" }
+
+  - id: disk-full
+    title: { en: Disk almost full, es: Disco casi lleno }
+    severity: warning
+    expr: >-
+      100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"}
+                 / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"}) > 85
+    for: 10m
+    labels: [instance, mountpoint]
+    summary: { en: "{{mountpoint}} on {{instance}} is {{value}} % full", es: "{{mountpoint}} en {{instance}} está al {{value}} %" }
+
+  - id: memory-high
+    title: { en: Memory almost exhausted, es: Memoria casi agotada }
+    severity: warning
+    expr: 100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 92
+    for: 10m
+    labels: [instance]
+    summary: { en: "{{instance}} is using {{value}} % of its memory", es: "{{instance}} usa el {{value}} % de su memoria" }
+
+  - id: collector-spool
+    title: { en: Collector cannot deliver, es: El collector no entrega }
+    severity: warning
+    expr: atalaya_collector_spool_bytes > 0
+    for: 10m
+    labels: [instance]
+    summary: { en: "The collector on {{instance}} has {{value}} bytes queued on disk: ClickHouse unreachable?", es: "El collector de {{instance}} tiene {{value}} bytes en la cola de disco: ¿ClickHouse inaccesible?" }
+
+  - id: cpu-hot
+    title: { en: "CPU too hot", es: "CPU demasiado caliente" }
+    severity: warning
+    kind: metric
+    expr: 'max by (instance) (host_temperature_celsius{label=~"Package id 0|Tctl"}) > 95'
+    for: 10m
+    summary: { en: "CPU at {{value}} °C on {{instance}}", es: "CPU a {{value}} °C en {{instance}}" }
+
+  - id: nvme-hot
+    title: { en: "NVMe too hot", es: "NVMe demasiado caliente" }
+    severity: warning
+    kind: metric
+    expr: 'max by (instance, device) (host_temperature_celsius{chip="nvme", label="Composite"}) > 70'
+    for: 10m
+    summary: { en: "{{device}} at {{value}} °C on {{instance}} (throttles above ~70 °C)", es: "{{device}} a {{value}} °C en {{instance}} (limita velocidad por encima de ~70 °C)" }
+
+  - id: memory-ecc
+    title: { en: "Memory errors (ECC)", es: "Errores de memoria (ECC)" }
+    severity: warning
+    kind: metric
+    expr: 'sum by (instance, type) (increase(host_memory_ecc_errors_total[1h])) > 0'
+    for: 0s
+    summary: { en: "{{value}} {{type}} memory errors on {{instance}} in the last hour", es: "{{value}} errores de memoria ({{type}}) en {{instance}} en la última hora" }
+
+  - id: disk-failing
+    title: { en: "Disk failing (SMART)", es: "Disco fallando (SMART)" }
+    severity: critical
+    kind: metric
+    expr: 'last_over_time(host_disk_smart_healthy[2h]) == 0'
+    for: 0s
+    summary: { en: "{{device}} ({{model}}) on {{instance}} fails its SMART health check", es: "{{device}} ({{model}}) en {{instance}} no pasa la comprobación de salud SMART" }
+
+  - id: disk-bad-sectors
+    title: { en: "Disk bad sectors growing", es: "Crecen los sectores dañados" }
+    severity: warning
+    kind: metric
+    # Window max minus min: the exact figure (delta() extrapolates)
+    expr: 'max_over_time(host_disk_ata_attribute_raw{id=~"5|197|198"}[25h]) - min_over_time(host_disk_ata_attribute_raw{id=~"5|197|198"}[25h]) > 0'
+    for: 0s
+    summary: { en: "{{name}} grew by {{value}} in 24 h on {{device}} ({{model}}), {{instance}}", es: "{{name}} ha crecido {{value}} en 24 h en {{device}} ({{model}}), {{instance}}" }
+
+  - id: nvme-critical-warning
+    title: { en: "NVMe critical warning", es: "Aviso crítico de NVMe" }
+    severity: critical
+    kind: metric
+    expr: 'last_over_time(host_nvme_critical_warning[2h]) > 0'
+    for: 0s
+    summary: { en: "{{device}} ({{model}}) on {{instance}} reports critical warning {{value}} (spare, temperature, reliability or read-only)", es: "{{device}} ({{model}}) en {{instance}} da el aviso crítico {{value}} (reserva, temperatura, fiabilidad o solo lectura)" }
+
+  - id: disk-worn
+    title: { en: "SSD worn out", es: "SSD desgastado" }
+    severity: warning
+    kind: metric
+    expr: 'last_over_time(host_disk_endurance_used_ratio[2h]) * 100 > 90'
+    for: 0s
+    summary: { en: "{{device}} ({{model}}) on {{instance}} has used {{value}} % of its write endurance", es: "{{device}} ({{model}}) en {{instance}} ha gastado el {{value}} % de su resistencia a escrituras" }
+
+  - id: disk-hot
+    title: { en: "SATA disk too hot", es: "Disco SATA demasiado caliente" }
+    severity: warning
+    kind: metric
+    expr: 'last_over_time(host_disk_temperature_celsius{kind!="nvme"}[2h]) > 50'
+    for: 0s
+    summary: { en: "{{device}} ({{model}}) at {{value}} °C on {{instance}}", es: "{{device}} ({{model}}) a {{value}} °C en {{instance}}" }

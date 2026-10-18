@@ -1,0 +1,6 @@
+target/
+dist/
+# state of a server run from the checkout (ATALAYA_DATA defaults to ./data)
+/data/
+# the passwords of the Compose example (see examples/compose/README.md)
+examples/compose/.env

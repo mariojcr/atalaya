@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# atalaya-collector without Nomad, in a container next to ClickHouse and
+# node-exporter: static targets, host metrics (the host's / mounted at /host)
+# and Docker container logs. The ClickHouse password goes in the
+# CLICKHOUSE_PASSWORD environment variable. Reference: docs/collector.md.
+
+# Host name: the `instance` label of everything this collector sends
+node: host-1
+state_dir: /state
+
+clickhouse:
+  url: http://clickhouse:8123/
+  user: collector   # inserts only: see clickhouse-users.xml
+  database: atalaya
+
+scrape:
+  interval: 15s
+  static_targets:
+    - { service: node-exporter, url: http://node-exporter:9100/metrics }
+
+logs:
+  # Docker logs (json-file driver); with Nomad, allocation logs are read instead
+  docker_dir: /var/lib/docker/containers
+
+host:
+  root: /host
+  smart:
+    # SMART needs a privileged container (privileged: true in docker-compose.yml)
+    enabled: false

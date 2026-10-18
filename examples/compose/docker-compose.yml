@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# atalaya on a single host with Docker Compose: ClickHouse, the schema, the
+# UI, the collector and node-exporter.
+#
+#   docker compose up -d        →  http://localhost:8080
+#
+# One ClickHouse user per job, each with its own password from .env (see
+# README.md): admin applies the schema, reader serves the UI (read-only) and
+# collector inserts. Compose stops if one is missing.
+#
+# Images come from ghcr.io/mariojcr (ATALAYA_VERSION, latest by default: the
+# server and the collector share their versions); to use your own, build them
+# as described in the Dockerfile and change them here.
+
+services:
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.8
+    environment:
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:?set it in .env, see README.md}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      # read by clickhouse-users.xml
+      CLICKHOUSE_READER_PASSWORD: ${CLICKHOUSE_READER_PASSWORD:?set it in .env, see README.md}
+      CLICKHOUSE_COLLECTOR_PASSWORD: ${CLICKHOUSE_COLLECTOR_PASSWORD:?set it in .env, see README.md}
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+      - ./clickhouse-users.xml:/etc/clickhouse-server/users.d/atalaya.xml:ro
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      # /ping needs no user: no password on a command line, where `ps` would show it
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # Creates the database and tables (idempotent) and exits
+  schema:
+    image: ghcr.io/mariojcr/atalaya-server:${ATALAYA_VERSION:-latest}
+    command: ["schema", "--apply"]
+    environment:
+      CLICKHOUSE_URL: http://clickhouse:8123/
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:?set it in .env, see README.md}
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    restart: "no"
+
+  atalaya:
+    image: ghcr.io/mariojcr/atalaya-server:${ATALAYA_VERSION:-latest}
+    environment:
+      CLICKHOUSE_URL: http://clickhouse:8123/
+      CLICKHOUSE_USER: reader
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_READER_PASSWORD:?set it in .env, see README.md}
+      ATALAYA_DASHBOARDS: /etc/atalaya/dashboards   # overview, timeline and alerts next to it
+    volumes:
+      - ../data:/etc/atalaya:ro
+      - atalaya:/var/lib/atalaya                    # notebooks and alert state (the image's ATALAYA_DATA)
+    # Only on this machine: without sign-in, anyone who reaches the port can use it
+    ports:
+      - "127.0.0.1:${ATALAYA_PORT:-8080}:8080"
+    depends_on:
+      schema: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  collector:
+    image: ghcr.io/mariojcr/atalaya-collector:${ATALAYA_VERSION:-latest}
+    command: ["/etc/atalaya/collector.yaml"]
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_COLLECTOR_PASSWORD:?set it in .env, see README.md}
+    # privileged: true    # only for SMART (host.smart.enabled in collector.yaml)
+    volumes:
+      - ./collector.yaml:/etc/atalaya/collector.yaml:ro
+      - /:/host:ro                                   # sysfs: sensors, RAPL, GPU, battery
+      - ${DOCKER_CONTAINERS_DIR:-/var/lib/docker/containers}:/var/lib/docker/containers:ro
+      - collector:/state                             # log offsets and disk spool
+    depends_on:
+      schema: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  node-exporter:
+    image: docker.io/prom/node-exporter:v1.12.1
+    command: ["--path.rootfs=/host"]
+    pid: host
+    volumes:
+      - /:/host:ro
+    restart: unless-stopped
+
+volumes:
+  clickhouse:
+  atalaya:
+  collector:

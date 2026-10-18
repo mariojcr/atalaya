@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "atalaya-collector"
+description = "atalaya collector: scrapes Prometheus metrics, tails logs, reads host hardware and writes it all to ClickHouse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+flate2 = "1"
+futures.workspace = true
+libc = "0.2"
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
+# sync: the syslog receiver's connection limit (a semaphore)
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+xxhash-rust.workspace = true

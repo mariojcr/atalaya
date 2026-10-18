@@ -1,0 +1,428 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr> -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f5f7">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f1318">
+  <meta name="color-scheme" content="light dark">
+  <meta name="atalaya-now-delay" content="__NOW_DELAY__">
+  <meta name="atalaya-refresh" content="__PAGE_REFRESH__">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="icon" href="/static/favicon.ico" sizes="32x32">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <title>Atalaya</title>
+  <link rel="stylesheet" href="/static/uPlot.min.css">
+  <link rel="stylesheet" href="/static/app.css">
+  <!-- Loaded before first paint: sets data-theme and lang on <html> -->
+  <script src="/static/i18n.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn" id="nav-toggle" aria-label="Menu" data-i18n-aria="menu" aria-controls="sidenav" aria-expanded="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+    <a class="brand" href="#/">
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="brand-mark"><path d="M12 2 4 7v2h16V7z M6 10h3v9H6z M10.5 10h3v9h-3z M15 10h3v9h-3z M4 20h16v2H4z"/></svg>
+      <span>Atalaya</span>
+    </a>
+    <div class="topbar-title" id="view-title"></div>
+    <div class="time-controls">
+      <div class="time-picker">
+        <button class="outlined" id="time-button" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          <span id="time-label">Last hour</span>
+        </button>
+        <div class="menu time-menu" id="time-menu" hidden>
+          <div class="time-presets" id="time-presets" role="group" aria-label="Preset ranges" data-i18n-aria="time.presets"></div>
+          <div class="time-custom">
+            <label><span data-i18n="time.from">From</span> <input type="datetime-local" id="time-start"></label>
+            <label><span data-i18n="time.to">To</span> <input type="datetime-local" id="time-end"></label>
+            <button class="filled" id="time-apply" data-i18n="apply">Apply</button>
+          </div>
+        </div>
+      </div>
+      <button class="outlined toggle" id="auto-refresh" aria-pressed="false" data-tip="Refresh every minute">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></svg>
+        <span data-i18n="auto">Auto</span>
+      </button>
+      <!-- Language and theme: in the top bar; on mobile app.js moves them to the bottom of the side menu -->
+      <div class="prefs" id="prefs">
+        <div class="segmented lang" id="lang-pick" role="radiogroup" aria-label="Language" data-i18n-aria="lang.label">
+          <button role="radio" data-lang="en" aria-checked="true" lang="en">EN</button>
+          <button role="radio" data-lang="es" aria-checked="false" lang="es">ES</button>
+        </div>
+        <button class="icon-btn theme-btn" id="theme-btn" aria-label="Theme" data-t="system">
+          <svg class="i-system" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17A8.5 8.5 0 0 0 12 3.5z" fill="currentColor" stroke="none"/></svg>
+          <svg class="i-light" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></svg>
+          <svg class="i-dark" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.5A8.5 8.5 0 1 1 9.5 3.5a7 7 0 0 0 11 11z"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="sidenav" id="sidenav">
+    <a href="#/" data-view="home">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11 12 4l9 7M5 10v10h14V10"/></svg>
+      <span data-i18n="nav.home">Home</span>
+    </a>
+    <a href="#/alerts" data-view="alerts">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4l2-2zM10 20a2 2 0 0 0 4 0"/></svg>
+      <span data-i18n="nav.alerts">Alerts</span>
+    </a>
+    <a href="#/timeline" data-view="timeline">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18M8 4v4M14 10v4M11 16v4"/></svg>
+      <span data-i18n="nav.timeline">Timeline</span>
+    </a>
+    <a href="#/notebooks" data-view="notebooks">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h11a2 2 0 0 1 2 2v16l-3-2-3 2-3-2-3 2V5a2 2 0 0 1 2-2z"/><path d="M9 8h6M9 12h6"/></svg>
+      <span data-i18n="nav.notebooks">Notebooks</span>
+    </a>
+    <a href="#/metrics" data-view="metrics">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20h18M5 16l4-5 4 3 6-8"/></svg>
+      <span data-i18n="nav.metrics">Metrics explorer</span>
+    </a>
+    <a href="#/dashboards" data-view="dashboards">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="5" rx="1"/><rect x="13" y="10" width="8" height="11" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/></svg>
+      <span data-i18n="nav.dashboards">Dashboards</span>
+    </a>
+    <a href="#/logs" data-view="logs">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 10h16M4 14h10M4 18h12"/></svg>
+      <span data-i18n="nav.logs">Logs explorer</span>
+    </a>
+    <div class="sidenav-foot" id="sidenav-foot"></div>
+  </nav>
+
+  <main id="main" tabindex="-1">
+    <!-- Home: status board or dense table -->
+    <section class="view" id="view-home">
+      <div class="home-head">
+        <div class="home-summary" id="home-summary"></div>
+        <div class="segmented" id="home-mode" role="radiogroup" aria-label="Home view" data-i18n-aria="home.view">
+          <button role="radio" data-mode="tiles" aria-checked="true" data-i18n="home.tiles">Board</button>
+          <button role="radio" data-mode="table" aria-checked="false" data-i18n="home.table">Table</button>
+        </div>
+        <span class="hint" id="home-updated"></span>
+        <div class="status" id="home-status"></div>
+      </div>
+      <div class="tiles" id="home-tiles"></div>
+      <div class="dense" id="home-dense" hidden>
+        <div class="dense-filter"><span class="prompt" aria-hidden="true">&gt;</span><input id="home-filter" placeholder="host or service" data-i18n-placeholder="home.filter_ph" aria-label="Filter by host or service" data-i18n-aria="home.filter_aria" autocomplete="off"><span class="hint" id="home-count"></span></div>
+        <div class="dense-wrap">
+          <table id="home-table">
+            <thead><tr><th data-i18n="th.host">Host / service</th><th data-i18n="th.state">State</th><th data-i18n="th.cpu">CPU</th><th class="c-mem" data-i18n="th.mem">Mem</th><th class="c-net" data-i18n="th.net">Net</th><th class="num" data-i18n="th.err">Err/min</th><th class="num" data-i18n="th.series">Series</th><th class="c-last" data-i18n="th.lastlog">Last log</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="dense-keys"><span><kbd>j</kbd><kbd>k</kbd> <span data-i18n="keys.move">move</span></span><span><kbd data-i18n="keys.enter">Enter</kbd> <span data-i18n="keys.expand">expand</span></span><span><kbd>/</kbd> <span data-i18n="keys.filter">filter</span></span><span><kbd>g</kbd> <span data-i18n="keys.explorer">explorer</span></span><span><kbd>l</kbd> <span data-i18n="keys.logs">logs</span></span><span class="more-cols" aria-hidden="true" data-i18n="keys.more">→ more columns</span></div>
+      </div>
+    </section>
+
+    <!-- Alerts: alerts.yaml rules, their state, silences and history -->
+    <section class="view" id="view-alerts">
+      <div class="al-head">
+        <div class="al-counts" id="al-counts"></div>
+        <div class="al-tools"><span class="hint" id="al-meta"></span><button class="outlined small" id="al-refresh" data-i18n="al.refresh">Refresh</button></div>
+      </div>
+      <p class="werror" id="al-cfg-error" hidden></p>
+      <div class="al-channels" id="al-channels" hidden></div>
+      <div class="status" id="al-status"></div>
+      <div class="al-rules" id="al-rules"></div>
+      <h2 class="al-h2" data-i18n="al.silences">Silences</h2>
+      <div class="al-silences" id="al-silences"></div>
+      <h2 class="al-h2"><span data-i18n="al.history">History</span> <span class="hint" id="al-history-range"></span></h2>
+      <div class="al-history" id="al-history"></div>
+      <div class="scrim" id="al-silence" hidden>
+        <div class="picker al-silence-dialog" role="dialog" aria-modal="true" aria-labelledby="al-sil-title">
+          <h3 id="al-sil-title" data-i18n="al.silence_title">Silence</h3>
+          <p class="al-sil-what" id="al-sil-what"></p>
+          <p class="hint" data-i18n="al.silence_hint">Silenced alerts stay visible here but are not sent to the channels.</p>
+          <div class="segmented al-sil-dur" id="al-sil-dur" role="radiogroup" aria-label="Duration" data-i18n-aria="al.duration">
+            <button role="radio" data-d="1h" aria-checked="true">1 h</button>
+            <button role="radio" data-d="8h" aria-checked="false">8 h</button>
+            <button role="radio" data-d="24h" aria-checked="false">24 h</button>
+            <button role="radio" data-d="7d" aria-checked="false">7 d</button>
+            <button role="radio" data-d="custom" aria-checked="false" data-i18n="al.until_custom">Until…</button>
+          </div>
+          <input type="datetime-local" id="al-sil-custom" aria-label="Until" data-i18n-aria="al.until_label" hidden>
+          <label class="al-sil-comment"><span data-i18n="al.comment">Comment</span><input id="al-sil-comment" placeholder="Why it is silenced" data-i18n-placeholder="al.comment_ph" maxlength="200"></label>
+          <div class="al-sil-foot"><button class="text" id="al-sil-cancel" data-i18n="cancel">Cancel</button><button class="filled" id="al-sil-save" data-i18n="al.silence">Silence</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Timeline: events and lanes on a shared axis -->
+    <section class="view" id="view-timeline">
+      <div class="tl-head">
+        <span class="hint" id="tl-count"></span>
+        <span class="chip" id="tl-service" hidden><span data-i18n="tl.service">service:</span> <b id="tl-service-name"></b><button id="tl-service-clear" aria-label="Remove the service filter" data-i18n-aria="tl.clear_service">×</button></span>
+        <button class="outlined small" id="tl-back" hidden data-i18n="tl.back">⤺ back</button>
+        <div class="tl-add-wrap">
+          <button class="outlined small" id="tl-add" aria-haspopup="dialog" data-i18n="tl.add">+ lane</button>
+          <div class="menu tl-lane-pop" id="tl-lane-pop" role="dialog" aria-label="Add lane" data-i18n-aria="tl.add_dialog" hidden>
+            <label><span data-i18n="tl.query">PromQL query</span><input id="tl-lane-q" placeholder='rate(node_disk_io_time_seconds_total{instance="host-1"}[5m])' autocomplete="off"></label>
+            <div class="tl-lane-row">
+              <label><span data-i18n="tl.title">Title</span><input id="tl-lane-t" placeholder="Disk · host-1" data-i18n-placeholder="tl.title_ph"></label>
+              <label><span data-i18n="tl.unit">Unit</span><select id="tl-lane-u"><option value="short" data-i18n="unit.number">number</option><option value="percent">%</option><option value="bytes" data-i18n="unit.bytes">bytes</option><option value="Bps" data-i18n="unit.Bps">bytes/s</option><option value="s" data-i18n="unit.s">seconds</option><option value="watt">W</option></select></label>
+            </div>
+            <p class="hint" data-i18n="tl.session_hint">This session only; fixed lanes live in timeline.yaml.</p>
+            <button class="filled small" id="tl-lane-ok" data-i18n="add">Add</button>
+          </div>
+        </div>
+        <div class="status" id="tl-status"></div>
+      </div>
+      <div id="tl-desk">
+        <div class="tl-lanes" id="tl-lanes"></div>
+        <div class="tl-strip" id="tl-strip" hidden>
+          <div><h4><span id="tl-strip-time"></span> · <span data-i18n="tl.events">Events</span></h4><div id="tl-strip-ev"></div></div>
+          <div><h4><span data-i18n="tl.logs_slot">Logs in this slot</span> <button class="text small tl-to-nb" id="tl-to-nb" data-i18n="tl.to_nb">Add to notebook</button></h4><div id="tl-strip-logs"></div></div>
+          <div><h4 data-i18n="tl.values">Values</h4><div class="tl-vals" id="tl-strip-vals"></div></div>
+        </div>
+        <p class="hint tl-help" data-i18n="tl.help">Drag to zoom into a span · double-click to go back to the range · ← → move the cursor</p>
+      </div>
+      <div id="tl-mobile" hidden>
+        <div class="tl-mini" id="tl-mini"></div>
+        <div class="tl-list" id="tl-list"></div>
+      </div>
+    </section>
+
+    <!-- Notebooks: investigations as documents -->
+    <section class="view" id="view-notebooks">
+      <div id="nb-index">
+        <div class="nb-index-head">
+          <p class="hint" data-i18n="nb.intro">Investigations saved as documents: text, PromQL charts and logs, with their time range.</p>
+          <button class="filled small" id="nb-new" data-i18n="nb.new">+ Notebook</button>
+        </div>
+        <div class="nb-list" id="nb-list"></div>
+      </div>
+      <div id="nb-doc" hidden>
+        <header class="nb-head">
+          <a class="nb-back text small" href="#/notebooks" data-i18n="nb.back">‹ Notebooks</a>
+          <h2 class="nb-title" id="nb-title" tabindex="0" role="button" title="Click to edit the title" data-i18n-title="nb.edit_title"></h2>
+          <div class="nb-head-right">
+            <span class="hint nb-saved" id="nb-saved"></span>
+            <button class="text small" id="nb-share" data-i18n="nb.share">Share</button>
+            <button class="filled small" id="nb-save" data-tip="Ctrl+S" data-i18n="nb.save">Save</button>
+          </div>
+        </header>
+        <div class="nb-range-row">
+          <span class="hint" data-i18n="nb.range">Notebook range</span>
+          <span class="chip" id="nb-range-label"></span>
+          <select class="small" id="nb-range-sel" aria-label="Notebook range" data-i18n-aria="nb.range"></select>
+          <button class="text small" id="nb-freeze" aria-pressed="false" data-i18n="nb.freeze">Freeze range</button>
+          <button class="outlined small nb-cells-btn" id="nb-cells-btn" data-i18n="nb.cells">Cells</button>
+        </div>
+        <div class="nb-body">
+          <aside class="nb-side" id="nb-side">
+            <div class="nb-side-head"><span class="hint" data-i18n="nb.cells">Cells</span><button class="outlined small" id="nb-add" aria-haspopup="menu" data-i18n="nb.add_cell">+ cell</button>
+              <div class="menu nb-add-pop" id="nb-add-pop" hidden role="menu">
+                <button role="menuitem" data-type="text" data-i18n="nb.text">Text</button>
+                <button role="menuitem" data-type="promql" data-i18n="nb.promql">PromQL</button>
+                <button role="menuitem" data-type="logs" data-i18n="nb.logs">Logs</button>
+                <button role="menuitem" data-type="note" data-i18n="nb.note">Note</button>
+              </div>
+            </div>
+            <nav class="nb-outline" id="nb-outline" aria-label="Notebook outline" data-i18n-aria="nb.outline"></nav>
+          </aside>
+          <div class="nb-cells" id="nb-cells"></div>
+        </div>
+      </div>
+      <div class="status" id="nb-status"></div>
+    </section>
+
+
+    <!-- Metrics explorer -->
+    <section class="view" id="view-metrics">
+      <div class="explorer">
+        <aside class="query-panel">
+          <div class="tabs" role="tablist">
+            <button role="tab" class="tab active" data-tab="builder" data-i18n="tab.builder">Builder</button>
+            <button role="tab" class="tab" data-tab="code" data-i18n="tab.code">Query</button>
+            <button role="tab" class="tab" data-tab="sql" data-i18n="tab.sql">SQL</button>
+          </div>
+
+          <div class="tab-body" data-body="builder">
+            <div class="query-list" id="query-list"></div>
+            <div class="query-list" id="formula-list"></div>
+            <div class="add-row">
+              <button class="outlined" id="add-query" data-i18n="ex.add_query">+ Add query</button>
+              <button class="outlined" id="add-formula" data-i18n="ex.add_formula">+ Add formula</button>
+            </div>
+          </div>
+
+          <div class="tab-body" data-body="code" hidden>
+            <p class="hint" data-i18n-html="ex.code_hint">Queries in the <code>timeSeries</code> API format (or <code>{"promql": …}</code>) and the formulas that combine them. Edit them and run.</p>
+            <textarea id="code" spellcheck="false" rows="18"></textarea>
+            <button class="filled" id="code-run" data-i18n="ex.run">Run query</button>
+          </div>
+
+          <div class="tab-body" data-body="sql" hidden>
+            <p class="hint" data-i18n="ex.sql_hint">The SQL run in ClickHouse for each query (or the expression, for PromQL ones).</p>
+            <pre id="sql"></pre>
+          </div>
+        </aside>
+
+        <section class="chart-panel">
+          <div class="chart-toolbar">
+            <h2 id="chart-title">Metrics explorer</h2>
+            <div class="segmented" role="radiogroup" aria-label="Chart type" data-i18n-aria="ex.chart_type">
+              <button role="radio" data-type="line" aria-checked="true" data-i18n="ex.line">Line</button>
+              <button role="radio" data-type="area" aria-checked="false" data-i18n="ex.area">Stacked area</button>
+              <button role="radio" data-type="bar" aria-checked="false" data-i18n="ex.bar">Stacked bars</button>
+            </div>
+            <label class="check"><input type="checkbox" id="log-scale"> <span data-i18n="ex.log">Log scale</span></label>
+            <label class="check"><span data-i18n="ex.compare">Compare with</span>
+              <select id="compare">
+                <option value="" data-i18n="cmp.none">No comparison</option>
+                <option value="1h" data-i18n="cmp.1h">1 hour ago</option>
+                <option value="1d" data-i18n="cmp.1d">1 day ago</option>
+                <option value="7d" data-i18n="cmp.7d">1 week ago</option>
+                <option value="28d" data-i18n="cmp.28d">4 weeks ago</option>
+                <option value="prev" data-i18n="cmp.prev">Previous period</option>
+                <option value="custom" data-i18n="cmp.custom">Custom…</option>
+              </select>
+            </label>
+            <input id="compare-custom" class="narrow" placeholder="3h, 2d…" data-i18n-placeholder="ex.custom_ph" aria-label="Custom offset" data-i18n-aria="ex.custom_aria" hidden>
+          </div>
+          <div class="chart-host" id="explorer-chart">
+            <div class="empty">
+              <p data-i18n="ex.pick">Pick a metric to start.</p>
+            </div>
+          </div>
+          <div class="status-row"><div class="status" id="explorer-status"></div><button class="text small" id="legend-mode" aria-pressed="false" hidden data-i18n="legend.table">Table</button><button class="text small" id="ex-to-nb" data-i18n="ex.to_nb">Save to notebook</button></div>
+          <div class="legend-host" id="explorer-legend"></div>
+        </section>
+      </div>
+    </section>
+
+    <!-- Dashboards -->
+    <section class="view" id="view-dashboards">
+      <div class="dash-header">
+        <div class="dash-tabs" id="dash-list"></div>
+        <div class="dash-vars" id="dash-vars"></div>
+      </div>
+      <div class="dash-body" id="dash-grid"></div>
+    </section>
+
+    <!-- Logs explorer, Discover-style: query, fields, histogram and documents -->
+    <section class="view" id="view-logs">
+      <div class="lg-bar">
+        <div class="lg-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="log-q" role="combobox" aria-autocomplete="list" aria-controls="lg-ac" aria-expanded="false" placeholder="Search: free text, field:value, -field:value, field>10, field~text" data-i18n-placeholder="lg.search_ph" aria-label="Query" data-i18n-aria="lg.search_aria" autocomplete="off" spellcheck="false" autocapitalize="off">
+          <button class="icon-btn" id="lg-clear" aria-label="Clear query" data-i18n-aria="lg.clear" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+          <div class="menu lg-ac" id="lg-ac" role="listbox" aria-label="Suggestions" data-i18n-aria="lg.ac" hidden></div>
+        </div>
+        <button class="filled" id="lg-run" data-i18n="lg.run">Search</button>
+        <div class="lg-saved">
+          <button class="outlined" id="lg-open" aria-haspopup="menu" aria-expanded="false" data-i18n="lg.open">Open</button>
+          <button class="outlined" id="lg-save" aria-haspopup="dialog" data-i18n="lg.save">Save</button>
+          <button class="outlined" id="lg-to-nb" data-i18n="lg.to_nb">Add to notebook</button>
+          <div class="menu lg-saved-menu" id="lg-saved-menu" role="menu" aria-label="Saved searches" data-i18n-aria="lg.saved" hidden></div>
+          <div class="menu lg-save-pop" id="lg-save-pop" role="dialog" aria-label="Save search" data-i18n-aria="lg.save_as" hidden>
+            <label><span data-i18n="lg.save_as">Save search as</span><input id="lg-save-name" placeholder="Name" data-i18n-placeholder="lg.name_ph" autocomplete="off"></label>
+            <button class="filled small" id="lg-save-ok" data-i18n="lg.save">Save</button>
+          </div>
+        </div>
+      </div>
+      <div class="lg-pills" id="lg-pills"></div>
+      <div class="lg-layout">
+        <div class="lg-fields-scrim" id="lg-fields-scrim" hidden></div>
+        <aside class="lg-fields" id="lg-fields" aria-label="Fields" data-i18n-aria="lg.fields">
+          <div class="lg-fields-head">
+            <input id="lg-field-q" type="search" placeholder="Search field names" data-i18n-placeholder="lg.field_q" aria-label="Search field names" data-i18n-aria="lg.field_q" autocomplete="off">
+            <button class="icon-btn" id="lg-fields-close" aria-label="Close" data-i18n-aria="drawer.close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+          </div>
+          <div class="lg-fields-body" id="lg-fields-body"></div>
+        </aside>
+        <div class="lg-main">
+          <div class="lg-hits">
+            <span class="lg-count" id="lg-count"></span>
+            <div class="status" id="log-status"></div>
+            <button class="outlined small lg-fields-btn" id="lg-fields-btn" aria-expanded="false" data-i18n="lg.fields">Fields</button>
+            <label class="lg-bk-label"><span data-i18n="lg.bk">Break down by</span><select id="lg-bk"></select></label>
+          </div>
+          <div class="chart-host small lg-chart" id="log-chart"></div>
+          <div class="legend-host lg-legend" id="lg-legend"></div>
+          <p class="hint lg-zoom-hint" data-i18n="lg.zoom_hint">Drag to zoom · click a bar to open that bucket</p>
+          <div class="lg-docs" id="lg-docs"></div>
+        </div>
+      </div>
+      <!-- Documents surrounding one -->
+      <div class="scrim lg-ctx" id="lg-ctx" hidden>
+        <div class="picker lg-ctx-dialog" role="dialog" aria-modal="true" aria-labelledby="lg-ctx-title">
+          <header class="lg-ctx-head">
+            <div><h3 id="lg-ctx-title"></h3><p class="hint" id="lg-ctx-sub"></p></div>
+            <label class="lg-ctx-nlabel"><span data-i18n="lg.ctx_n">Before and after</span><select id="lg-ctx-n"><option>10</option><option selected>20</option><option>50</option><option>100</option></select></label>
+            <button class="icon-btn" id="lg-ctx-close" aria-label="Close" data-i18n-aria="drawer.close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+          </header>
+          <div class="lg-ctx-list" id="lg-ctx-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Metric picker, modelled on Cloud Monitoring's -->
+  <div class="scrim" id="picker" hidden>
+    <div class="picker" role="dialog" aria-modal="true" aria-label="Select a metric" data-i18n-aria="picker.aria">
+      <div class="picker-search">
+        <input id="picker-q" placeholder="Filter by resource and metric name" data-i18n-placeholder="picker.ph" autocomplete="off" aria-label="Filter metrics" data-i18n-aria="picker.filter_aria">
+        <span class="hint" id="picker-count"></span>
+      </div>
+      <div class="picker-cols">
+        <div class="picker-col"><h3 data-i18n="picker.resources">Resources</h3><ul id="picker-resources" role="listbox" aria-label="Resources" data-i18n-aria="picker.resources"></ul></div>
+        <div class="picker-col"><h3 data-i18n="picker.categories">Categories</h3><ul id="picker-categories" role="listbox" aria-label="Categories" data-i18n-aria="picker.categories"></ul></div>
+        <div class="picker-col wide"><h3 data-i18n="picker.metrics">Metrics</h3><ul id="picker-metrics" role="listbox" aria-label="Metrics" data-i18n-aria="picker.metrics"></ul></div>
+      </div>
+      <div class="picker-foot">
+        <p class="hint" id="picker-desc"></p>
+        <button class="text" id="picker-cancel" data-i18n="cancel">Cancel</button>
+        <button class="filled" id="picker-apply" disabled data-i18n="apply">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Service drawer (opened from the board, table and timeline) -->
+  <div class="drawer-scrim" id="drawer" hidden>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+      <header class="drawer-head">
+        <div class="drawer-grab" aria-hidden="true"></div>
+        <div class="drawer-title" id="drawer-title"><span class="crumb" id="drawer-host"></span><span class="crumb">›</span><b id="drawer-svc"></b><i class="hdot" id="drawer-dot" aria-hidden="true"></i></div>
+        <button class="icon-btn" id="drawer-close" aria-label="Close" data-i18n-aria="drawer.close"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        <p class="drawer-sub" id="drawer-sub"></p>
+        <div class="drawer-actions">
+          <a class="outlined small" id="drawer-explore" href="#/metrics" data-i18n="drawer.explore">Explorer ↗</a>
+          <a class="outlined small" id="drawer-logs" href="#/logs" data-i18n="drawer.logs">Logs</a>
+          <a class="outlined small" id="drawer-dash" href="#/dashboards" hidden data-i18n="drawer.dash">Dashboard</a>
+          <a class="outlined small" id="drawer-timeline" href="#/timeline" data-i18n="nav.timeline">Timeline</a>
+        </div>
+      </header>
+      <div class="drawer-body">
+        <div class="dstats">
+          <div><span class="lb" data-i18n="chart.cpu">CPU</span><b id="d-cpu">—</b></div>
+          <div><span class="lb" data-i18n="detail.mem">Memory</span><b id="d-mem">—</b></div>
+          <div><span class="lb" data-i18n="detail.errmin">Errors/min</span><b id="d-err">—</b></div>
+        </div>
+        <section><h4><span data-i18n="detail.cpu">Alloc CPU</span> · <span id="d-range"></span></h4><div class="chart-host dchart" data-k="cpu"></div></section>
+        <section><h4 data-i18n="detail.mem">Memory</h4><div class="chart-host dchart" data-k="mem"></div></section>
+        <section><h4 data-i18n="detail.err">Errors per hour</h4><div class="chart-host dchart short" data-k="err"></div></section>
+        <section><h4 data-i18n="detail.logs">Latest logs</h4><div class="log-list compact" id="d-logs" data-k="logs"></div></section>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/static/uPlot.iife.min.js"></script>
+  <script src="/static/units.js"></script>
+  <script src="/static/prom.js"></script>
+  <script src="/static/app.js"></script>
+  <script src="/static/dash.js"></script>
+  <script src="/static/home.js"></script>
+  <script src="/static/timeline.js"></script>
+  <script src="/static/notebook.js"></script>
+  <script src="/static/logs.js"></script>
+  <script src="/static/alerts.js"></script>
+</body>
+</html>

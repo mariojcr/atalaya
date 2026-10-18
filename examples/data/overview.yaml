@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
+# SPDX-License-Identifier: Apache-2.0
+# The home page (Board and Table): what each service shows. A service is a job
+# (the collector's scrape.static_targets); each host is its collector's `node`.
+#   spark        PromQL for the small chart ($job and $host are substituted)
+#   spark_unit   chart unit (percent, bytes, watt, short…)
+#   status       pieces of the status line; {{v}} is the query's value and
+#                unit: bytes | secs formats it. A single text or {en, es}
+#   warn         PromQL: if it returns > 0, the service is shown as warning
+#   hosts_from   services without `up` (the collector): PromQL whose series give
+#                the hosts through their instance label
+#   node_job     node-exporter job (CPU, memory and network of each host)
+#   ignore_tasks Nomad tasks whose logs do not count (no Nomad here)
+node_job: node-exporter
+
+services:
+  node-exporter:
+    spark: '100 * (1 - avg(rate(node_cpu_seconds_total{job="node-exporter", instance="$host", mode="idle"}[5m])))'
+    spark_unit: percent
+    status:
+      - { text: { en: "{{v}} cores", es: "{{v}} núcleos" }, query: 'count(node_cpu_seconds_total{job="node-exporter", instance="$host", mode="idle"})', decimals: 0 }
+      - { text: { en: "load {{v}}", es: "carga {{v}}" }, query: 'node_load1{job="node-exporter", instance="$host"}', decimals: 2 }
+      - { text: { en: "CPU {{v}} °C", es: "CPU {{v}} °C" }, query: 'max(host_temperature_celsius{instance="$host", label=~"Package id 0|Tctl"})', decimals: 0 }
+    warn: 'max(host_temperature_celsius{instance="$host", label=~"Package id 0|Tctl"}) > bool 95'
+  atalaya-collector:
+    hosts_from: 'atalaya_collector_points_total'
+    spark: 'sum by (instance) (rate(atalaya_collector_points_total{instance="$host"}[5m]))'
+    spark_unit: short
+    status:
+      - { text: { en: "{{v}} points/s", es: "{{v}} puntos/s" }, query: 'sum(rate(atalaya_collector_points_total{instance="$host"}[5m]))', decimals: 0 }
+      - { text: { en: "queue {{v}}", es: "cola {{v}}" }, query: 'sum(atalaya_collector_spool_bytes{instance="$host"})', unit: bytes }
