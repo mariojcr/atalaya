@@ -171,10 +171,15 @@ impl Engine {
         if end < start {
             bail!("end is before start");
         }
+        let now = now();
+        // Within the epoch and a day ahead: start and end come from the request,
+        // and neither `end - start` nor the arithmetic on them below may overflow
+        if start < 0 || end > now + 86400 {
+            bail!("invalid range");
+        }
         if (end - start) / step + 1 > MAX_POINTS {
             bail!("too many points per series ({}): increase the step", (end - start) / step + 1);
         }
-        let now = now();
         let range = end - start;
 
         // The tier depends on the expression's longest range, and the macros
@@ -266,5 +271,24 @@ impl Engine {
     /// Instant query at `time`
     pub async fn instant(&self, query: &str, time: i64) -> Result<Evaluated> {
         self.range(query, time, time, 15).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_range_outside_the_epoch_or_far_ahead_is_refused() {
+        let ch = crate::ch::ClickHouse::new("http://127.0.0.1:1/".into(), "u".into(), String::new());
+        let engine = Engine::new(Store::new(ch, "atalaya".into()));
+        let now = now();
+        // i64::MIN would wrap `end - start` past the point limit
+        for (start, end) in [(i64::MIN, now), (-1, now), (now, now + 2 * 86400), (now, i64::MAX)] {
+            let err = engine.range("up", start, end, 15).await.err().expect("refused");
+            assert!(err.to_string().contains("invalid range"), "{start}..{end}: {err}");
+        }
+        let err = engine.instant("up", i64::MIN).await.err().expect("refused");
+        assert!(err.to_string().contains("invalid range"), "{err}");
     }
 }
