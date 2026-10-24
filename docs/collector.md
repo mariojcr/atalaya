@@ -134,12 +134,16 @@ JSON lines are unaffected.
 
 The patterns come from whoever submits the job, so their cost is bounded:
 
-- **Count:** 8 per task, 16 per job and 32 in use per node. The same text is
+- **Count:** only a task's first 8 lines are read. A job holds at most 16
+  patterns on a node, and the node at most 32 in use. The same text is
   compiled once for every allocation.
 - **Size:** each pattern compiles to at most 32 KiB, and patterns only see the
   first 4 KiB of a line.
-- **Time:** a job's lines get 50 ms of matching per pass (every 2 s); the rest
-  of that pass's lines go without pattern attributes.
+- **Time:** in each pass (every 2 s), a job's lines get 50 ms of matching, and
+  the node's lines 200 ms in all. The rest of that pass's lines go without
+  pattern attributes, and each pass starts at a different allocation.
+
+A dispatched or periodic job's children count as their parent job.
 
 A pattern that does not compile, or is past those limits, is skipped with a
 warning in the collector's log. A pattern that only lacked room on the node is

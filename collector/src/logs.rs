@@ -43,11 +43,12 @@ const MAX_BODY: usize = 64 << 10;
 /// Log patterns only see the start of a line: enough for a structured line,
 /// and the work per line stays bounded
 const PATTERN_INPUT: usize = 4 << 10;
-/// Time a job's lines may spend matching patterns in one pass, all its
-/// allocations together: no pattern is tried past it, and the rest of the
-/// pass's lines go without pattern attributes, so a costly pattern cannot hold
-/// up every other allocation's logs
-const PATTERN_BUDGET: Duration = Duration::from_millis(50);
+/// Time lines may spend matching patterns in one pass: a job's (with its
+/// dispatched or periodic children) and the node's. No pattern is tried past
+/// it, and the rest of the pass's lines go without pattern attributes, so
+/// costly patterns cannot hold up every other allocation's logs.
+const JOB_PATTERN_TIME: Duration = Duration::from_millis(50);
+const NODE_PATTERN_TIME: Duration = Duration::from_millis(200);
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct State {
@@ -65,8 +66,11 @@ pub struct Tailer {
     /// Groups in the middle of a line longer than MAX_READ: discard up to the
     /// next newline
     skipping: HashSet<String>,
-    /// Groups already reported for running out of their job's pattern budget
+    /// Groups already reported for running out of pattern time
     over_budget: HashSet<String>,
+    /// Passes so far: each starts at a different group, so the node's pattern
+    /// time does not always go to the same allocations
+    passes: usize,
     host: String,
     pub lines: u64,
     /// Lines truncated or dropped for being too long
@@ -122,6 +126,7 @@ impl Tailer {
             partial: HashMap::new(),
             skipping: HashSet::new(),
             over_budget: HashSet::new(),
+            passes: 0,
             host,
             lines: 0,
             truncated: 0,
@@ -182,11 +187,12 @@ impl Tailer {
         self.skipping.retain(|k| groups.contains_key(k));
         self.over_budget.retain(|k| groups.contains_key(k));
 
-        let mut budgets: HashMap<String, Duration> = HashMap::new();
-        for (key, g) in &groups {
+        let mut budget = Budget::new();
+        let first = self.passes % groups.len().max(1);
+        self.passes = self.passes.wrapping_add(1);
+        for (key, g) in groups.iter().cycle().skip(first).take(groups.len()) {
             let (mut idx, mut pos) = self.state.files.get(key).copied().unwrap_or((g.files[0].0, 0));
             let info = nomad.alloc(&g.alloc).await.unwrap_or_default();
-            let budget = budgets.entry(format!("{}/{}", info.namespace, info.job)).or_insert(PATTERN_BUDGET);
             loop {
                 let Some((_, path)) = g.files.iter().find(|(n, _)| *n == idx) else {
                     // The file is gone: move to the next available one
@@ -223,7 +229,7 @@ impl Tailer {
                 // the rest (otherwise the same block would be re-read every pass)
                 if buf.len() as u64 >= MAX_READ && !buf.contains(&b'\n') && !has_next {
                     let head = String::from_utf8_lossy(&buf).into_owned();
-                    self.emit(key, g, &info, &head, sink, budget);
+                    self.emit(key, g, &info, &head, sink, &mut budget);
                     self.truncated += 1;
                     self.skipping.insert(key.clone());
                     pos += buf.len() as u64;
@@ -238,7 +244,7 @@ impl Tailer {
                     None => (&[][..], 0),
                 };
                 for line in String::from_utf8_lossy(complete).lines() {
-                    self.emit(key, g, &info, line, sink, budget);
+                    self.emit(key, g, &info, line, sink, &mut budget);
                 }
                 pos += consumed;
                 if consumed == 0 && has_next {
@@ -273,7 +279,7 @@ impl Tailer {
         }
     }
 
-    fn emit(&mut self, key: &str, g: &Group, info: &crate::nomad::AllocInfo, line: &str, sink: &Sink, budget: &mut Duration) {
+    fn emit(&mut self, key: &str, g: &Group, info: &crate::nomad::AllocInfo, line: &str, sink: &Sink, budget: &mut Budget) {
         let (time, stream, text) = match line_re().captures(line) {
             Some(c) => {
                 let text = c["text"].to_owned();
@@ -311,7 +317,8 @@ impl Tailer {
             "nomad.namespace": info.namespace,
         });
         let list = info.log_regex.get(&g.task).map_or(&[][..], Vec::as_slice);
-        let list = if budget.is_zero() { &[] } else { list };
+        let left = if list.is_empty() { Duration::ZERO } else { budget.left(&info.owner) };
+        let list = if left.is_zero() { &[] } else { list };
         let started = Instant::now();
         let row = build_row(
             &self.host,
@@ -320,23 +327,46 @@ impl Tailer {
             time,
             text,
             resource,
-            LinePatterns {
-                list,
-                until: started + *budget,
-            },
+            LinePatterns { list, until: started + left },
         );
-        if !list.is_empty() {
-            *budget = budget.saturating_sub(started.elapsed());
-            if budget.is_zero() && self.over_budget.insert(key.to_owned()) {
-                tracing::warn!(
-                    "logs: {key}: its job's log patterns took over {PATTERN_BUDGET:?} in one pass; the rest of its lines in that pass went without their attributes"
-                );
-            }
+        if !list.is_empty() && budget.spend(&info.owner, started.elapsed()) && self.over_budget.insert(key.to_owned()) {
+            tracing::warn!(
+                "logs: {key}: out of log pattern time in one pass ({JOB_PATTERN_TIME:?} per job, {NODE_PATTERN_TIME:?} per node); the rest of its lines in that pass went without their attributes"
+            );
         }
         if let Some(row) = row {
             sink.push("logs", row);
             self.lines += 1;
         }
+    }
+}
+
+/// What is left of a pass's pattern time, per job (`AllocInfo::owner`) and for
+/// the node
+struct Budget {
+    node: Duration,
+    jobs: HashMap<String, Duration>,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self {
+            node: NODE_PATTERN_TIME,
+            jobs: HashMap::new(),
+        }
+    }
+
+    /// Time left for a job's lines
+    fn left(&self, job: &str) -> Duration {
+        self.node.min(self.jobs.get(job).copied().unwrap_or(JOB_PATTERN_TIME))
+    }
+
+    /// Takes the time a job's line took; true if that leaves the job none
+    fn spend(&mut self, job: &str, took: Duration) -> bool {
+        self.node = self.node.saturating_sub(took);
+        let left = self.jobs.entry(job.to_owned()).or_insert(JOB_PATTERN_TIME);
+        *left = left.saturating_sub(took);
+        self.left(job).is_zero()
     }
 }
 
@@ -519,10 +549,28 @@ mod tests {
     }
 
     #[test]
+    fn pattern_time_is_shared_by_a_job_and_by_the_node() {
+        let mut b = Budget::new();
+        assert!(b.spend("ns/a", JOB_PATTERN_TIME), "job a is out of time");
+        assert_eq!(b.left("ns/a"), Duration::ZERO);
+        assert_eq!(b.left("ns/b"), JOB_PATTERN_TIME, "b still has its own");
+        for job in ["ns/b", "ns/c", "ns/d"] {
+            b.spend(job, JOB_PATTERN_TIME - Duration::from_millis(1));
+        }
+        assert_eq!(
+            b.left("ns/e"),
+            NODE_PATTERN_TIME - 4 * JOB_PATTERN_TIME + Duration::from_millis(3),
+            "the node's time runs out first"
+        );
+        assert!(b.spend("ns/e", Duration::from_millis(3)), "none left for anyone");
+        assert_eq!(b.left("ns/f"), Duration::ZERO);
+    }
+
+    #[test]
     fn no_pattern_is_tried_past_its_deadline() {
         let list = [Arc::new(Regex::new("(?P<x>.)").unwrap())];
         let row = |until| build_row("h", "web", "stdout", Utc::now(), "text".into(), json!({}), LinePatterns { list: &list, until }).unwrap();
-        assert_eq!(row(Instant::now() + PATTERN_BUDGET)["Attributes"], json!({"x": "t"}));
+        assert_eq!(row(Instant::now() + JOB_PATTERN_TIME)["Attributes"], json!({"x": "t"}));
         assert_eq!(row(Instant::now())["Attributes"], json!({}), "out of time: the line goes without them");
     }
 
@@ -536,7 +584,7 @@ mod tests {
         .map(|p| Arc::new(Regex::new(p).unwrap()));
         let all = |n: usize| LinePatterns {
             list: &patterns[..n],
-            until: Instant::now() + PATTERN_BUDGET,
+            until: Instant::now() + JOB_PATTERN_TIME,
         };
         let row = |text: &str| build_row("h", "dns", "stderr", Utc::now(), text.into(), json!({}), all(3)).unwrap();
 

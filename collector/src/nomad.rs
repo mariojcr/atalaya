@@ -38,6 +38,9 @@ pub struct AllocInfo {
     pub reach: Reach,
     /// The patterns each task's plain-text log lines are parsed with
     pub log_regex: Arc<HashMap<String, Vec<Arc<Regex>>>>,
+    /// Whose share of pattern slots and time they use: namespace/job, or the
+    /// parent job of a dispatched or periodic one
+    pub owner: String,
 }
 
 /// Meta key (task, group or job) with the patterns that turn a task's
@@ -131,6 +134,9 @@ struct Allocation {
 /// The job the allocation runs: only its meta
 #[derive(Deserialize)]
 struct JobSpec {
+    /// Set on a dispatched or periodic job's children
+    #[serde(rename = "ParentID", default)]
+    parent: String,
     #[serde(rename = "Meta", default)]
     meta: Option<HashMap<String, String>>,
     #[serde(rename = "TaskGroups", default)]
@@ -230,6 +236,13 @@ impl Allocation {
         Reach { own, ports }
     }
 
+    /// Whose share of pattern slots and time the allocation uses: its job, or
+    /// the parent of a dispatched or periodic one (each child has its own ID)
+    fn owner(&self) -> String {
+        let parent = self.job.as_ref().map_or("", |j| j.parent.as_str());
+        format!("{}/{}", self.namespace, if parent.is_empty() { &self.job_id } else { parent })
+    }
+
     /// Each task's log patterns: its `atalaya.log_regex`, or its group's, or
     /// its job's, compiled once per node (`compiled`); and those left out
     fn log_regex(&self, compiled: &mut Patterns) -> (HashMap<String, Vec<Arc<Regex>>>, Vec<Skipped>) {
@@ -238,19 +251,17 @@ impl Allocation {
         let Some(group) = job.groups.iter().flatten().find(|g| g.name == self.task_group) else {
             return (out, skipped);
         };
-        let owner = format!("{}/{}", self.namespace, self.job_id);
+        let owner = self.owner();
         for task in group.tasks.iter().flatten() {
             let Some(src) = [&task.meta, &group.meta, &job.meta].into_iter().flatten().find_map(|m| m.get(LOG_REGEX)) else {
                 continue;
             };
             let mut patterns = Vec::new();
-            for (line, text) in src.lines().map(str::trim).enumerate().filter(|(_, l)| !l.is_empty()) {
-                let found = if patterns.len() == MAX_TASK_PATTERNS {
-                    Err((format!("a task has at most {MAX_TASK_PATTERNS} patterns"), false))
-                } else {
-                    pattern(compiled, text, &owner)
-                };
-                match found {
+            let mut lines = src.lines().map(str::trim).enumerate().filter(|(_, l)| !l.is_empty());
+            // Only the first lines are looked at, compiled or not: the rest are
+            // reported together
+            for (line, text) in lines.by_ref().take(MAX_TASK_PATTERNS) {
+                match pattern(compiled, text, &owner) {
                     Ok(re) => patterns.push(re),
                     Err((why, full)) => skipped.push(Skipped {
                         task: task.name.clone(),
@@ -259,6 +270,16 @@ impl Allocation {
                         full,
                     }),
                 }
+            }
+            let rest: Vec<usize> = lines.map(|(line, _)| line).collect();
+            if let Some(&line) = rest.first() {
+                let why = format!("past the {MAX_TASK_PATTERNS} lines a task may have ({} more)", rest.len());
+                skipped.push(Skipped {
+                    task: task.name.clone(),
+                    line,
+                    why,
+                    full: false,
+                });
             }
             if !patterns.is_empty() {
                 out.insert(task.name.clone(), patterns);
@@ -434,6 +455,7 @@ impl Nomad {
             skipped.iter().any(|s| s.full).then(|| now + FULL_TTL)
         };
         let log_regex = Arc::new(log_regex);
+        let owner = a.owner();
         let info = AllocInfo {
             job: a.job_id,
             group: a.task_group,
@@ -441,6 +463,7 @@ impl Nomad {
             index,
             reach,
             log_regex,
+            owner,
         };
         remember(&mut self.allocs.lock().unwrap(), id, info.clone(), until, now);
         Some(info)
@@ -630,6 +653,21 @@ mod tests {
             1,
             "patterns nobody holds are forgotten"
         );
+    }
+
+    #[test]
+    fn only_a_tasks_first_lines_count_and_children_share_their_parents_slots() {
+        let src = format!("{}\nvalid", ["(unclosed"; MAX_TASK_PATTERNS].join("\n"));
+        let a: Allocation = serde_json::from_value(serde_json::json!({
+            "JobID": "batch/dispatch-1", "TaskGroup": "g", "Namespace": "default", "Name": "batch/dispatch-1.g[0]",
+            "Job": {"ParentID": "batch", "TaskGroups": [{"Name": "g", "Tasks": [{"Name": "t", "Meta": {"atalaya.log_regex": src}}]}]},
+        }))
+        .unwrap();
+        let (got, skipped) = a.log_regex(&mut HashMap::new());
+        assert!(got.is_empty(), "the valid line comes after the first {MAX_TASK_PATTERNS}");
+        assert_eq!(skipped.len(), MAX_TASK_PATTERNS + 1, "each one that does not compile, and the rest together");
+        assert!(skipped[MAX_TASK_PATTERNS].why.ends_with("(1 more)"), "{}", skipped[MAX_TASK_PATTERNS].why);
+        assert_eq!(a.owner(), "default/batch");
     }
 
     #[test]
