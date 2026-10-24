@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::prom::{Descriptor, Kind, Labels, Scalar, Scrape};
+use crate::prom::{Kind, Labels, Scrape};
 
 pub const SERVICE: &str = "host";
 
@@ -53,27 +53,11 @@ fn lbl(pairs: &[(&str, &str)]) -> Labels {
 
 struct Out(Scrape);
 impl Out {
-    fn put(&mut self, metric: &str, kind: Kind, unit: &str, help: &str, labels: Labels, value: f64) {
-        if !value.is_finite() {
-            return;
-        }
-        self.0.descriptors.entry(metric.to_owned()).or_insert_with(|| Descriptor {
-            kind,
-            unit: unit.to_owned(),
-            help: help.to_owned(),
-        });
-        self.0.scalars.push(Scalar {
-            metric: metric.to_owned(),
-            labels,
-            value,
-            counter: kind == Kind::Cumulative,
-        });
-    }
     fn gauge(&mut self, metric: &str, unit: &str, help: &str, labels: Labels, value: f64) {
-        self.put(metric, Kind::Gauge, unit, help, labels, value);
+        self.0.put(metric, Kind::Gauge, unit, help, labels, value);
     }
     fn counter(&mut self, metric: &str, unit: &str, help: &str, labels: Labels, value: f64) {
-        self.put(metric, Kind::Cumulative, unit, help, labels, value);
+        self.0.put(metric, Kind::Cumulative, unit, help, labels, value);
     }
 }
 
@@ -347,6 +331,7 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prom::Scalar;
     use std::os::unix::fs::symlink;
 
     fn w(p: &Path, s: &str) {
