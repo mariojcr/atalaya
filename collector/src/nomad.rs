@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Nomad API queries: this node's services that expose metrics and the details
-//! of each allocation (job, group, index), cached.
+//! of each allocation (job, group, index, log patterns), cached.
 //!
 //! A service registration's address and port are the job's to choose, and the
 //! collector scrapes from the host's network: a target is only scraped at an
@@ -11,10 +11,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -35,7 +36,19 @@ pub struct AllocInfo {
     pub index: String,
     /// Where the allocation answers
     pub reach: Reach,
+    /// The patterns each task's plain-text log lines are parsed with
+    pub log_regex: Arc<HashMap<String, Vec<Arc<Regex>>>>,
 }
+
+/// Meta key (task, group or job) with the patterns that turn a task's
+/// plain-text log lines into attributes: one regular expression per line
+const LOG_REGEX: &str = "atalaya.log_regex";
+/// The patterns come from the job, so they are bounded: at most this many per
+/// task, this many in use on the node (the same text is compiled once for
+/// every allocation), and each compiled, and its lazy DFA cache, up to this size
+const MAX_PATTERNS: usize = 16;
+const MAX_NODE_PATTERNS: usize = 32;
+const PATTERN_SIZE: usize = 64 << 10;
 
 /// Where an allocation answers: its own address in its network namespace (any
 /// port there is its own) and the host addresses and ports it was given
@@ -97,6 +110,35 @@ struct Allocation {
     network_status: Option<NetworkStatus>,
     #[serde(rename = "AllocatedResources", default)]
     resources: Option<AllocatedResources>,
+    #[serde(rename = "Job", default)]
+    job: Option<JobSpec>,
+}
+
+/// The job the allocation runs: only its meta
+#[derive(Deserialize)]
+struct JobSpec {
+    #[serde(rename = "Meta", default)]
+    meta: Option<HashMap<String, String>>,
+    #[serde(rename = "TaskGroups", default)]
+    groups: Option<Vec<GroupSpec>>,
+}
+
+#[derive(Deserialize)]
+struct GroupSpec {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Meta", default)]
+    meta: Option<HashMap<String, String>>,
+    #[serde(rename = "Tasks", default)]
+    tasks: Option<Vec<TaskSpec>>,
+}
+
+#[derive(Deserialize)]
+struct TaskSpec {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Meta", default)]
+    meta: Option<HashMap<String, String>>,
 }
 
 /// The group network's status (bridge or CNI): the allocation's own address
@@ -173,6 +215,54 @@ impl Allocation {
         }
         Reach { own, ports }
     }
+
+    /// Each task's log patterns: its `atalaya.log_regex`, or its group's, or
+    /// its job's, compiled once per node (`compiled`)
+    fn log_regex(&self, compiled: &mut HashMap<String, Arc<Regex>>) -> HashMap<String, Vec<Arc<Regex>>> {
+        let mut out = HashMap::new();
+        let Some(job) = &self.job else { return out };
+        let Some(group) = job.groups.iter().flatten().find(|g| g.name == self.task_group) else {
+            return out;
+        };
+        for task in group.tasks.iter().flatten() {
+            let Some(src) = [&task.meta, &group.meta, &job.meta].into_iter().flatten().find_map(|m| m.get(LOG_REGEX)) else {
+                continue;
+            };
+            let who = format!("{}/{}", self.job_id, task.name);
+            let lines = src.lines().map(str::trim).filter(|l| !l.is_empty());
+            let patterns: Vec<_> = lines.take(MAX_PATTERNS).filter_map(|l| pattern(compiled, l, &who)).collect();
+            if !patterns.is_empty() {
+                out.insert(task.name.clone(), patterns);
+            }
+        }
+        out
+    }
+}
+
+/// A compiled log pattern, shared with every allocation that uses the same
+/// text. None (and a warning) if it does not compile or the node already has
+/// `MAX_NODE_PATTERNS` others in use.
+fn pattern(compiled: &mut HashMap<String, Arc<Regex>>, src: &str, task: &str) -> Option<Arc<Regex>> {
+    if let Some(re) = compiled.get(src) {
+        return Some(re.clone());
+    }
+    // Those no allocation holds any more are forgotten
+    compiled.retain(|_, re| Arc::strong_count(re) > 1);
+    if compiled.len() >= MAX_NODE_PATTERNS {
+        tracing::warn!("nomad: {task}: ignoring a {LOG_REGEX} pattern: {MAX_NODE_PATTERNS} already in use on this node");
+        return None;
+    }
+    match RegexBuilder::new(src).size_limit(PATTERN_SIZE).dfa_size_limit(PATTERN_SIZE).build() {
+        Ok(re) => {
+            let re = Arc::new(re);
+            compiled.insert(src.to_owned(), re.clone());
+            Some(re)
+        }
+        Err(e) => {
+            tracing::warn!("nomad: {task}: ignoring a {LOG_REGEX} pattern: {e}");
+            None
+        }
+    }
 }
 
 /// The target a registration describes, if it points at its own allocation
@@ -206,6 +296,8 @@ pub struct Nomad {
     allocs: Mutex<Cache>,
     /// Registrations already reported as not scraped: once each
     refused: Mutex<HashSet<String>>,
+    /// Compiled log patterns by their text, for every allocation on the node
+    patterns: Mutex<HashMap<String, Arc<Regex>>>,
 }
 
 /// An allocation not asked about for this long is forgotten: it has stopped
@@ -242,6 +334,7 @@ impl Nomad {
             node_id,
             allocs: Mutex::new(HashMap::new()),
             refused: Mutex::new(HashSet::new()),
+            patterns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -305,12 +398,14 @@ impl Nomad {
         let index = a.name.rsplit_once('[').and_then(|(_, i)| i.strip_suffix(']')).unwrap_or("0").to_owned();
         let reach = a.reach();
         let until = (a.client_status == "pending").then(|| now + PENDING_TTL);
+        let log_regex = Arc::new(a.log_regex(&mut self.patterns.lock().unwrap()));
         let info = AllocInfo {
             job: a.job_id,
             group: a.task_group,
             namespace: a.namespace,
             index,
             reach,
+            log_regex,
         };
         remember(&mut self.allocs.lock().unwrap(), id, info.clone(), until, now);
         Some(info)
@@ -333,7 +428,7 @@ mod tests {
             group: "g".into(),
             namespace: "default".into(),
             index: "0".into(),
-            reach: Reach::default(),
+            ..Default::default()
         }
     }
 
@@ -392,7 +487,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_starting_allocation_is_read_again_until_it_runs() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // Nomad answers the first read before the allocation reported its network
@@ -423,6 +517,60 @@ mod tests {
         assert!(reach(PENDING_TTL.as_secs() + 1).await, "read again once running");
         assert!(reach(3600).await);
         assert_eq!(reads.load(Ordering::SeqCst), 2, "a running allocation stays cached");
+    }
+
+    #[test]
+    fn log_patterns_come_from_the_task_its_group_or_its_job() {
+        let mut compiled = HashMap::new();
+        let a: Allocation = serde_json::from_str(
+            r#"{"JobID":"dns","TaskGroup":"unbound","Namespace":"default","Name":"dns.unbound[0]",
+                "Job":{"Meta":{"atalaya.log_regex":"job: (?P<j>.*)"},"TaskGroups":[
+                  {"Name":"other","Meta":{"atalaya.log_regex":"other"},"Tasks":[{"Name":"unbound","Meta":null}]},
+                  {"Name":"unbound","Meta":{"atalaya.log_regex":"group: (?P<g>.*)"},"Tasks":[
+                    {"Name":"unbound","Meta":{"atalaya.log_regex":"reply: (?P<client>\\S+)\n\n  rpz: (?P<rpz>\\S+)  \n(unclosed"}},
+                    {"Name":"exporter","Meta":null}]}]}}"#,
+        )
+        .unwrap();
+        let got = a.log_regex(&mut compiled);
+        let src = |task: &str| got[task].iter().map(|re| re.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            src("unbound"),
+            [r"reply: (?P<client>\S+)", r"rpz: (?P<rpz>\S+)"],
+            "its own, without the one that does not compile"
+        );
+        assert_eq!(src("exporter"), ["group: (?P<g>.*)"], "its group's");
+        assert_eq!(got.len(), 2);
+
+        let job: Allocation = serde_json::from_str(
+            r#"{"JobID":"dns","TaskGroup":"plain","Namespace":"default","Name":"dns.plain[0]",
+                "Job":{"Meta":{"atalaya.log_regex":"job: (?P<j>.*)"},"TaskGroups":[{"Name":"plain","Tasks":[{"Name":"t"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(job.log_regex(&mut compiled)["t"][0].as_str(), "job: (?P<j>.*)", "its job's");
+        let none: Allocation = serde_json::from_str(r#"{"JobID":"web","TaskGroup":"web","Namespace":"default","Name":"web.web[0]"}"#).unwrap();
+        assert!(none.log_regex(&mut compiled).is_empty());
+    }
+
+    #[test]
+    fn log_patterns_are_bounded_per_task_and_per_node() {
+        let alloc = |from: usize, n: usize| -> Allocation {
+            let src = (from..from + n).map(|i| format!("p{i}")).collect::<Vec<_>>().join("\n");
+            serde_json::from_value(serde_json::json!({
+                "JobID": "j", "TaskGroup": "g", "Namespace": "default", "Name": "j.g[0]",
+                "Job": {"TaskGroups": [{"Name": "g", "Tasks": [{"Name": "t", "Meta": {"atalaya.log_regex": src}}]}]},
+            }))
+            .unwrap()
+        };
+        let mut compiled = HashMap::new();
+        let a = alloc(0, MAX_PATTERNS + 2).log_regex(&mut compiled);
+        assert_eq!(a["t"].len(), MAX_PATTERNS, "per task");
+        let again = alloc(0, 1).log_regex(&mut compiled);
+        assert!(Arc::ptr_eq(&a["t"][0], &again["t"][0]), "the same text is compiled once");
+        let b = alloc(100, MAX_NODE_PATTERNS - MAX_PATTERNS).log_regex(&mut compiled);
+        assert_eq!(b["t"].len(), MAX_NODE_PATTERNS - MAX_PATTERNS);
+        assert!(alloc(200, 1).log_regex(&mut compiled).is_empty(), "the node is full");
+        drop((a, again));
+        assert_eq!(alloc(200, 1).log_regex(&mut compiled)["t"].len(), 1, "patterns nobody holds are forgotten");
     }
 
     #[test]

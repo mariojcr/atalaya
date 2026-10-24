@@ -27,7 +27,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
@@ -39,6 +39,9 @@ use crate::sink::Sink;
 
 pub(crate) const MAX_READ: u64 = 4 << 20;
 const MAX_BODY: usize = 64 << 10;
+/// Log patterns only see the start of a line: enough for a structured line,
+/// and the work per line stays bounded
+const PATTERN_INPUT: usize = 8 << 10;
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct State {
@@ -295,16 +298,23 @@ impl Tailer {
             "nomad.alloc": g.alloc,
             "nomad.namespace": info.namespace,
         });
-        if let Some(row) = build_row(&self.host, &service, &stream, time, text, resource) {
+        let patterns = info.log_regex.get(&g.task).map_or(&[][..], Vec::as_slice);
+        if let Some(row) = build_row(&self.host, &service, &stream, time, text, resource, patterns) {
             sink.push("logs", row);
             self.lines += 1;
         }
     }
 }
 
+/// Keys whose value is the line's level
+fn is_level_key(k: &str) -> bool {
+    matches!(k, "level" | "lvl" | "severity" | "log.level" | "levelname")
+}
+
 /// A log line in the logs table format: level (from JSON or from the text),
-/// attributes from JSON and the body truncated to MAX_BODY
-pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<Utc>, text: String, resource: Value) -> Option<Value> {
+/// attributes from JSON or from the named groups of the first pattern a
+/// plain-text line matches, and the body truncated to MAX_BODY
+pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<Utc>, text: String, resource: Value, patterns: &[Arc<Regex>]) -> Option<Value> {
     if text.trim().is_empty() {
         return None;
     }
@@ -320,10 +330,21 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
                 Value::Null => continue,
                 other => other.to_string(),
             };
-            if level.is_empty() && matches!(k.as_str(), "level" | "lvl" | "severity" | "log.level" | "levelname") {
+            if level.is_empty() && is_level_key(&k) {
                 level = normalize_level(&s).to_owned();
             }
             attributes.insert(k, Value::String(s));
+        }
+    } else if let Some((re, c)) = patterns.iter().find_map(|re| re.captures(head(&text, PATTERN_INPUT)).map(|c| (re, c))) {
+        for (name, m) in re.capture_names().zip(c.iter()) {
+            if let (Some(k), Some(m)) = (name, m)
+                && attributes.len() < 64
+            {
+                if level.is_empty() && is_level_key(k) {
+                    level = normalize_level(m.as_str()).to_owned();
+                }
+                attributes.insert(k.to_owned(), Value::String(m.as_str().to_owned()));
+            }
         }
     }
     if level.is_empty() {
@@ -333,13 +354,7 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
         }
     }
     let mut body = text;
-    if body.len() > MAX_BODY {
-        let mut cut = MAX_BODY;
-        while !body.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        body.truncate(cut);
-    }
+    body.truncate(head(&body, MAX_BODY).len());
     Some(json!({
         "Time": time.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
         "Service": service,
@@ -350,6 +365,15 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
         "Resource": resource,
         "Attributes": attributes,
     }))
+}
+
+/// The first `max` bytes of a text, or fewer to end at a character boundary
+fn head(text: &str, max: usize) -> &str {
+    let mut cut = text.len().min(max);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
 }
 
 /// A directory opened without following a symlink in its last component
@@ -435,6 +459,36 @@ mod tests {
         let pos = t.offsets().files.values().next().unwrap().1;
         assert_eq!(pos, std::fs::metadata(&file).unwrap().len(), "read to the end");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plain_text_line_takes_the_named_groups_of_the_first_pattern_it_matches() {
+        let patterns = [
+            r"reply: (?P<client>\S+) (?P<qname>\S+) (?P<qtype>\S+) \S+ (?P<rcode>\S+)",
+            r"(?P<level>info): rpz: applied \[(?P<rpz>[^\]]+)\] \S+ (?P<action>\S+) (?P<client>[^@ ]+)@\d+ (?P<qname>\S+)",
+            r"(?P<qname>\S+)",
+        ]
+        .map(|p| Arc::new(Regex::new(p).unwrap()));
+        let row = |text: &str| build_row("h", "dns", "stderr", Utc::now(), text.into(), json!({}), &patterns).unwrap();
+
+        let r = row("[1792868141] unbound[1:0] reply: 10.10.0.5 example.com. A IN NOERROR 0.012000 0 56");
+        assert_eq!(
+            r["Attributes"],
+            json!({"client": "10.10.0.5", "qname": "example.com.", "qtype": "A", "rcode": "NOERROR"})
+        );
+        let r = row("[1792868141] unbound[1:0] info: rpz: applied [hagezi] ads.example. nxdomain 10.10.0.5@53412 x.ads.example. A IN");
+        assert_eq!(r["Attributes"]["rpz"], "hagezi");
+        assert_eq!(r["Attributes"]["qname"], "x.ads.example.");
+        assert_eq!(r["Level"], "INFO", "a group named level sets it");
+        // JSON keeps its own keys; the patterns are only for plain text
+        let r = row(r#"{"msg":"hi","level":"warn"}"#);
+        assert_eq!(r["Attributes"], json!({"msg": "hi", "level": "warn"}));
+        let r = build_row("h", "dns", "stderr", Utc::now(), "no patterns".into(), json!({}), &[]).unwrap();
+        assert_eq!(r["Attributes"], json!({}));
+        // Only the start of a line is matched
+        let late = format!("{} reply: 10.10.0.5 example.com. A IN NOERROR", " ".repeat(PATTERN_INPUT));
+        let r = build_row("h", "dns", "stderr", Utc::now(), late, json!({}), &patterns[..1]).unwrap();
+        assert_eq!(r["Attributes"], json!({}));
     }
 
     #[test]
