@@ -5,7 +5,7 @@ flowchart LR
     subgraph hostA["host A"]
         CA["atalaya-collector"]
         TA["exporters<br/>(/metrics)"]
-        SA["sysfs · smartctl"]
+        SA["sysfs · smartctl · chronyd"]
         LA["container / alloc logs"]
     end
     subgraph hostB["host B"]
@@ -40,10 +40,10 @@ flowchart LR
 
 **Collector** (`atalaya-collector`), one per host. Every scrape interval it
 gathers metrics from Prometheus endpoints (static targets, or Nomad services
-tagged `metrics=true`) and from the host itself (sysfs, `smartctl`). It applies
-the metric rules (allow lists, drops, aggregation), registers each new series
-once and then only sends points. It also tails logs (Nomad allocs and/or Docker
-containers). Everything is batched per table and sent every `flush_interval`;
+tagged `metrics=true`) and from the host itself (sysfs, `smartctl`, chronyd). It
+applies the metric rules (allow lists, drops, aggregation), registers each new
+series once and then only sends points. It also tails logs (Nomad allocs and/or
+Docker containers). Everything is batched per table and sent every `flush_interval`;
 failed batches go to an on-disk queue that is retried in order. See
 [collector](collector.md).
 
