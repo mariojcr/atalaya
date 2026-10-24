@@ -41,6 +41,9 @@ host:
     enabled: true              # default true
     interval: 1h               # default 1h
     smartctl: smartctl         # binary (it ships in the image)
+  chrony:
+    enabled: true              # default true: time sync from chronyd
+    address: 127.0.0.1:323     # chronyd's command port (default)
 
 syslog:                        # optional: receive syslog
   listen: 0.0.0.0:5514         # UDP and TCP on the same address (default)
@@ -181,6 +184,25 @@ series also carries `model`, `serial` and `kind` (hdd, ssd or nvme):
 - the NVMe health log (`host_nvme_*`): critical warning, spare, bytes read and
   written, media errors, error log entries, unsafe shutdowns and time over
   temperature.
+
+**Time synchronization** (service `host`), from chronyd's command port on every
+scrape. chronyd answers it on localhost only, so the collector needs the host's
+network; `host_chrony_up` is 0 on a host without chronyd.
+
+- `host_chrony_synchronized`, `host_chrony_stratum` and
+  `host_chrony_local_reference` (1 in orphan mode, with no real source);
+- `host_chrony_system_time_offset_seconds` (positive when the clock is ahead),
+  `_rms_offset_seconds`, `_frequency_ppm`, `_reference_age_seconds` and
+  `_max_error_seconds`;
+- per source (`source`, and `mode`: server, peer or refclock):
+  `host_chrony_source_state` (0 selected, 1 not selectable, 2 falseticker,
+  3 jittery, 4 combined, 5 not combined), `_stratum`, `_reachability_ratio`,
+  `_last_sample_age_seconds`, `_offset_seconds`, `_offset_error_seconds` and
+  `_std_dev_seconds`;
+- as an NTP server, `host_chrony_server_ntp_requests_total` and
+  `_ntp_dropped_total`, from chrony 4.7 when chrony.conf opens the command. The
+  directive replaces the default list, so it repeats it:
+  `opencommands activity manual rtcdata smoothing sourcename sources sourcestats tracking serverstats`.
 
 **Self metrics** (service `atalaya-collector`):
 

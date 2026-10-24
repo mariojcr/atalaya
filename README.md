@@ -12,9 +12,9 @@ serves the UI, and the collector, which runs on every host.
   `timeSeries` API with aligners and reducers.
 - **One collector per host:** scrapes Prometheus endpoints, reads the host's
   hardware (temperatures, fans, CPU energy, GPU, battery, ECC, SMART disk health)
-  and tails container logs, with an on-disk queue so nothing is lost while
-  ClickHouse is down. Works with Nomad (service discovery and alloc logs) or
-  without it (static targets and Docker logs).
+  and chrony's time sync, and tails container logs, with an on-disk queue so
+  nothing is lost while ClickHouse is down. Works with Nomad (service discovery
+  and alloc logs) or without it (static targets and Docker logs).
 - **A UI for day-to-day use:** a status home, YAML dashboards, a metrics
   explorer, a Discover-style logs explorer, a timeline of events, notebooks for
   investigations and alerting with silences. English and Spanish, light and dark.

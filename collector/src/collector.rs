@@ -17,7 +17,7 @@ use crate::nomad::{AllocInfo, Nomad};
 use crate::prom::{self, Descriptor, Kind, Labels, Scrape};
 use crate::rules::Rules;
 use crate::sink::Sink;
-use crate::{host, smart};
+use crate::{chrony, host, smart};
 
 /// Series and descriptors already sent (re-sent every hour to refresh
 /// LastSeen).
@@ -280,17 +280,11 @@ impl Collector {
         }
         let mut handles: Vec<_> = Vec::new();
         if let Some(h) = self.host.clone() {
-            let me = self.clone();
-            let res = host.clone();
-            handles.push(tokio::spawn(async move {
-                match tokio::task::spawn_blocking(move || h.lock().unwrap().collect()).await {
-                    Ok(s) => {
-                        let s = me.rules.lock().await.apply(host::SERVICE, "sysfs", s);
-                        me.write(host::SERVICE, &res, s, now).await;
-                    }
-                    Err(e) => tracing::warn!("reading sysfs: {e}"),
-                }
-            }));
+            handles.push(self.read_host("sysfs", &host, now, move || h.lock().unwrap().collect()));
+        }
+        if self.cfg.host.enabled && self.cfg.host.chrony.enabled {
+            let addr = self.cfg.host.chrony.address;
+            handles.push(self.read_host("chronyd", &host, now, move || chrony::collect(addr)));
         }
         handles.extend(jobs.into_iter().map(|(service, url, res)| {
             let me = self.clone();
@@ -299,6 +293,27 @@ impl Collector {
         for h in handles {
             let _ = h.await;
         }
+    }
+
+    /// Reads a host source off the async runtime and writes it as service `host`
+    fn read_host(
+        self: &Arc<Self>,
+        source: &'static str,
+        res: &Labels,
+        now: i64,
+        read: impl FnOnce() -> Scrape + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        let res = res.clone();
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(read).await {
+                Ok(s) => {
+                    let s = me.rules.lock().await.apply(host::SERVICE, source, s);
+                    me.write(host::SERVICE, &res, s, now).await;
+                }
+                Err(e) => tracing::warn!("reading {source}: {e}"),
+            }
+        })
     }
 
     /// One SMART pass over all disks, one after another

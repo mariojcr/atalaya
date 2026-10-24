@@ -173,6 +173,8 @@ pub(crate) struct HostConfig {
     pub(crate) root: PathBuf,
     #[serde(default)]
     pub(crate) smart: SmartConfig,
+    #[serde(default)]
+    pub(crate) chrony: ChronyConfig,
 }
 impl Default for HostConfig {
     fn default() -> Self {
@@ -180,8 +182,31 @@ impl Default for HostConfig {
             enabled: true,
             root: default_host_root(),
             smart: SmartConfig::default(),
+            chrony: ChronyConfig::default(),
         }
     }
+}
+
+/// Time synchronisation from chronyd's command port, read on every scrape
+/// (the collector needs the host's network to reach it on localhost)
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChronyConfig {
+    #[serde(default = "yes")]
+    pub(crate) enabled: bool,
+    #[serde(default = "default_chrony_address")]
+    pub(crate) address: std::net::SocketAddr,
+}
+impl Default for ChronyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            address: default_chrony_address(),
+        }
+    }
+}
+pub(crate) fn default_chrony_address() -> std::net::SocketAddr {
+    ([127, 0, 0, 1], 323).into()
 }
 
 /// Disk health via smartctl (needs a privileged container)

@@ -70,6 +70,27 @@ pub struct Scrape {
     pub invalid_example: String,
 }
 
+impl Scrape {
+    /// Adds a sample, and its metric's descriptor the first time; a value that
+    /// is not finite is skipped
+    pub fn put(&mut self, metric: &str, kind: Kind, unit: &str, help: &str, labels: Labels, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        self.descriptors.entry(metric.to_owned()).or_insert_with(|| Descriptor {
+            kind,
+            unit: unit.to_owned(),
+            help: help.to_owned(),
+        });
+        self.scalars.push(Scalar {
+            metric: metric.to_owned(),
+            labels,
+            value,
+            counter: kind == Kind::Cumulative,
+        });
+    }
+}
+
 /// A Prometheus metric name: `[a-zA-Z_:][a-zA-Z0-9_:]*`
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();

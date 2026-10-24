@@ -9,6 +9,7 @@
 //!
 //! Usage: atalaya-collector <config.yaml>   (password in CLICKHOUSE_PASSWORD)
 
+mod chrony;
 mod collector;
 mod config;
 mod docker_logs;
