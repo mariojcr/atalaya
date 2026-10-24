@@ -70,13 +70,24 @@ fn log_filters(q: &Option<String>) -> Vec<String> {
     query_all(q, "f")
 }
 
-async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
-    let end = p.end.unwrap_or(now);
-    let start = match p.start {
+/// A request's range: `start` and `end`, or `range` (1h by default) back from
+/// `end`. Within the epoch and a day ahead, so neither `end - start` nor the
+/// milliseconds ClickHouse computes can overflow.
+fn log_range(start: Option<i64>, end: Option<i64>, range: Option<&str>) -> anyhow::Result<(i64, i64)> {
+    let now = unix_now();
+    let end = end.unwrap_or(now);
+    let start = match start {
         Some(s) => s,
-        None => end - query::parse_duration(p.range.as_deref().unwrap_or("1h"))?,
+        None => end.saturating_sub(query::parse_duration(range.unwrap_or("1h"))?),
     };
+    if start < 0 || end < start || end > now + 86400 {
+        anyhow::bail!("invalid range");
+    }
+    Ok((start, end))
+}
+
+async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
+    let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
     let mut params: Vec<Param> = vec![("start".into(), start.to_string()), ("end".into(), end.to_string())];
     let mut conds = vec!["Time >= fromUnixTimestamp64Milli({start:Int64} * 1000) AND Time < fromUnixTimestamp64Milli({end:Int64} * 1000)".to_owned()];
     if !p.service.is_empty() {
@@ -170,12 +181,7 @@ async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq
 /// Fields present in the logs matching the filters, with counts and their most
 /// frequent values (the Discover-style fields panel)
 async fn log_fields(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
-    let now = unix_now();
-    let end = p.end.unwrap_or(now);
-    let start = match p.start {
-        Some(s) => s,
-        None => end - query::parse_duration(p.range.as_deref().unwrap_or("1h"))?,
-    };
+    let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
     let mut params: Vec<Param> = vec![("start".into(), start.to_string()), ("end".into(), end.to_string())];
     let mut conds = vec!["Time >= fromUnixTimestamp64Milli({start:Int64} * 1000) AND Time < fromUnixTimestamp64Milli({end:Int64} * 1000)".to_owned()];
     if !p.service.is_empty() {
@@ -213,17 +219,7 @@ const MAX_BY: usize = 3;
 /// the `by=` fields (repeatable), the `top` most frequent groups of the range,
 /// with one count each or one per `step` (0 where there were no lines)
 async fn log_counts(State(app): State<Shared>, Query(p): Query<CountsParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
-    let now = unix_now();
-    let end = p.end.unwrap_or(now);
-    let start = match p.start {
-        Some(s) => s,
-        None => end - query::parse_duration(p.range.as_deref().unwrap_or("1h"))?,
-    };
-    // Within the epoch and a day ahead: `end - start` and the milliseconds
-    // ClickHouse computes cannot overflow
-    if start < 0 || end < start || end > now + 86400 {
-        return Err(anyhow::anyhow!("invalid range").into());
-    }
+    let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
     let mut params: Vec<Param> = vec![("start".into(), start.to_string()), ("end".into(), end.to_string())];
     let mut conds = vec!["Time >= fromUnixTimestamp64Milli({start:Int64} * 1000) AND Time < fromUnixTimestamp64Milli({end:Int64} * 1000)".to_owned()];
     let filters = log_filters(&rq);
@@ -302,12 +298,7 @@ struct ValuesParams {
 /// Most frequent values of a field starting with the prefix, within the range
 /// and filters (query bar autocompletion)
 async fn log_values(State(app): State<Shared>, Query(p): Query<ValuesParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
-    let now = unix_now();
-    let end = p.end.unwrap_or(now);
-    let start = match p.start {
-        Some(s) => s,
-        None => end - query::parse_duration(p.range.as_deref().unwrap_or("1h"))?,
-    };
+    let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
     let mut params: Vec<Param> = vec![
         ("start".into(), start.to_string()),
         ("end".into(), end.to_string()),
@@ -397,6 +388,22 @@ async fn sv_delete(State(app): State<Shared>, Path(id): Path<String>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_outside_the_epoch_or_far_ahead_is_refused() {
+        let now = unix_now();
+        assert_eq!(log_range(None, Some(7200), None).unwrap(), (3600, 7200), "an hour back by default");
+        assert_eq!(log_range(None, Some(7200), Some("30m")).unwrap(), (5400, 7200));
+        for (start, end) in [
+            (Some(i64::MIN), None),
+            (Some(-1), None),
+            (Some(10), Some(5)),
+            (None, Some(now + 2 * 86400)),
+            (None, Some(i64::MIN)),
+        ] {
+            assert!(log_range(start, end, None).is_err(), "{start:?}..{end:?}");
+        }
+    }
 
     #[test]
     fn count_series_fill_the_buckets_without_lines() {

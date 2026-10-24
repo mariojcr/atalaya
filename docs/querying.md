@@ -92,7 +92,8 @@ extrapolated `rate`, so the two can differ slightly on the same data.
 | `GET /api/v1/logs/context` | Lines around one line |
 | `GET/PUT/DELETE /api/v1/searches[/{id}]` | Saved searches |
 
-Common parameters: `range=1h` or `start`/`end`, `service`, `host`, `level`,
+Common parameters: `range=1h` or `start`/`end` (Unix seconds, from the epoch to
+a day ahead), `service`, `host`, `level`,
 `q` (case-insensitive text), `limit`, `breakdown=<field>` for the histogram,
 `docs_only=true` for the lines alone, and any number of `f=` filters:
 
