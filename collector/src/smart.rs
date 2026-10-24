@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::prom::{Descriptor, Kind, Labels, Scalar, Scrape};
+use crate::prom::{Kind, Labels, Scrape};
 
 /// A host disk as seen in sysfs
 #[derive(Debug, PartialEq)]
@@ -108,26 +108,6 @@ pub async fn run(smartctl: &str, path: &str) -> Option<Value> {
     }
 }
 
-struct Out<'a>(&'a mut Scrape);
-impl Out<'_> {
-    fn put(&mut self, metric: &str, kind: Kind, unit: &str, help: &str, labels: Labels, value: f64) {
-        if !value.is_finite() {
-            return;
-        }
-        self.0.descriptors.entry(metric.to_owned()).or_insert_with(|| Descriptor {
-            kind,
-            unit: unit.to_owned(),
-            help: help.to_owned(),
-        });
-        self.0.scalars.push(Scalar {
-            metric: metric.to_owned(),
-            labels,
-            value,
-            counter: kind == Kind::Cumulative,
-        });
-    }
-}
-
 /// The readable raw value of an ATA attribute: "35 (Min/Max 14/49)" → 35,
 /// "309 (Average 283)" → 309; if the string does not start with a clean number
 /// ("0/7"), the integer raw value reported by smartctl.
@@ -142,8 +122,7 @@ fn ata_raw(raw: &Value) -> Option<f64> {
 }
 
 /// Turns one disk's smartctl output into metrics
-pub fn parse(device: &str, rotational: Option<bool>, v: &Value, s: &mut Scrape) {
-    let mut o = Out(s);
+pub fn parse(device: &str, rotational: Option<bool>, v: &Value, o: &mut Scrape) {
     let standby = v["smartctl"]["messages"].as_array().is_some_and(|m| {
         m.iter()
             .any(|x| x["string"].as_str().is_some_and(|t| t.contains("STANDBY") || t.contains("SLEEP")))
@@ -296,32 +275,32 @@ pub fn parse(device: &str, rotational: Option<bool>, v: &Value, s: &mut Scrape) 
     }
     let n = &v["nvme_smart_health_information_log"];
     if n.is_object() {
-        let g = |o: &mut Out, m: &str, unit: &str, help: &str, x: Option<f64>| {
+        let g = |o: &mut Scrape, m: &str, unit: &str, help: &str, x: Option<f64>| {
             if let Some(x) = x {
                 o.put(m, Kind::Gauge, unit, help, labels.clone(), x);
             }
         };
-        let c = |o: &mut Out, m: &str, unit: &str, help: &str, x: Option<f64>| {
+        let c = |o: &mut Scrape, m: &str, unit: &str, help: &str, x: Option<f64>| {
             if let Some(x) = x {
                 o.put(m, Kind::Cumulative, unit, help, labels.clone(), x);
             }
         };
         g(
-            &mut o,
+            o,
             "host_nvme_critical_warning",
             "1",
             "NVMe critical warning bits (0 = none).",
             n["critical_warning"].as_f64(),
         );
         g(
-            &mut o,
+            o,
             "host_nvme_available_spare_ratio",
             "1",
             "NVMe spare capacity left.",
             n["available_spare"].as_f64().map(|x| x / 100.0),
         );
         g(
-            &mut o,
+            o,
             "host_nvme_available_spare_threshold_ratio",
             "1",
             "NVMe spare capacity below which the drive warns.",
@@ -329,49 +308,49 @@ pub fn parse(device: &str, rotational: Option<bool>, v: &Value, s: &mut Scrape) 
         );
         // Data units of 1000 512-byte sectors
         c(
-            &mut o,
+            o,
             "host_nvme_data_read_bytes_total",
             "By",
             "Bytes read by the host from the NVMe drive.",
             n["data_units_read"].as_f64().map(|x| x * 512_000.0),
         );
         c(
-            &mut o,
+            o,
             "host_nvme_data_written_bytes_total",
             "By",
             "Bytes written by the host to the NVMe drive.",
             n["data_units_written"].as_f64().map(|x| x * 512_000.0),
         );
         c(
-            &mut o,
+            o,
             "host_nvme_unsafe_shutdowns_total",
             "1",
             "NVMe shutdowns without a clean power-off notification.",
             n["unsafe_shutdowns"].as_f64(),
         );
         c(
-            &mut o,
+            o,
             "host_nvme_media_errors_total",
             "1",
             "NVMe unrecovered data integrity errors.",
             n["media_errors"].as_f64(),
         );
         c(
-            &mut o,
+            o,
             "host_nvme_error_log_entries_total",
             "1",
             "NVMe error log entries over the drive's life.",
             n["num_err_log_entries"].as_f64(),
         );
         c(
-            &mut o,
+            o,
             "host_nvme_warning_temperature_seconds_total",
             "s",
             "Time the NVMe drive spent above its warning temperature.",
             n["warning_temp_time"].as_f64().map(|x| x * 60.0),
         );
         c(
-            &mut o,
+            o,
             "host_nvme_critical_temperature_seconds_total",
             "s",
             "Time the NVMe drive spent above its critical temperature.",
@@ -383,6 +362,7 @@ pub fn parse(device: &str, rotational: Option<bool>, v: &Value, s: &mut Scrape) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prom::Scalar;
 
     fn get<'a>(s: &'a Scrape, metric: &str, extra: Option<(&str, &str)>) -> Option<&'a Scalar> {
         s.scalars
