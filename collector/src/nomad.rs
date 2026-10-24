@@ -44,11 +44,25 @@ pub struct AllocInfo {
 /// plain-text log lines into attributes: one regular expression per line
 const LOG_REGEX: &str = "atalaya.log_regex";
 /// The patterns come from the job, so they are bounded: at most this many per
-/// task, this many in use on the node (the same text is compiled once for
+/// task, per job and in use on the node (the same text is compiled once for
 /// every allocation), and each compiled, and its lazy DFA cache, up to this size
-const MAX_PATTERNS: usize = 16;
+const MAX_TASK_PATTERNS: usize = 8;
+const MAX_JOB_PATTERNS: usize = 16;
 const MAX_NODE_PATTERNS: usize = 32;
-const PATTERN_SIZE: usize = 64 << 10;
+const PATTERN_SIZE: usize = 32 << 10;
+
+/// Compiled log patterns by their text, with the job (namespace/ID) that
+/// compiled each; shared by every allocation on the node
+type Patterns = HashMap<String, (String, Arc<Regex>)>;
+
+/// A log pattern left out: its task and line, why, and whether it only lacked
+/// room (it is tried again when the allocation is read again)
+struct Skipped {
+    task: String,
+    line: usize,
+    why: String,
+    full: bool,
+}
 
 /// Where an allocation answers: its own address in its network namespace (any
 /// port there is its own) and the host addresses and ports it was given
@@ -217,52 +231,61 @@ impl Allocation {
     }
 
     /// Each task's log patterns: its `atalaya.log_regex`, or its group's, or
-    /// its job's, compiled once per node (`compiled`)
-    fn log_regex(&self, compiled: &mut HashMap<String, Arc<Regex>>) -> HashMap<String, Vec<Arc<Regex>>> {
-        let mut out = HashMap::new();
-        let Some(job) = &self.job else { return out };
+    /// its job's, compiled once per node (`compiled`); and those left out
+    fn log_regex(&self, compiled: &mut Patterns) -> (HashMap<String, Vec<Arc<Regex>>>, Vec<Skipped>) {
+        let (mut out, mut skipped) = (HashMap::new(), Vec::new());
+        let Some(job) = &self.job else { return (out, skipped) };
         let Some(group) = job.groups.iter().flatten().find(|g| g.name == self.task_group) else {
-            return out;
+            return (out, skipped);
         };
+        let owner = format!("{}/{}", self.namespace, self.job_id);
         for task in group.tasks.iter().flatten() {
             let Some(src) = [&task.meta, &group.meta, &job.meta].into_iter().flatten().find_map(|m| m.get(LOG_REGEX)) else {
                 continue;
             };
-            let who = format!("{}/{}", self.job_id, task.name);
-            let lines = src.lines().map(str::trim).filter(|l| !l.is_empty());
-            let patterns: Vec<_> = lines.take(MAX_PATTERNS).filter_map(|l| pattern(compiled, l, &who)).collect();
+            let mut patterns = Vec::new();
+            for (line, text) in src.lines().map(str::trim).enumerate().filter(|(_, l)| !l.is_empty()) {
+                let found = if patterns.len() == MAX_TASK_PATTERNS {
+                    Err((format!("a task has at most {MAX_TASK_PATTERNS} patterns"), false))
+                } else {
+                    pattern(compiled, text, &owner)
+                };
+                match found {
+                    Ok(re) => patterns.push(re),
+                    Err((why, full)) => skipped.push(Skipped {
+                        task: task.name.clone(),
+                        line,
+                        why,
+                        full,
+                    }),
+                }
+            }
             if !patterns.is_empty() {
                 out.insert(task.name.clone(), patterns);
             }
         }
-        out
+        (out, skipped)
     }
 }
 
 /// A compiled log pattern, shared with every allocation that uses the same
-/// text. None (and a warning) if it does not compile or the node already has
-/// `MAX_NODE_PATTERNS` others in use.
-fn pattern(compiled: &mut HashMap<String, Arc<Regex>>, src: &str, task: &str) -> Option<Arc<Regex>> {
-    if let Some(re) = compiled.get(src) {
-        return Some(re.clone());
+/// text; or why not, and whether only for lack of room
+fn pattern(compiled: &mut Patterns, src: &str, job: &str) -> std::result::Result<Arc<Regex>, (String, bool)> {
+    if let Some((_, re)) = compiled.get(src) {
+        return Ok(re.clone());
     }
     // Those no allocation holds any more are forgotten
-    compiled.retain(|_, re| Arc::strong_count(re) > 1);
+    compiled.retain(|_, (_, re)| Arc::strong_count(re) > 1);
     if compiled.len() >= MAX_NODE_PATTERNS {
-        tracing::warn!("nomad: {task}: ignoring a {LOG_REGEX} pattern: {MAX_NODE_PATTERNS} already in use on this node");
-        return None;
+        return Err((format!("{MAX_NODE_PATTERNS} patterns already in use on this node"), true));
     }
-    match RegexBuilder::new(src).size_limit(PATTERN_SIZE).dfa_size_limit(PATTERN_SIZE).build() {
-        Ok(re) => {
-            let re = Arc::new(re);
-            compiled.insert(src.to_owned(), re.clone());
-            Some(re)
-        }
-        Err(e) => {
-            tracing::warn!("nomad: {task}: ignoring a {LOG_REGEX} pattern: {e}");
-            None
-        }
+    if compiled.values().filter(|(j, _)| j == job).count() >= MAX_JOB_PATTERNS {
+        return Err((format!("its job already has {MAX_JOB_PATTERNS} patterns in use on this node"), true));
     }
+    let re = RegexBuilder::new(src).size_limit(PATTERN_SIZE).dfa_size_limit(PATTERN_SIZE).build();
+    let re = Arc::new(re.map_err(|e| (e.to_string(), false))?);
+    compiled.insert(src.to_owned(), (job.to_owned(), re.clone()));
+    Ok(re)
 }
 
 /// The target a registration describes, if it points at its own allocation
@@ -294,10 +317,10 @@ pub struct Nomad {
     addr: String,
     node_id: String,
     allocs: Mutex<Cache>,
-    /// Registrations already reported as not scraped: once each
-    refused: Mutex<HashSet<String>>,
-    /// Compiled log patterns by their text, for every allocation on the node
-    patterns: Mutex<HashMap<String, Arc<Regex>>>,
+    /// Warnings already logged (registrations not scraped, log patterns left
+    /// out): once each
+    warned: Mutex<HashSet<String>>,
+    patterns: Mutex<Patterns>,
 }
 
 /// An allocation not asked about for this long is forgotten: it has stopped
@@ -306,6 +329,9 @@ const ALLOC_TTL: Duration = Duration::from_secs(3600);
 /// A starting allocation may not have reported its network yet: its details
 /// are read again after this long, until it runs
 const PENDING_TTL: Duration = Duration::from_secs(10);
+/// An allocation with log patterns left out for lack of room is read again
+/// after this long, in case there is room by then
+const FULL_TTL: Duration = Duration::from_secs(60);
 
 /// Stores an allocation's details and forgets those nobody asked about within
 /// `ALLOC_TTL`; without this every allocation the node ever ran stays in memory
@@ -333,7 +359,7 @@ impl Nomad {
             addr: addr.trim_end_matches('/').to_owned(),
             node_id,
             allocs: Mutex::new(HashMap::new()),
-            refused: Mutex::new(HashSet::new()),
+            warned: Mutex::new(HashSet::new()),
             patterns: Mutex::new(HashMap::new()),
         })
     }
@@ -364,22 +390,22 @@ impl Nomad {
                 };
                 match found {
                     Ok(t) => out.push(t),
-                    Err(why) => self.refuse(key, &why),
+                    Err(why) => self.warn_once(format!("scrape/{key}"), || format!("nomad: not scraping {key}: {why}")),
                 }
             }
         }
         Ok(out)
     }
 
-    /// Reports a registration that is not scraped, once (the set starts over
-    /// past a thousand, so stopped allocations do not pile up)
-    fn refuse(&self, key: String, why: &str) {
-        let mut refused = self.refused.lock().unwrap();
-        if refused.len() > 1000 {
-            refused.clear();
+    /// Logs a warning once per key (the set starts over past a thousand, so
+    /// stopped allocations do not pile up)
+    fn warn_once(&self, key: String, message: impl FnOnce() -> String) {
+        let mut warned = self.warned.lock().unwrap();
+        if warned.len() > 1000 {
+            warned.clear();
         }
-        if refused.insert(key.clone()) {
-            tracing::warn!("nomad: not scraping {key}: {why}");
+        if warned.insert(key) {
+            tracing::warn!("{}", message());
         }
     }
 
@@ -397,8 +423,17 @@ impl Nomad {
         let a: Allocation = self.get(&format!("/v1/allocation/{id}")).await.ok()?;
         let index = a.name.rsplit_once('[').and_then(|(_, i)| i.strip_suffix(']')).unwrap_or("0").to_owned();
         let reach = a.reach();
-        let until = (a.client_status == "pending").then(|| now + PENDING_TTL);
-        let log_regex = Arc::new(a.log_regex(&mut self.patterns.lock().unwrap()));
+        let (log_regex, skipped) = a.log_regex(&mut self.patterns.lock().unwrap());
+        for s in &skipped {
+            let message = || format!("nomad: {}/{}: ignoring {LOG_REGEX} line {}: {}", a.job_id, s.task, s.line + 1, s.why);
+            self.warn_once(format!("{id}/{}/{}", s.task, s.line), message);
+        }
+        let until = if a.client_status == "pending" {
+            Some(now + PENDING_TTL)
+        } else {
+            skipped.iter().any(|s| s.full).then(|| now + FULL_TTL)
+        };
+        let log_regex = Arc::new(log_regex);
         let info = AllocInfo {
             job: a.job_id,
             group: a.task_group,
@@ -531,7 +566,7 @@ mod tests {
                     {"Name":"exporter","Meta":null}]}]}}"#,
         )
         .unwrap();
-        let got = a.log_regex(&mut compiled);
+        let (got, skipped) = a.log_regex(&mut compiled);
         let src = |task: &str| got[task].iter().map(|re| re.as_str()).collect::<Vec<_>>();
         assert_eq!(
             src("unbound"),
@@ -540,37 +575,61 @@ mod tests {
         );
         assert_eq!(src("exporter"), ["group: (?P<g>.*)"], "its group's");
         assert_eq!(got.len(), 2);
+        assert_eq!(
+            (skipped[0].task.as_str(), skipped[0].line, skipped[0].full),
+            ("unbound", 3, false),
+            "reported, not retried"
+        );
 
         let job: Allocation = serde_json::from_str(
             r#"{"JobID":"dns","TaskGroup":"plain","Namespace":"default","Name":"dns.plain[0]",
                 "Job":{"Meta":{"atalaya.log_regex":"job: (?P<j>.*)"},"TaskGroups":[{"Name":"plain","Tasks":[{"Name":"t"}]}]}}"#,
         )
         .unwrap();
-        assert_eq!(job.log_regex(&mut compiled)["t"][0].as_str(), "job: (?P<j>.*)", "its job's");
+        assert_eq!(job.log_regex(&mut compiled).0["t"][0].as_str(), "job: (?P<j>.*)", "its job's");
         let none: Allocation = serde_json::from_str(r#"{"JobID":"web","TaskGroup":"web","Namespace":"default","Name":"web.web[0]"}"#).unwrap();
-        assert!(none.log_regex(&mut compiled).is_empty());
+        assert!(none.log_regex(&mut compiled).0.is_empty());
     }
 
     #[test]
-    fn log_patterns_are_bounded_per_task_and_per_node() {
-        let alloc = |from: usize, n: usize| -> Allocation {
-            let src = (from..from + n).map(|i| format!("p{i}")).collect::<Vec<_>>().join("\n");
+    fn log_patterns_are_bounded_per_task_job_and_node() {
+        // An allocation of `job` with one task per (first pattern, count)
+        let alloc = |job: &str, tasks: &[(usize, usize)]| -> Allocation {
+            let tasks: Vec<_> = tasks
+                .iter()
+                .enumerate()
+                .map(|(i, &(from, n))| {
+                    let src = (from..from + n).map(|p| format!("p{p}")).collect::<Vec<_>>().join("\n");
+                    serde_json::json!({"Name": format!("t{i}"), "Meta": {"atalaya.log_regex": src}})
+                })
+                .collect();
             serde_json::from_value(serde_json::json!({
-                "JobID": "j", "TaskGroup": "g", "Namespace": "default", "Name": "j.g[0]",
-                "Job": {"TaskGroups": [{"Name": "g", "Tasks": [{"Name": "t", "Meta": {"atalaya.log_regex": src}}]}]},
+                "JobID": job, "TaskGroup": "g", "Namespace": "default", "Name": format!("{job}.g[0]"),
+                "Job": {"TaskGroups": [{"Name": "g", "Tasks": tasks}]},
             }))
             .unwrap()
         };
         let mut compiled = HashMap::new();
-        let a = alloc(0, MAX_PATTERNS + 2).log_regex(&mut compiled);
-        assert_eq!(a["t"].len(), MAX_PATTERNS, "per task");
-        let again = alloc(0, 1).log_regex(&mut compiled);
-        assert!(Arc::ptr_eq(&a["t"][0], &again["t"][0]), "the same text is compiled once");
-        let b = alloc(100, MAX_NODE_PATTERNS - MAX_PATTERNS).log_regex(&mut compiled);
-        assert_eq!(b["t"].len(), MAX_NODE_PATTERNS - MAX_PATTERNS);
-        assert!(alloc(200, 1).log_regex(&mut compiled).is_empty(), "the node is full");
+        let tasks = [(0, MAX_TASK_PATTERNS + 1), (100, MAX_JOB_PATTERNS - MAX_TASK_PATTERNS), (200, 1)];
+        let (a, skipped) = alloc("a", &tasks).log_regex(&mut compiled);
+        assert_eq!(
+            (a["t0"].len(), a["t1"].len(), a.contains_key("t2")),
+            (MAX_TASK_PATTERNS, MAX_JOB_PATTERNS - MAX_TASK_PATTERNS, false)
+        );
+        let why: Vec<_> = skipped.iter().map(|s| (s.task.as_str(), s.full)).collect();
+        assert_eq!(why, [("t0", false), ("t2", true)], "one past the task's limit, one past the job's");
+        let (again, _) = alloc("a", &[(0, 1)]).log_regex(&mut compiled);
+        assert!(Arc::ptr_eq(&a["t0"][0], &again["t0"][0]), "the same text is compiled once");
+        let (b, _) = alloc("b", &[(300, MAX_TASK_PATTERNS), (400, MAX_TASK_PATTERNS)]).log_regex(&mut compiled);
+        assert_eq!(b.len(), 2, "another job has its own share");
+        let (c, skipped) = alloc("c", &[(500, 1)]).log_regex(&mut compiled);
+        assert!(c.is_empty() && skipped[0].full, "the node is full, for now");
         drop((a, again));
-        assert_eq!(alloc(200, 1).log_regex(&mut compiled)["t"].len(), 1, "patterns nobody holds are forgotten");
+        assert_eq!(
+            alloc("c", &[(500, 1)]).log_regex(&mut compiled).0["t0"].len(),
+            1,
+            "patterns nobody holds are forgotten"
+        );
     }
 
     #[test]

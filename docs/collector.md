@@ -130,11 +130,20 @@ A Nomad task that logs plain text can have it parsed too. Its
 `atalaya.log_regex` meta key (or, failing that, its group's or job's) holds one
 regular expression per line. The named groups of the first pattern a line
 matches become its attributes, and a group named `level` also sets the level.
-JSON lines are unaffected. Patterns only see the first 8 KiB of a line. A task
-gets at most 16 patterns and a node at most 32 different ones in use (the same
-text is compiled once), each up to 64 KiB compiled. A pattern that does not
-compile, or is past those limits, is skipped with a warning in the collector's
-log.
+JSON lines are unaffected.
+
+The patterns come from whoever submits the job, so their cost is bounded:
+
+- **Count:** 8 per task, 16 per job and 32 in use per node. The same text is
+  compiled once for every allocation.
+- **Size:** each pattern compiles to at most 32 KiB, and patterns only see the
+  first 4 KiB of a line.
+- **Time:** a job's lines get 50 ms of matching per pass (every 2 s); the rest
+  of that pass's lines go without pattern attributes.
+
+A pattern that does not compile, or is past those limits, is skipped with a
+warning in the collector's log. A pattern that only lacked room on the node is
+tried again a minute later.
 
 ```hcl
 task "unbound" {

@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::logs::{MAX_READ, build_row, read_from};
+use crate::logs::{LinePatterns, MAX_READ, build_row, read_from};
 use crate::sink::Sink;
 
 /// Read offset of each container (id → bytes)
@@ -129,7 +129,7 @@ impl DockerTailer {
                     .map(|t| t.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 let resource = json!({ "container.id": id, "container.name": container, "container.image": image });
-                if let Some(row) = build_row(&self.host, &service, &e.stream, time, text, resource, &[]) {
+                if let Some(row) = build_row(&self.host, &service, &e.stream, time, text, resource, LinePatterns::none()) {
                     sink.push("logs", row);
                     self.lines += 1;
                 }
@@ -201,7 +201,16 @@ mod tests {
 
     #[test]
     fn build_row_takes_the_level_from_text() {
-        let row = build_row("h", "web", "stderr", Utc::now(), "level=error part final".into(), json!({}), &[]).unwrap();
+        let row = build_row(
+            "h",
+            "web",
+            "stderr",
+            Utc::now(),
+            "level=error part final".into(),
+            json!({}),
+            LinePatterns::none(),
+        )
+        .unwrap();
         assert_eq!(row["Level"], "ERROR");
         assert_eq!(row["Service"], "web");
     }
