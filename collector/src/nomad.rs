@@ -91,6 +91,8 @@ struct Allocation {
     namespace: String,
     #[serde(rename = "Name")]
     name: String,
+    #[serde(rename = "ClientStatus", default)]
+    client_status: String,
     #[serde(rename = "NetworkStatus", default)]
     network_status: Option<NetworkStatus>,
     #[serde(rename = "AllocatedResources", default)]
@@ -193,12 +195,15 @@ fn target(r: Registration, reach: &Reach) -> std::result::Result<Target, String>
     })
 }
 
+/// Allocation details by id, with when they were last asked for and, for one
+/// still starting, when to read them again
+type Cache = HashMap<String, (AllocInfo, Instant, Option<Instant>)>;
+
 pub struct Nomad {
     http: reqwest::Client,
     addr: String,
     node_id: String,
-    /// Allocation details by id, with when they were last asked for
-    allocs: Mutex<HashMap<String, (AllocInfo, Instant)>>,
+    allocs: Mutex<Cache>,
     /// Registrations already reported as not scraped: once each
     refused: Mutex<HashSet<String>>,
 }
@@ -206,11 +211,15 @@ pub struct Nomad {
 /// An allocation not asked about for this long is forgotten: it has stopped
 const ALLOC_TTL: Duration = Duration::from_secs(3600);
 
+/// A starting allocation may not have reported its network yet: its details
+/// are read again after this long, until it runs
+const PENDING_TTL: Duration = Duration::from_secs(10);
+
 /// Stores an allocation's details and forgets those nobody asked about within
 /// `ALLOC_TTL`; without this every allocation the node ever ran stays in memory
-fn remember(allocs: &mut HashMap<String, (AllocInfo, Instant)>, id: &str, info: AllocInfo, now: Instant) {
-    allocs.retain(|_, (_, used)| now.duration_since(*used) <= ALLOC_TTL);
-    allocs.insert(id.to_owned(), (info, now));
+fn remember(allocs: &mut Cache, id: &str, info: AllocInfo, until: Option<Instant>, now: Instant) {
+    allocs.retain(|_, (_, used, _)| now.duration_since(*used) <= ALLOC_TTL);
+    allocs.insert(id.to_owned(), (info, now, until));
 }
 
 impl Nomad {
@@ -282,13 +291,20 @@ impl Nomad {
     }
 
     pub async fn alloc(&self, id: &str) -> Option<AllocInfo> {
-        if let Some((a, used)) = self.allocs.lock().unwrap().get_mut(id) {
-            *used = Instant::now();
+        self.alloc_at(id, Instant::now()).await
+    }
+
+    async fn alloc_at(&self, id: &str, now: Instant) -> Option<AllocInfo> {
+        if let Some((a, used, until)) = self.allocs.lock().unwrap().get_mut(id)
+            && until.is_none_or(|u| now < u)
+        {
+            *used = now;
             return Some(a.clone());
         }
         let a: Allocation = self.get(&format!("/v1/allocation/{id}")).await.ok()?;
         let index = a.name.rsplit_once('[').and_then(|(_, i)| i.strip_suffix(']')).unwrap_or("0").to_owned();
         let reach = a.reach();
+        let until = (a.client_status == "pending").then(|| now + PENDING_TTL);
         let info = AllocInfo {
             job: a.job_id,
             group: a.task_group,
@@ -296,7 +312,7 @@ impl Nomad {
             index,
             reach,
         };
-        remember(&mut self.allocs.lock().unwrap(), id, info.clone(), Instant::now());
+        remember(&mut self.allocs.lock().unwrap(), id, info.clone(), until, now);
         Some(info)
     }
 }
@@ -374,14 +390,49 @@ mod tests {
         assert_eq!(target(registration("fd00::2", 9100, &[]), &v6).unwrap().url, "http://[fd00::2]:9100/metrics");
     }
 
+    #[tokio::test]
+    async fn a_starting_allocation_is_read_again_until_it_runs() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Nomad answers the first read before the allocation reported its network
+        let answers = [
+            r#"{"JobID":"dns","TaskGroup":"g","Namespace":"default","Name":"dns.g[0]","ClientStatus":"pending","NetworkStatus":null}"#,
+            r#"{"JobID":"dns","TaskGroup":"g","Namespace":"default","Name":"dns.g[0]","ClientStatus":"running","NetworkStatus":{"Address":"10.10.100.53"}}"#,
+        ];
+        let reads = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = reads.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let body = answers[served.fetch_add(1, Ordering::SeqCst).min(1)];
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body.as_bytes()).await;
+            }
+        });
+        let nomad = Nomad::new(format!("http://{addr}"), "n".into(), None, None).unwrap();
+        let (ip, start) = ("10.10.100.53".parse().unwrap(), Instant::now());
+        let reach = async |secs| nomad.alloc_at("a1", start + Duration::from_secs(secs)).await.unwrap().reach.allows(ip, 9167);
+
+        assert!(!reach(0).await, "no address yet");
+        assert!(!reach(1).await, "not read again right away");
+        assert!(reach(PENDING_TTL.as_secs() + 1).await, "read again once running");
+        assert!(reach(3600).await);
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "a running allocation stays cached");
+    }
+
     #[test]
     fn allocations_nobody_asks_about_are_forgotten() {
         let start = Instant::now();
         let mut allocs = HashMap::new();
-        remember(&mut allocs, "a", info("old"), start);
-        remember(&mut allocs, "b", info("live"), start + ALLOC_TTL);
+        remember(&mut allocs, "a", info("old"), None, start);
+        remember(&mut allocs, "b", info("live"), None, start + ALLOC_TTL);
         assert_eq!(allocs.len(), 2, "both within the TTL");
-        remember(&mut allocs, "c", info("new"), start + ALLOC_TTL + Duration::from_secs(1));
+        remember(&mut allocs, "c", info("new"), None, start + ALLOC_TTL + Duration::from_secs(1));
         let mut ids: Vec<&str> = allocs.keys().map(String::as_str).collect();
         ids.sort();
         assert_eq!(ids, ["b", "c"]);
