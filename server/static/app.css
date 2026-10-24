@@ -368,6 +368,8 @@ body.nav-collapsed main { padding-left: 24px; }
 .grid-table .num { text-align: right; font-variant-numeric: tabular-nums; }
 .grid-table tfoot td { font-weight: 500; border-bottom: 0; border-top: 1px solid var(--line); }
 .grid-table tbody tr:hover { background: var(--surface-2); }
+.wlogs th { cursor: default; }
+.wlogs .sev { display: inline-block; margin-right: 6px; vertical-align: -1px; }
 .cell-bar { position: relative; display: block; min-width: 80px; border-radius: 2px; overflow: hidden; }
 .cell-bar i { position: absolute; left: 0; top: 0; bottom: 0; }
 .cell-bar span { position: relative; padding: 0 4px; }

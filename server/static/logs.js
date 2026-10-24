@@ -27,9 +27,9 @@ const ICO = {
 };
 
 // ── Query and filters ──────────────────────────────────────────────────────
-/** Splits the bar: `field:value`, `-field~text`, `field>=3` are filters; the rest are message words */
+/** Splits the bar: `field:value`, `-field~text`, `field>=3`, `field=~regex` are filters; the rest are message words */
 function lgParse(src) {
-  const re = /(-?[\w.@/-]+)(>=|<=|[:~<>])(?:"([^"]*)"|(\S+))|"([^"]*)"|(\S+)/g;
+  const re = /(-?[\w.@/-]+)(=~|>=|<=|[:~<>])(?:"([^"]*)"|(\S+))|"([^"]*)"|(\S+)/g;
   const filters = [], words = [];
   for (const m of String(src || "").matchAll(re)) {
     if (m[1]) filters.push(`${m[1]}${m[2]}${m[3] ?? m[4]}`);
@@ -44,7 +44,7 @@ function lgAllFilters() {
 }
 function lgSplit(f) {
   const neg = f.startsWith("-"), s = neg ? f.slice(1) : f;
-  const m = /^([^:~<>]+)(>=|<=|[:~<>])([\s\S]*)$/.exec(s);
+  const m = /^([^:~<>=]+)(=~|>=|<=|[:~<>])([\s\S]*)$/.exec(s);
   return m ? { neg, field: m[1], op: m[2], value: m[3] } : { neg, field: s, op: "", value: "" };
 }
 /** Adds a field:value pill (removes it if already present; replaces its negation) */
@@ -428,7 +428,7 @@ function lgAcToken() {
   let b = caret; while (b < v.length && !/\s/.test(v[b])) b++;
   const text = v.slice(a, caret);
   const neg = text.startsWith("-"), body = neg ? text.slice(1) : text;
-  const m = /^([\w.@/-]*)(>=|<=|[:~<>])?("?)(.*)$/s.exec(body);
+  const m = /^([\w.@/-]*)(=~|>=|<=|[:~<>])?("?)(.*)$/s.exec(body);
   return { a, b, caret, text, neg, field: m[1], op: m[2] || "", quoted: m[3] === '"', value: m[4] };
 }
 function lgAcUpdate() {

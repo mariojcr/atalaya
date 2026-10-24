@@ -120,7 +120,7 @@ const I18N = {
     "lg.empty": "No documents match in this range. Widen the range or remove a filter.",
     "nb.f_filters": "filters {v}",
     // Dashboards
-    "dash.open": "Open in the metrics explorer", "dash.open_aria": "Open in the explorer", "dash.desc": "Description: {d}", "dash.untitled": "Untitled", "dash.none": "None",
+    "dash.open": "Open in the metrics explorer", "dash.open_logs": "Open in the logs explorer", "dash.open_aria": "Open in the explorer", "dash.desc": "Description: {d}", "dash.untitled": "Untitled", "dash.none": "None",
     "dash.empty": "No dashboards. Add a YAML file to the dashboards directory.",
     // Units
     "u.year": "year", "u.years": "years", "u.wk": "wk", "u.day": "day", "u.days": "days", "u.hour": "hour", "u.hours": "hours", "u.minute": "minute", "u.minutes": "minutes", "u.second": "second", "u.seconds": "seconds",
@@ -228,7 +228,7 @@ const I18N = {
     "lg.more": "Mostrar {n} más ({r} restantes)", "lg.older": "Cargar documentos anteriores", "lg.all_loaded": "Se muestran los {n} documentos cargados",
     "lg.empty": "Ningún documento coincide en este rango. Amplía el rango o quita un filtro.",
     "nb.f_filters": "filtros {v}",
-    "dash.open": "Abrir en el explorador de métricas", "dash.open_aria": "Abrir en el explorador", "dash.desc": "Descripción: {d}", "dash.untitled": "Sin título", "dash.none": "Ninguno",
+    "dash.open": "Abrir en el explorador de métricas", "dash.open_logs": "Abrir en el explorador de logs", "dash.open_aria": "Abrir en el explorador", "dash.desc": "Descripción: {d}", "dash.untitled": "Sin título", "dash.none": "Ninguno",
     "dash.empty": "No hay paneles. Añade un fichero YAML al directorio de paneles.",
     "u.year": "año", "u.years": "años", "u.wk": "sem.", "u.day": "día", "u.days": "días", "u.hour": "hora", "u.hours": "horas", "u.minute": "minuto", "u.minutes": "minutos", "u.second": "segundo", "u.seconds": "segundos",
     "u.few_seconds": "unos segundos", "u.ago": "hace {t}", "u.in": "dentro de {t}", "u.true": "Verdadero", "u.false": "Falso", "u.yes": "Sí", "u.on": "Encendido", "u.off": "Apagado",
