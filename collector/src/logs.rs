@@ -27,7 +27,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
@@ -39,6 +40,15 @@ use crate::sink::Sink;
 
 pub(crate) const MAX_READ: u64 = 4 << 20;
 const MAX_BODY: usize = 64 << 10;
+/// Log patterns only see the start of a line: enough for a structured line,
+/// and the work per line stays bounded
+const PATTERN_INPUT: usize = 4 << 10;
+/// Time lines may spend matching patterns in one pass: a job's (with its
+/// dispatched or periodic children) and the node's. No pattern is tried past
+/// it, and the rest of the pass's lines go without pattern attributes, so
+/// costly patterns cannot hold up every other allocation's logs.
+const JOB_PATTERN_TIME: Duration = Duration::from_millis(50);
+const NODE_PATTERN_TIME: Duration = Duration::from_millis(200);
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct State {
@@ -56,6 +66,11 @@ pub struct Tailer {
     /// Groups in the middle of a line longer than MAX_READ: discard up to the
     /// next newline
     skipping: HashSet<String>,
+    /// Groups already reported for running out of pattern time
+    over_budget: HashSet<String>,
+    /// Passes so far: each starts at a different group, so the node's pattern
+    /// time does not always go to the same allocations
+    passes: usize,
     host: String,
     pub lines: u64,
     /// Lines truncated or dropped for being too long
@@ -110,6 +125,8 @@ impl Tailer {
             initial,
             partial: HashMap::new(),
             skipping: HashSet::new(),
+            over_budget: HashSet::new(),
+            passes: 0,
             host,
             lines: 0,
             truncated: 0,
@@ -168,8 +185,12 @@ impl Tailer {
         self.state.files.retain(|k, _| groups.contains_key(k));
         self.partial.retain(|k, _| groups.contains_key(k));
         self.skipping.retain(|k| groups.contains_key(k));
+        self.over_budget.retain(|k| groups.contains_key(k));
 
-        for (key, g) in &groups {
+        let mut budget = Budget::new();
+        let first = self.passes % groups.len().max(1);
+        self.passes = self.passes.wrapping_add(1);
+        for (key, g) in groups.iter().cycle().skip(first).take(groups.len()) {
             let (mut idx, mut pos) = self.state.files.get(key).copied().unwrap_or((g.files[0].0, 0));
             let info = nomad.alloc(&g.alloc).await.unwrap_or_default();
             loop {
@@ -208,7 +229,7 @@ impl Tailer {
                 // the rest (otherwise the same block would be re-read every pass)
                 if buf.len() as u64 >= MAX_READ && !buf.contains(&b'\n') && !has_next {
                     let head = String::from_utf8_lossy(&buf).into_owned();
-                    self.emit(key, g, &info, &head, sink);
+                    self.emit(key, g, &info, &head, sink, &mut budget);
                     self.truncated += 1;
                     self.skipping.insert(key.clone());
                     pos += buf.len() as u64;
@@ -223,7 +244,7 @@ impl Tailer {
                     None => (&[][..], 0),
                 };
                 for line in String::from_utf8_lossy(complete).lines() {
-                    self.emit(key, g, &info, line, sink);
+                    self.emit(key, g, &info, line, sink, &mut budget);
                 }
                 pos += consumed;
                 if consumed == 0 && has_next {
@@ -258,7 +279,7 @@ impl Tailer {
         }
     }
 
-    fn emit(&mut self, key: &str, g: &Group, info: &crate::nomad::AllocInfo, line: &str, sink: &Sink) {
+    fn emit(&mut self, key: &str, g: &Group, info: &crate::nomad::AllocInfo, line: &str, sink: &Sink, budget: &mut Budget) {
         let (time, stream, text) = match line_re().captures(line) {
             Some(c) => {
                 let text = c["text"].to_owned();
@@ -295,16 +316,92 @@ impl Tailer {
             "nomad.alloc": g.alloc,
             "nomad.namespace": info.namespace,
         });
-        if let Some(row) = build_row(&self.host, &service, &stream, time, text, resource) {
+        let list = info.log_regex.get(&g.task).map_or(&[][..], Vec::as_slice);
+        let left = if list.is_empty() { Duration::ZERO } else { budget.left(&info.owner) };
+        let list = if left.is_zero() { &[] } else { list };
+        let started = Instant::now();
+        let row = build_row(
+            &self.host,
+            &service,
+            &stream,
+            time,
+            text,
+            resource,
+            LinePatterns { list, until: started + left },
+        );
+        if !list.is_empty() && budget.spend(&info.owner, started.elapsed()) && self.over_budget.insert(key.to_owned()) {
+            tracing::warn!(
+                "logs: {key}: out of log pattern time in one pass ({JOB_PATTERN_TIME:?} per job, {NODE_PATTERN_TIME:?} per node); the rest of its lines in that pass went without their attributes"
+            );
+        }
+        if let Some(row) = row {
             sink.push("logs", row);
             self.lines += 1;
         }
     }
 }
 
+/// What is left of a pass's pattern time, per job (`AllocInfo::owner`) and for
+/// the node
+struct Budget {
+    node: Duration,
+    jobs: HashMap<String, Duration>,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self {
+            node: NODE_PATTERN_TIME,
+            jobs: HashMap::new(),
+        }
+    }
+
+    /// Time left for a job's lines
+    fn left(&self, job: &str) -> Duration {
+        self.node.min(self.jobs.get(job).copied().unwrap_or(JOB_PATTERN_TIME))
+    }
+
+    /// Takes the time a job's line took; true if that leaves the job none
+    fn spend(&mut self, job: &str, took: Duration) -> bool {
+        self.node = self.node.saturating_sub(took);
+        let left = self.jobs.entry(job.to_owned()).or_insert(JOB_PATTERN_TIME);
+        *left = left.saturating_sub(took);
+        self.left(job).is_zero()
+    }
+}
+
+/// The patterns a plain-text line is matched against, in order; none is tried
+/// once `until` has passed
+#[derive(Clone, Copy)]
+pub(crate) struct LinePatterns<'a> {
+    list: &'a [Arc<Regex>],
+    until: Instant,
+}
+
+impl<'a> LinePatterns<'a> {
+    pub(crate) fn none() -> Self {
+        Self {
+            list: &[],
+            until: Instant::now(),
+        }
+    }
+
+    /// The first pattern that matches the text, with its captures
+    fn first_match<'t>(&self, text: &'t str) -> Option<(&'a Regex, regex::Captures<'t>)> {
+        let mut tried = self.list.iter().take_while(|_| Instant::now() < self.until);
+        tried.find_map(|re| re.captures(text).map(|c| (&**re, c)))
+    }
+}
+
+/// Keys whose value is the line's level
+fn is_level_key(k: &str) -> bool {
+    matches!(k, "level" | "lvl" | "severity" | "log.level" | "levelname")
+}
+
 /// A log line in the logs table format: level (from JSON or from the text),
-/// attributes from JSON and the body truncated to MAX_BODY
-pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<Utc>, text: String, resource: Value) -> Option<Value> {
+/// attributes from JSON or from the named groups of the first pattern a
+/// plain-text line matches, and the body truncated to MAX_BODY
+pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<Utc>, text: String, resource: Value, patterns: LinePatterns) -> Option<Value> {
     if text.trim().is_empty() {
         return None;
     }
@@ -320,10 +417,21 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
                 Value::Null => continue,
                 other => other.to_string(),
             };
-            if level.is_empty() && matches!(k.as_str(), "level" | "lvl" | "severity" | "log.level" | "levelname") {
+            if level.is_empty() && is_level_key(&k) {
                 level = normalize_level(&s).to_owned();
             }
             attributes.insert(k, Value::String(s));
+        }
+    } else if let Some((re, c)) = patterns.first_match(head(&text, PATTERN_INPUT)) {
+        for (name, m) in re.capture_names().zip(c.iter()) {
+            if let (Some(k), Some(m)) = (name, m)
+                && attributes.len() < 64
+            {
+                if level.is_empty() && is_level_key(k) {
+                    level = normalize_level(m.as_str()).to_owned();
+                }
+                attributes.insert(k.to_owned(), Value::String(m.as_str().to_owned()));
+            }
         }
     }
     if level.is_empty() {
@@ -333,13 +441,7 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
         }
     }
     let mut body = text;
-    if body.len() > MAX_BODY {
-        let mut cut = MAX_BODY;
-        while !body.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        body.truncate(cut);
-    }
+    body.truncate(head(&body, MAX_BODY).len());
     Some(json!({
         "Time": time.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
         "Service": service,
@@ -350,6 +452,15 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
         "Resource": resource,
         "Attributes": attributes,
     }))
+}
+
+/// The first `max` bytes of a text, or fewer to end at a character boundary
+fn head(text: &str, max: usize) -> &str {
+    let mut cut = text.len().min(max);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
 }
 
 /// A directory opened without following a symlink in its last component
@@ -435,6 +546,66 @@ mod tests {
         let pos = t.offsets().files.values().next().unwrap().1;
         assert_eq!(pos, std::fs::metadata(&file).unwrap().len(), "read to the end");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pattern_time_is_shared_by_a_job_and_by_the_node() {
+        let mut b = Budget::new();
+        assert!(b.spend("ns/a", JOB_PATTERN_TIME), "job a is out of time");
+        assert_eq!(b.left("ns/a"), Duration::ZERO);
+        assert_eq!(b.left("ns/b"), JOB_PATTERN_TIME, "b still has its own");
+        for job in ["ns/b", "ns/c", "ns/d"] {
+            b.spend(job, JOB_PATTERN_TIME - Duration::from_millis(1));
+        }
+        assert_eq!(
+            b.left("ns/e"),
+            NODE_PATTERN_TIME - 4 * JOB_PATTERN_TIME + Duration::from_millis(3),
+            "the node's time runs out first"
+        );
+        assert!(b.spend("ns/e", Duration::from_millis(3)), "none left for anyone");
+        assert_eq!(b.left("ns/f"), Duration::ZERO);
+    }
+
+    #[test]
+    fn no_pattern_is_tried_past_its_deadline() {
+        let list = [Arc::new(Regex::new("(?P<x>.)").unwrap())];
+        let row = |until| build_row("h", "web", "stdout", Utc::now(), "text".into(), json!({}), LinePatterns { list: &list, until }).unwrap();
+        assert_eq!(row(Instant::now() + JOB_PATTERN_TIME)["Attributes"], json!({"x": "t"}));
+        assert_eq!(row(Instant::now())["Attributes"], json!({}), "out of time: the line goes without them");
+    }
+
+    #[test]
+    fn a_plain_text_line_takes_the_named_groups_of_the_first_pattern_it_matches() {
+        let patterns = [
+            r"reply: (?P<client>\S+) (?P<qname>\S+) (?P<qtype>\S+) \S+ (?P<rcode>\S+)",
+            r"(?P<level>info): rpz: applied \[(?P<rpz>[^\]]+)\] \S+ (?P<action>\S+) (?P<client>[^@ ]+)@\d+ (?P<qname>\S+)",
+            r"(?P<qname>\S+)",
+        ]
+        .map(|p| Arc::new(Regex::new(p).unwrap()));
+        let all = |n: usize| LinePatterns {
+            list: &patterns[..n],
+            until: Instant::now() + JOB_PATTERN_TIME,
+        };
+        let row = |text: &str| build_row("h", "dns", "stderr", Utc::now(), text.into(), json!({}), all(3)).unwrap();
+
+        let r = row("[1792868141] unbound[1:0] reply: 10.10.0.5 example.com. A IN NOERROR 0.012000 0 56");
+        assert_eq!(
+            r["Attributes"],
+            json!({"client": "10.10.0.5", "qname": "example.com.", "qtype": "A", "rcode": "NOERROR"})
+        );
+        let r = row("[1792868141] unbound[1:0] info: rpz: applied [hagezi] ads.example. nxdomain 10.10.0.5@53412 x.ads.example. A IN");
+        assert_eq!(r["Attributes"]["rpz"], "hagezi");
+        assert_eq!(r["Attributes"]["qname"], "x.ads.example.");
+        assert_eq!(r["Level"], "INFO", "a group named level sets it");
+        // JSON keeps its own keys; the patterns are only for plain text
+        let r = row(r#"{"msg":"hi","level":"warn"}"#);
+        assert_eq!(r["Attributes"], json!({"msg": "hi", "level": "warn"}));
+        let r = build_row("h", "dns", "stderr", Utc::now(), "no patterns".into(), json!({}), LinePatterns::none()).unwrap();
+        assert_eq!(r["Attributes"], json!({}));
+        // Only the start of a line is matched
+        let late = format!("{} reply: 10.10.0.5 example.com. A IN NOERROR", " ".repeat(PATTERN_INPUT));
+        let r = build_row("h", "dns", "stderr", Utc::now(), late, json!({}), all(1)).unwrap();
+        assert_eq!(r["Attributes"], json!({}));
     }
 
     #[test]

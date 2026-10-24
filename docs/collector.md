@@ -126,6 +126,44 @@ The first run starts at the end of the existing files. The level is taken from
 JSON logs (`level`, `severity`, …) or from the text, and JSON logs keep their
 keys as attributes. Bodies are stored up to 64 KiB.
 
+A Nomad task that logs plain text can have it parsed too. Its
+`atalaya.log_regex` meta key (or, failing that, its group's or job's) holds one
+regular expression per line. The named groups of the first pattern a line
+matches become its attributes, and a group named `level` also sets the level.
+JSON lines are unaffected.
+
+The patterns come from whoever submits the job, so their cost is bounded:
+
+- **Count:** only a task's first 8 lines are read. A job holds at most 16
+  patterns on a node, and the node at most 32 in use. The same text is
+  compiled once for every allocation.
+- **Size:** each pattern compiles to at most 32 KiB, and patterns only see the
+  first 4 KiB of a line.
+- **Time:** in each pass (every 2 s), a job's lines get 50 ms of matching, and
+  the node's lines 200 ms in all. The rest of that pass's lines go without
+  pattern attributes, and each pass starts at a different allocation.
+
+A dispatched or periodic job's children count as their parent job.
+
+A pattern that does not compile, or is past those limits, is skipped with a
+warning in the collector's log. A pattern that only lacked room on the node is
+tried again a minute later.
+
+```hcl
+task "unbound" {
+  # The map form: a key with a dot cannot go in a meta block
+  meta = {
+    "atalaya.log_regex" = <<-EOT
+      reply: (?P<client>\S+) (?P<qname>\S+) (?P<qtype>\S+) \S+ (?P<rcode>\S+)
+      rpz: applied \[(?P<rpz>[^\]]+)\] \S+ (?P<action>\S+) (?P<client>[^@ ]+)@\d+ (?P<qname>\S+)
+    EOT
+  }
+}
+```
+
+The syntax is Rust's [regex](https://docs.rs/regex/latest/regex/#syntax) crate,
+which matches in linear time.
+
 Over-long lines:
 
 - **Nomad:** a line longer than 4 MiB is cut and the rest skipped, counted in
