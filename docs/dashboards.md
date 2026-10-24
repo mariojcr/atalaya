@@ -51,7 +51,7 @@ sections:                     Grafana rows; collapsed: true does not query until
   - title, collapsed
     widgets:
       - title, description
-        type: timeseries | stat | gauge | bargauge | table | timeline | pie | bar | text
+        type: timeseries | stat | gauge | bargauge | table | timeline | pie | bar | logs | text
         grid: [x, y, w, h]    Grafana units: 24 columns, 30 px rows; y relative to the section
         unit, decimals, min, max, noValue
         thresholds: {mode: absolute|percentage, steps: [[null, green], [80, red]]}
@@ -72,6 +72,7 @@ sections:                     Grafana rows; collapsed: true does not query until
                    sort: {field, desc}, footer: sum|mean|max|min|count, header: true}
                   Without columns: one column per label and one per query. With join or several queries,
                   one row per key (the join label or the remaining labels) and one column per query.
+        logs:     {columns: [<field>, …], limit: 100}  type: logs; columns default to service, host, body
         content: text/markdown (type: text)
         rename: [[regex, replacement]]            renames series (Grafana's renameByRegex)
         queries:
@@ -81,6 +82,10 @@ sections:                     Grafana rows; collapsed: true does not query until
             instant: true                          an instant query (stat, tables…)
             minStep: 1m
             hide: true
+          - logs: 'service:my-app level:ERROR'     a log query instead of expr (see below)
+            by: <field> | [field, …]               up to 3; one series per group
+            top: 10                                the most frequent groups (up to 100)
+            instant: true                          one count for the whole range
         series:                                    Grafana overrides (the useful subset)
           - match: <exact name> | /regex/ | [name, name]
             name, color, unit, decimals, min, max, negative: true, fill, lineWidth, dash: true,
@@ -91,6 +96,43 @@ Units are Grafana's: `none`, `short`, `percent`, `percentunit`, `bytes`,
 `decbytes`, `bps`, `Bps`, `reqps`, `ops`, `s`, `ms`, `dtdurations`, `volt`,
 `amp`, `watt`, `kwatt`, `watth`, `kwatth`, `hertz`, `rotrpm`, `celsius`,
 `bool_yes_no` and a few more. Unknown units are written after the number.
+
+## Log panels
+
+A query with `logs:` instead of `expr:` counts log lines. It uses the logs
+explorer's syntax (`field:value`, `-field:value`, `field~text`, `field=~regex`
+and plain words), and its result is series like a PromQL query's, so any panel
+can draw it:
+
+- **Without `instant`:** a count per step, for timeseries and timelines.
+- **With `instant: true`:** one count for the range, for stat, bargauge, pie,
+  bar and table panels.
+- **Groups:** one series per value of the `by` fields, labeled with the field
+  names, keeping the `top` most frequent.
+
+A `type: logs` panel lists the latest lines of its log query, newest first, with
+a column per field in `logs.columns`. Its link opens the logs explorer with the
+same query and columns.
+
+Variables are substituted as in PromQL. A variable that allows several values or
+All becomes a regex, so use it with `=~`:
+
+```yaml
+- title: Blocked domains
+  type: bargauge
+  grid: [0, 0, 8, 8]
+  queries:
+    - logs: 'nomad.job:dns rpz:* host=~$host'
+      by: qname
+      top: 10
+      instant: true
+- title: Latest answers
+  type: logs
+  grid: [8, 0, 16, 8]
+  logs: {columns: [host, client, qname, qtype, rcode], limit: 100}
+  queries:
+    - logs: 'nomad.job:dns client:* host=~$host'
+```
 
 ## Builder dashboards
 

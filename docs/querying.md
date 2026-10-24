@@ -88,19 +88,30 @@ extrapolated `rate`, so the two can differ slightly on the same data.
 | `GET /api/v1/logs` | Lines and a histogram for a range and filters |
 | `GET /api/v1/logs/fields` | Fields present, with counts and top values |
 | `GET /api/v1/logs/values?field=…` | Top values of a field (autocomplete) |
+| `GET /api/v1/logs/counts` | Line counts per group of fields, as series (dashboards) |
 | `GET /api/v1/logs/context` | Lines around one line |
 | `GET/PUT/DELETE /api/v1/searches[/{id}]` | Saved searches |
 
 Common parameters: `range=1h` or `start`/`end`, `service`, `host`, `level`,
-`q` (case-insensitive text), `limit`, `breakdown=<field>` for the histogram, and
-any number of `f=` filters:
+`q` (case-insensitive text), `limit`, `breakdown=<field>` for the histogram,
+`docs_only=true` for the lines alone, and any number of `f=` filters:
 
 ```
 field:value      equal             -field:value     not equal
 field:*          exists            -field:*         does not exist
 field>n  field<n  field>=n  field<=n   numeric
 field~text       contains (case-insensitive)   -field~text  does not contain
+field=~regex     matches the whole value (RE2)  -field=~regex  does not match
 ```
+
+`/api/v1/logs/counts` counts the lines matching `start`/`end` and the `f=`
+filters. Its answer is `{"series": [{"labels": {…}, "points": [[t, n], …]}]}`:
+
+- `by=<field>`: groups by a field; repeat it for up to 3 fields. The labels are
+  named after the fields.
+- `top=10`: keeps that many groups, the most frequent in the range (up to 100).
+- `step=<seconds>`: a point per bucket, with 0 for buckets without lines.
+  Without it, a single count for the whole range, at `end`.
 
 Fields are `service`, `host`, `level`, `stream`, `body` and any key of the JSON
 attributes or resource labels (`nomad.job`, `container.name`, …).

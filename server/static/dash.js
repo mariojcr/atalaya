@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
-// Dashboards: collapsible sections, variables and widgets (PromQL and builder ones).
+// Dashboards: collapsible sections, variables and widgets (PromQL, log and builder ones).
 // The YAML schema is documented in the README (dashboard format).
 "use strict";
 
@@ -135,14 +135,35 @@ function expandRange(expr, secs) {
   const v = (unit) => (unit === "_s" ? String(secs) : unit === "_ms" ? String(secs * 1000) : `${secs}s`);
   return expr.replace(/\$\{__range(_s|_ms)?\}|\$__range(_s|_ms)?\b/g, (m, a, b) => v(a || b));
 }
+/** Filters of a log query (the explorer's syntax, with the variables
+ *  substituted) and the range, as /api/v1/logs parameters */
+function logParams(src, ctx, t) {
+  const { filters, words } = lgParse(interpolate(src || "", ctx));
+  const p = new URLSearchParams({ start: t.start, end: t.end });
+  [...filters, ...words.map((w) => `body~${w}`)].forEach((f) => p.append("f", f));
+  return p;
+}
+/** Line counts of a log query as series (one per group of its `by` fields):
+ *  one count over the range (instant) or one per step */
+async function logCounts(q, ctx, t, step, signal) {
+  const p = logParams(q.logs, ctx, t);
+  [].concat(q.by || []).forEach((b) => p.append("by", b));
+  if (q.top) p.set("top", q.top);
+  if (step) p.set("step", step);
+  const r = await fetch(`/api/v1/logs/counts?${p}`, { signal });
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j.series;
+}
 async function runQueries(w, t, width, signal) {
   const ctx = varContext();
-  const qs = (w.queries || []).filter((q) => !q.hide && q.expr);
+  const qs = (w.queries || []).filter((q) => !q.hide && (q.expr || q.logs != null));
   const points = w.type === "timeseries" || w.type === "timeline" ? width / 2 : Math.min(200, width / 3);
   return Promise.all(qs.map(async (q, i) => {
     const qq = { ...q, ref: q.ref || LETTERS[i] };
-    const expr = q.instant ? expandRange(interpolate(q.expr, ctx), t.end - t.start) : interpolate(q.expr, ctx);
     const minStep = q.minStep ? durSecs(q.minStep) || 15 : 15;
+    if (q.logs != null) return { q: qq, series: await logCounts(q, ctx, t, q.instant ? 0 : niceStep(t.end - t.start, points, minStep), signal), meta: {} };
+    const expr = q.instant ? expandRange(interpolate(q.expr, ctx), t.end - t.start) : interpolate(q.expr, ctx);
     // Range queries are batched with those of other widgets querying at the same time
     const r = q.instant ? await promInstant(expr, t.end, signal) : await promRangeBatched(expr, t.start, t.end, niceStep(t.end - t.start, points, minStep), signal);
     return { q: qq, series: r.series, meta: r.meta };
@@ -457,6 +478,25 @@ function renderTimeline(w, body, series, tr) {
   $$(".swatch[data-m]", body).forEach((e) => { const c = colorName(legendItems[+e.dataset.m].color || css("--muted")); e.style.background = c; e.style.borderColor = c; });
 }
 
+/** Log lines: the latest of the widget's log query, newest first, with a
+ *  column per field (`logs.columns`) */
+async function renderLogs(w, body, tr, signal) {
+  const q = (w.queries || []).find((x) => !x.hide && x.logs != null);
+  const o = w.logs || {};
+  const p = logParams(q?.logs, varContext(), tr);
+  p.set("limit", Math.min(o.limit || 100, 1000));
+  p.set("docs_only", "true");
+  const r = await fetch(`/api/v1/logs?${p}`, { signal });
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  if (!j.logs.length) { body.innerHTML = `<div class="empty"><p>${t("nologs")}</p></div>`; return; }
+  const cols = o.columns?.length ? o.columns : ["service", "host", "body"];
+  const withDate = tr.end - tr.start > 86400;
+  const cell = (l, c) => { const v = String(lgValue(l, c) ?? ""); return `<td data-tip="${esc(v)}">${esc(v)}</td>`; };
+  body.innerHTML = `<div class="table-wrap"><table class="grid-table wlogs"><thead><tr><th>${t("lg.time")}</th>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${
+    j.logs.map((l) => `<tr><td><span class="sev ${esc(l.level)}" aria-label="${esc(SEV_NAME[l.level] ?? l.level)}"></span>${lgTime(l.ts, withDate)}</td>${cols.map((c) => cell(l, c)).join("")}</tr>`).join("")}</tbody></table></div>`;
+}
+
 /** Minimal Markdown (headings, lists, bold, italics, code and links) over already-escaped text */
 function markdown(src) {
   const inline = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/\*([^*]+)\*/g, "<i>$1</i>")
@@ -476,6 +516,16 @@ function markdown(src) {
 // ── Widgets ─────────────────────────────────────────────────────────────────
 function explorerLink(w) {
   const ctx = varContext();
+  // Log queries open the logs explorer: the query, the columns and the first by field as the breakdown
+  const lq = (w.queries || []).find((q) => !q.hide && q.logs != null);
+  if (lq) {
+    const p = new URLSearchParams();
+    if (lq.logs) p.set("q", interpolate(lq.logs, ctx));
+    if (w.logs?.columns?.length) p.set("cols", w.logs.columns.join(","));
+    const by = [].concat(lq.by || [])[0];
+    if (by) p.set("bk", by);
+    return `#/logs${p.toString() ? `?${p}` : ""}`;
+  }
   const queries = (w.queries || []).filter((q) => q.expr).map((q, i) => ({ ...newQuery(LETTERS[i]), mode: "promql", expr: interpolate(q.expr, ctx), legend: q.legend || "", hidden: !!q.hide }));
   return `#/metrics?s=${encodeState({ queries, formulas: [], type: w.style?.stack ? (w.style.draw === "bars" ? "bar" : "area") : "line", log: false, compare: "" })}`;
 }
@@ -492,6 +542,7 @@ async function runWidget(wd) {
   if (w.legacy) return runLegacyWidget(wd, tr);
   wd.el.classList.add("loading");
   try {
+    if (w.type === "logs") return await renderLogs(w, body, tr, ctrl.signal);
     const results = await runQueries(w, tr, body.clientWidth || 600, ctrl.signal);
     if (ctrl.signal.aborted) return;
     const series = buildSeries(w, results);
@@ -543,7 +594,8 @@ function widgetEl(w) {
   el.style.gridColumn = `${x + 1} / span ${gw}`;
   el.style.gridRow = `${y + 1} / span ${gh}`;
   el.style.setProperty("--h", gh);
-  const link = w.type === "text" ? "" : `<a class="icon-btn open" href="${w.legacy ? "#/metrics" : esc(explorerLink(w))}" data-tip="${t("dash.open")}" aria-label="${t("dash.open_aria")}">${ICON_OPEN}</a>`;
+  const logs = (w.queries || []).some((q) => q.logs != null);
+  const link = w.type === "text" ? "" : `<a class="icon-btn open" href="${w.legacy ? "#/metrics" : esc(explorerLink(w))}" data-tip="${t(logs ? "dash.open_logs" : "dash.open")}" aria-label="${t("dash.open_aria")}">${ICON_OPEN}</a>`;
   el.innerHTML = `<header><h3 data-tip="${esc(w.title)}">${esc(w.title)}</h3><span class="tools">${w.description ? `<button class="icon-btn info" data-tip="${esc(w.description)}" data-tip-only aria-label="${esc(t("dash.desc", { d: w.description }))}">${ICON_INFO}</button>` : ""}${link}</span></header><div class="wbody"></div>`;
   return el;
 }
