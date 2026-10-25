@@ -293,10 +293,12 @@ struct ValuesParams {
     field: String,
     #[serde(default)]
     prefix: String,
+    /// How many values (10 by default, up to 1000: dashboard variables)
+    limit: Option<u32>,
 }
 
 /// Most frequent values of a field starting with the prefix, within the range
-/// and filters (query bar autocompletion)
+/// and filters (query bar autocompletion and dashboard variables)
 async fn log_values(State(app): State<Shared>, Query(p): Query<ValuesParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
     let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
     let mut params: Vec<Param> = vec![
@@ -309,7 +311,8 @@ async fn log_values(State(app): State<Shared>, Query(p): Query<ValuesParams>, Ra
     conds.extend(logsearch::filters_sql(&log_filters(&rq), &mut params)?);
     let col = logsearch::field_sql(&p.field, &mut params, 999)?;
     let table = format!("{}.logs", app.db);
-    let rows = app.ch.rows(&logsearch::values_sql(&table, &conds.join(" AND "), &col), &params).await?;
+    let limit = p.limit.unwrap_or(10).clamp(1, 1000);
+    let rows = app.ch.rows(&logsearch::values_sql(&table, &conds.join(" AND "), &col, limit), &params).await?;
     Ok(Json(json!({ "field": p.field, "values": rows })))
 }
 
