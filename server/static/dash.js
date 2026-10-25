@@ -248,7 +248,16 @@ function fitText(el, h, wpx, maxPx = 56, minPx = 12) {
   el.style.fontSize = Math.max(minPx, Math.min(maxPx, h * 0.7, (wpx * 0.92) / (len * 0.58))) + "px";
 }
 
-function renderStat(w, body, series) {
+/** Change of a stat against the same range `stat.compare` back: "▲ 12 %" (no
+ *  percentage from zero), with the earlier value in its tooltip */
+function statDelta(w, v, pv, st) {
+  if (typeof v !== "number" || typeof pv !== "number" || !Number.isFinite(v) || !Number.isFinite(pv)) return "";
+  const pct = pv ? ((v - pv) / Math.abs(pv)) * 100 : null;
+  const arrow = v > pv ? "▲" : v < pv ? "▼" : "=";
+  const text = pct == null ? arrow : `${arrow} ${fmtDec(Math.abs(pct), Math.abs(pct) < 10 ? 1 : 0)} %`;
+  return `<div class="stat-delta" data-tip="${esc(t("dash.compare", { d: w.stat.compare, v: valueText(w, pv, st) }))}" data-tip-only>${esc(text)}</div>`;
+}
+function renderStat(w, body, series, prev) {
   const o = w.stat || {};
   let items;
   if (o.field) {
@@ -258,7 +267,10 @@ function renderStat(w, body, series) {
     const v = best ? best.s.labels[o.field] ?? null : null;
     items = [{ name: w.title, v, s: best?.s || { points: [], style: {} } }];
   } else {
-    items = series.map((s) => ({ name: s.name, v: reduce(s.points, o.reduce), s }));
+    items = series.map((s, i) => {
+      const ps = prev && (prev.find((p) => p.name === s.name) || prev[i]);
+      return { name: s.name, v: reduce(s.points, o.reduce), pv: ps ? reduce(ps.points, o.reduce) : undefined, s };
+    });
   }
   if (!items.length) items = [{ name: "", v: null, s: { points: [], style: {} } }];
   const mode = o.colorMode || "value";
@@ -266,7 +278,7 @@ function renderStat(w, body, series) {
   body.innerHTML = `<div class="stats${o.orientation === "horizontal" ? " horizontal" : ""}">` + items.map((it, i) => {
     const showName = textMode === "name" || textMode === "value_and_name";
     const main = textMode === "name" ? it.name : valueText(w, it.v, it.s.style);
-    return `<div class="stat ${mode === "background" ? "bg" : ""}" data-i="${i}">${showName && textMode !== "name" ? `<div class="stat-name" data-tip="${esc(it.name)}">${esc(it.name)}</div>` : ""}<div class="stat-box"><div class="stat-value">${esc(main)}</div></div>${o.graph === "area" && !o.field ? sparkline(it.s.points, "") : ""}</div>`;
+    return `<div class="stat ${mode === "background" ? "bg" : ""}" data-i="${i}">${showName && textMode !== "name" ? `<div class="stat-name" data-tip="${esc(it.name)}">${esc(it.name)}</div>` : ""}<div class="stat-box"><div class="stat-value">${esc(main)}</div></div>${it.pv !== undefined ? statDelta(w, it.v, it.pv, it.s.style) : ""}${o.graph === "area" && !o.field ? sparkline(it.s.points, "") : ""}</div>`;
   }).join("") + `</div>`;
   $$(".stat", body).forEach((el) => {
     const it = items[+el.dataset.i];
@@ -642,11 +654,13 @@ async function runWidget(wd) {
   try {
     if (w.type === "logs") return await renderLogs(w, body, tr, ctrl.signal);
     const marks = (w.type || "timeseries") === "timeseries" && w.annotations !== false ? boardMarks(tr) : null;
-    const results = await runQueries(w, tr, body.clientWidth || 600, ctrl.signal);
+    // stat.compare: the same queries that far back, for the change of each value
+    const cw = w.type === "stat" && w.stat?.compare && !w.stat.field ? { ...w, queries: (w.queries || []).map((q) => ({ ...q, offset: w.stat.compare })) } : null;
+    const [results, before] = await Promise.all([runQueries(w, tr, body.clientWidth || 600, ctrl.signal), cw && runQueries(cw, tr, body.clientWidth || 600, ctrl.signal)]);
     if (ctrl.signal.aborted) return;
     const series = buildSeries(w, results);
     switch (w.type) {
-      case "stat": renderStat(w, body, series); break;
+      case "stat": renderStat(w, body, series, before && buildSeries(cw, before)); break;
       case "gauge": renderGauge(w, body, series); break;
       case "bargauge": renderBargauge(w, body, series); break;
       case "pie": renderPie(w, body, series); break;
