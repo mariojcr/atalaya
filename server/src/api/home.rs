@@ -82,5 +82,7 @@ async fn events_handler(State(app): State<Shared>, Query(p): Query<EventsParams>
         return Err(anyhow::anyhow!("range must be between 5 minutes and 400 days").into());
     }
     let service = if p.service.is_empty() { None } else { Some(p.service.as_str()) };
-    Ok(Json(events::events(&app, start, end, service, lang_of(&p.lang), p.lanes.unwrap_or(true)).await?))
+    Ok(Json(
+        events::events(&app, start, end, service, lang_of(&p.lang), p.lanes.unwrap_or(true)).await?,
+    ))
 }
