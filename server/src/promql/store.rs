@@ -129,12 +129,15 @@ pub struct SeriesRef {
     field: Field,
 }
 
-/// Samples of a series (Unix seconds, value), ordered by time
+/// Samples of a series (Unix seconds, value), ordered by time, and when it
+/// went stale (ordered too): its last sample before one of those times is not
+/// a current value after it
 #[derive(Clone, Default)]
 pub struct Samples {
     pub labels: Labels,
     pub ts: Vec<i64>,
     pub vals: Vec<f64>,
+    pub stale: Vec<i64>,
 }
 
 /// Resolved series rows of a query (cached for 60 s)
@@ -154,6 +157,8 @@ pub struct Store {
     series_cache: Mutex<HashMap<String, (Instant, SeriesList)>>,
 }
 const SERIES_CACHE_TTL: Duration = Duration::from_secs(300);
+/// Reading staleness markers failed once already (reported once)
+static STALE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const SERIES_CACHE_MAX: usize = 1000;
 
 fn guess_kind(metric: &str) -> Kind {
@@ -592,7 +597,13 @@ impl Store {
             )
         };
         let settings: &[(&str, &str)] = &[("optimize_aggregation_in_order", "1"), ("max_threads", "8")];
-        let (a, b) = tokio::join!(
+        let stale_sql = format!(
+            "SELECT toUInt64(SeriesId), toInt64(toUnixTimestamp(Time)) AS t FROM {db}.stale
+             WHERE Metric IN {{metrics:Array(String)}} AND SeriesId IN {{ids:Array(UInt64)}}
+               AND Time > toDateTime({{from:Int64}}) AND Time <= toDateTime({{to:Int64}})
+             ORDER BY SeriesId, t FORMAT RowBinary"
+        );
+        let (a, b, c) = tokio::join!(
             async {
                 if has_scalar {
                     self.ch.bytes(&scalar_sql, &params, settings).await.map(Some)
@@ -607,7 +618,24 @@ impl Store {
                     Ok(None)
                 }
             },
+            self.ch.bytes(&stale_sql, &params, &[]),
         );
+        // id → times it went stale. Without them (a schema from before the
+        // stale table) series only end with the lookback, as before.
+        let mut stale: HashMap<u64, Vec<i64>> = HashMap::new();
+        match c {
+            Ok(body) => {
+                let mut r = Cursor::new(&body);
+                while let (Some(id), Some(t)) = (r.u64(), r.i64()) {
+                    stale.entry(id).or_default().push(t);
+                }
+                r.finish("stale")?;
+            }
+            Err(e) if !STALE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+                tracing::warn!("reading staleness markers: {e:#} (not repeated)");
+            }
+            Err(_) => {}
+        }
         if let Some(body) = a? {
             let mut r = Cursor::new(&body);
             while let (Some(id), Some(t), Some(g), Some(c), Some(mn)) = (r.u64(), r.i64(), r.f64(), r.f64(), r.f64()) {
@@ -637,6 +665,7 @@ impl Store {
             .map(|s| {
                 let mut out = Samples {
                     labels: s.labels,
+                    stale: stale.remove(&s.id).unwrap_or_default(),
                     ..Default::default()
                 };
                 match s.field {

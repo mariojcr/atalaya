@@ -66,6 +66,7 @@ Notebooks, saved searches and alert state live in `ATALAYA_DATA`.
 | `points` | Scalar points: series, time, value | 7 days |
 | `points_1m`, `points_10m` | Per bucket: min, max, sum, count, time of the last sample, DDSketch | 6 weeks / forever |
 | `dist_points` (+ `_1m`, `_10m`) | Histograms: count, sum and cumulative buckets | 7 days / 6 weeks / forever |
+| `stale` | When a series stopped being written (staleness markers) | forever |
 | `logs` | Time, service, host, stream, level, body, resource and JSON attributes | forever |
 
 ```mermaid

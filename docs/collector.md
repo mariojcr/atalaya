@@ -95,6 +95,13 @@ are stored as distributions; summaries as their quantiles plus `_sum`/`_count`.
 Samples whose metric name is not `[a-zA-Z_:][a-zA-Z0-9_:]*` are dropped, with a
 warning per target at most once an hour.
 
+As Prometheus does, a series is marked stale when it stops being written: missing
+from its target's next scrape, after a failed scrape, or when the target is gone
+(its allocation stopped; not while Nomad discovery is failing). The same applies
+to the host's readers. Markers go to the `stale` table on a best-effort basis: a
+batch that cannot be sent is dropped and never spooled, so a schema without that
+table holds nothing else up.
+
 What Nomad discovery covers:
 
 - services registered with Nomad's own provider (`provider = "nomad"`), not
