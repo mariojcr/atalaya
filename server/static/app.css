@@ -336,6 +336,10 @@ body.nav-collapsed main { padding-left: 24px; }
 /* Bar gauge */
 .bargauges { flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: space-evenly; gap: 2px; overflow: auto; }
 .bgrow { display: grid; grid-template-columns: minmax(40px, 30%) 1fr auto; gap: 8px; align-items: center; font-size: 12px; }
+/* Groups of a log query link to the logs explorer (dash.js drillLink) */
+a.bgrow, a.bar, .pie-legend a.pl, .grid-table td a { color: inherit; text-decoration: none; }
+a.bgrow:hover .bgname, a.bar:hover .lbl, .pie-legend a.pl:hover span, .grid-table td a:hover { text-decoration: underline; }
+.pie svg path.link { cursor: pointer; }
 .bgname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .bgtrack { height: 12px; background: var(--surface-2); border-radius: 2px; overflow: hidden; }
 .bgtrack i { display: block; height: 100%; border-radius: 2px; }
@@ -348,7 +352,8 @@ body.nav-collapsed main { padding-left: 24px; }
 .pie svg { width: auto; height: auto; max-width: 55%; aspect-ratio: 1; flex: none; stroke: var(--surface); stroke-width: .6; }
 .pie-legend { align-self: center; }
 .pie-legend { list-style: none; margin: 0; padding: 0; overflow: auto; max-height: 100%; font-size: 12px; flex: 1; min-width: 0; }
-.pie-legend li { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
+.pie-legend li, .pie-legend .pl { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
+.pie-legend .pl { flex: 1; min-width: 0; }
 .pie-legend li span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pie-legend .swatch { width: 10px; height: 10px; margin-right: 0; flex: none; }
 .bars { flex: 1; min-height: 0; display: flex; gap: 8px; align-items: stretch; padding-top: 4px; }

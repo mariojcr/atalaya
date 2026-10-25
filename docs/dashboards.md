@@ -111,7 +111,9 @@ can draw it:
 - **With `instant: true`:** one count for the range, for stat, bargauge, pie,
   bar and table panels.
 - **Groups:** one series per value of the `by` fields, labeled with the field
-  names, keeping the `top` most frequent.
+  names, keeping the `top` most frequent. In bargauge, bar, pie and table
+  panels each group links to the logs explorer, with the query and that
+  group's values.
 
 A `type: logs` panel lists the latest lines of its log query, newest first, with
 a column per field in `logs.columns`. Its link opens the logs explorer with the

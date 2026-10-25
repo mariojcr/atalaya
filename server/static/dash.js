@@ -180,6 +180,20 @@ async function runQueries(w, t, width, signal) {
   }));
 }
 
+/** Logs explorer link for one group of a log query with `by`: the query plus
+ *  that group's field values (null for other series) */
+function drillLink(w, s) {
+  const by = [].concat(s.q?.by || []);
+  if (s.q?.logs == null || !by.length) return null;
+  const terms = by.filter((f) => (s.labels[f] ?? "") !== "").map((f) => `${f}:${lgAcQuote(s.labels[f])}`);
+  // A `field:*` of a grouped field is redundant once its value is fixed
+  const re = (f) => new RegExp(`(^|\\s)${f.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\*(?=\\s|$)`, "g");
+  const base = by.reduce((src, f) => src.replace(re(f), "$1"), interpolate(s.q.logs, varContext()));
+  const p = new URLSearchParams({ q: [base.replace(/\s+/g, " ").trim(), ...terms].filter(Boolean).join(" ") });
+  if (w.logs?.columns?.length) p.set("cols", w.logs.columns.join(","));
+  return `#/logs?${p}`;
+}
+
 // ── Renderers ───────────────────────────────────────────────────────────────
 function renderTimeseries(w, body, series, t) {
   const right = w.legend?.placement === "right";
@@ -291,7 +305,10 @@ function renderBargauge(w, body, series) {
   const o = w.bargauge || {};
   const items = series.map((s) => ({ name: s.name, v: reduce(s.points, o.reduce), s }));
   if (!items.length) { body.innerHTML = `<div class="empty"><p>${t("nodata")}</p></div>`; return; }
-  body.innerHTML = `<div class="bargauges">` + items.map((it, i) => `<div class="bgrow" data-i="${i}"><span class="bgname" data-tip="${esc(it.name)}">${esc(it.name)}</span><span class="bgtrack"><i></i></span><span class="bgval">${esc(valueText(w, it.v, it.s.style))}</span></div>`).join("") + `</div>`;
+  body.innerHTML = `<div class="bargauges">` + items.map((it, i) => {
+    const href = drillLink(w, it.s), tag = href ? "a" : "div";
+    return `<${tag} class="bgrow" data-i="${i}"${href ? ` href="${esc(href)}"` : ""}><span class="bgname" data-tip="${esc(it.name)}">${esc(it.name)}</span><span class="bgtrack"><i></i></span><span class="bgval">${esc(valueText(w, it.v, it.s.style))}</span></${tag}>`;
+  }).join("") + `</div>`;
   $$(".bgrow", body).forEach((row) => {
     const i = +row.dataset.i, it = items[i], st = it.s.style || {};
     const min = st.min ?? w.min ?? 0, max = st.max ?? w.max ?? Math.max(...items.map((x) => x.v ?? 0), 1);
@@ -320,9 +337,16 @@ function renderPie(w, body, series) {
     a = a1;
     return `<path data-i="${i}" d="${d}" fill-rule="evenodd"><title>${esc(it.name)}: ${esc(valueText(w, it.v, it.s.style))} (${((it.v / total) * 100).toFixed(1)}%)</title></path>`;
   }).join("");
-  const legend = w.legend?.show === false ? "" : `<ul class="pie-legend">` + items.map((it, i) => `<li><i class="swatch" data-i="${i}"></i><span>${esc(it.name)}</span><b>${esc(valueText(w, it.v, it.s.style))}</b></li>`).join("") + `</ul>`;
+  const legend = w.legend?.show === false ? "" : `<ul class="pie-legend">` + items.map((it, i) => {
+    const href = drillLink(w, it.s), tag = href ? "a" : "span";
+    return `<li><${tag} class="pl"${href ? ` href="${esc(href)}"` : ""}><i class="swatch" data-i="${i}"></i><span>${esc(it.name)}</span><b>${esc(valueText(w, it.v, it.s.style))}</b></${tag}></li>`;
+  }).join("") + `</ul>`;
   body.innerHTML = `<div class="pie"><svg viewBox="0 0 100 100" role="img" aria-label="${esc(w.title)}">${segs}</svg>${legend}</div>`;
-  $$("path[data-i]", body).forEach((p) => { p.style.fill = items[+p.dataset.i].c; });
+  $$("path[data-i]", body).forEach((p) => {
+    const it = items[+p.dataset.i], href = drillLink(w, it.s);
+    p.style.fill = it.c;
+    if (href) { p.classList.add("link"); p.onclick = () => { location.hash = href.slice(1); }; }
+  });
   $$(".swatch[data-i]", body).forEach((e) => { const c = items[+e.dataset.i].c; e.style.background = c; e.style.borderColor = c; });
 }
 
@@ -330,7 +354,10 @@ function renderBar(w, body, series) {
   const items = series.map((s) => ({ name: s.name, v: reduce(s.points, "lastNotNull") ?? 0, s }));
   if (!items.length) { body.innerHTML = `<div class="empty"><p>${t("nodata")}</p></div>`; return; }
   const max = Math.max(w.max ?? 0, ...items.map((it) => it.v), 1e-9);
-  body.innerHTML = `<div class="bars">` + items.map((it, i) => `<div class="bar" data-i="${i}"><b>${esc(valueText(w, it.v, it.s.style))}</b><span class="col"><i></i></span><span class="lbl" data-tip="${esc(it.name)}">${esc(it.name)}</span></div>`).join("") + `</div>`;
+  body.innerHTML = `<div class="bars">` + items.map((it, i) => {
+    const href = drillLink(w, it.s), tag = href ? "a" : "div";
+    return `<${tag} class="bar" data-i="${i}"${href ? ` href="${esc(href)}"` : ""}><b>${esc(valueText(w, it.v, it.s.style))}</b><span class="col"><i></i></span><span class="lbl" data-tip="${esc(it.name)}">${esc(it.name)}</span></${tag}>`;
+  }).join("") + `</div>`;
   $$(".bar", body).forEach((el) => {
     const it = items[+el.dataset.i];
     const bar = $(".col i", el);
@@ -349,7 +376,7 @@ function renderTable(w, body, results) {
     for (const s of series) {
       const { __name__, ...rest } = s.labels;
       const key = tc.join ? s.labels[tc.join] ?? "" : multi ? labelKey(rest) : `${labelKey(s.labels)}#${rows.size}`;
-      const row = rows.get(key) || { labels: {}, values: {} };
+      const row = rows.get(key) || { labels: {}, values: {}, href: drillLink(w, s) };
       Object.entries(s.labels).forEach(([k, v]) => { if (!(k in row.labels)) row.labels[k] = v; if (!labelOrder.includes(k)) labelOrder.push(k); });
       const last = s.points.filter((p) => p[1] != null).at(-1);
       row.values[q.ref] = last ? last[1] : null;
@@ -381,7 +408,8 @@ function renderTable(w, body, results) {
       const v = cellValue(row, c);
       const txt = c.isValue ? valueText(w, v, unitOfCol(c)) : String(v);
       if (c.cell === "bar" && c.isValue) return `<td class="num"><span class="cell-bar" data-r="${data.indexOf(row)}" data-c="${i}"><i></i><span>${esc(txt)}</span></span></td>`;
-      return `<td class="${c.isValue ? "num" : ""}" data-r="${data.indexOf(row)}" data-c="${i}">${esc(txt)}</td>`;
+      const cell = !c.isValue && row.href ? `<a href="${esc(row.href)}">${esc(txt)}</a>` : esc(txt);
+      return `<td class="${c.isValue ? "num" : ""}" data-r="${data.indexOf(row)}" data-c="${i}">${cell}</td>`;
     }).join("")}</tr>`).join("");
     let foot = "";
     if (tc.footer) {
