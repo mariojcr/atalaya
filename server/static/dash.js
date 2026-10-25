@@ -194,8 +194,32 @@ function drillLink(w, s) {
   return `#/logs?${p}`;
 }
 
+/** Annotations of the dashboard for a range: the events (as on the timeline) of
+ *  each `annotations` entry, of the given types, as chart marks. One request per
+ *  range, shared by its panels. */
+const MARK_TYPES = ["alloc_started", "restart"];
+function boardMarks(tr) {
+  const defs = board?.def?.annotations || [];
+  if (!defs.length) return Promise.resolve([]);
+  const key = `${tr.start}|${tr.end}`;
+  board.marks ||= new Map();
+  if (!board.marks.has(key)) {
+    board.marks.set(key, Promise.all(defs.map(async (a) => {
+      const p = new URLSearchParams({ start: Math.floor(tr.start), end: Math.floor(tr.end), lang: LANG, lanes: "false" });
+      if (a.service) p.set("service", interpolate(a.service, varContext()));
+      const r = await fetch(`/api/v1/events?${p}`);
+      if (!r.ok) return [];
+      const types = a.types || MARK_TYPES, color = colorName(a.color || "purple");
+      return (await r.json()).events.filter((e) => types.includes(e.type)).map((e) => ({ t: e.time, title: e.title, detail: e.detail, color }));
+    })).then((l) => l.flat()).catch(() => []));
+    // Relative ranges move on every refresh: keep the latest few
+    if (board.marks.size > 8) board.marks.delete(board.marks.keys().next().value);
+  }
+  return board.marks.get(key);
+}
+
 // ── Renderers ───────────────────────────────────────────────────────────────
-function renderTimeseries(w, body, series, t) {
+function renderTimeseries(w, body, series, t, marks) {
   const right = w.legend?.placement === "right";
   body.innerHTML = `<div class="ts${right ? " right" : ""}"><div class="chart-host"></div><div class="legend-host"></div></div>`;
   const st = w.style || {};
@@ -204,7 +228,7 @@ function renderTimeseries(w, body, series, t) {
     grafana: true, height: "fit", unit: w.unit, decimals: w.decimals, min: w.min, max: w.max, start: t.start, end: t.end,
     stack: st.stack, fill: st.fill ?? 0, lineWidth: st.lineWidth, draw: st.draw, interpolation: st.interpolation, showPoints: st.showPoints,
     spanNulls: st.spanNulls, softMin: st.softMin, softMax: st.softMax, log: !!st.logBase, logBase: st.logBase, axis: st.axis,
-    thresholds, thresholdsStyle: w.thresholdsStyle, legend: { mode: "list", ...(w.legend || {}) },
+    thresholds, thresholdsStyle: w.thresholdsStyle, legend: { mode: "list", ...(w.legend || {}) }, marks,
     onZoom: (a, b) => setTime({ start: a, end: b }),
   });
 }
@@ -617,6 +641,7 @@ async function runWidget(wd) {
   wd.el.classList.add("loading");
   try {
     if (w.type === "logs") return await renderLogs(w, body, tr, ctrl.signal);
+    const marks = (w.type || "timeseries") === "timeseries" && w.annotations !== false ? boardMarks(tr) : null;
     const results = await runQueries(w, tr, body.clientWidth || 600, ctrl.signal);
     if (ctrl.signal.aborted) return;
     const series = buildSeries(w, results);
@@ -631,7 +656,10 @@ async function runWidget(wd) {
       case "heatmap": renderHeatmap(w, body, series); break;
       default:
         if (!series.length) body.innerHTML = `<div class="empty"><p>${t("chart.nodata")}</p></div>`;
-        else renderTimeseries(w, body, series, tr);
+        else {
+          const m = marks ? await marks : [];
+          if (!ctrl.signal.aborted) renderTimeseries(w, body, series, tr, m);
+        }
     }
   } catch (e) {
     if (e.name === "AbortError") return;

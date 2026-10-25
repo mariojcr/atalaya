@@ -222,6 +222,8 @@ body.nav-collapsed main { padding-left: 24px; }
 .tooltip .t { color: var(--muted); margin-bottom: 4px; }
 .tooltip .r { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
 .tooltip .r span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tooltip .mk { border-left: 3px solid; padding-left: 6px; margin-bottom: 4px; }
+.tooltip .mk span { display: block; color: var(--muted); }
 /* On touch the tooltip is a fixed bar above the chart (not under the finger); a tap pins it */
 .tooltip.bar { left: 0 !important; right: 0; top: 0 !important; max-width: none; border-radius: 0 0 4px 4px; max-height: 45%; overflow: auto; opacity: .96; }
 .tooltip.bar .r { padding: 1px 0; }

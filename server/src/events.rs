@@ -186,7 +186,7 @@ fn tr(lang: &str, key: &str) -> &'static str {
     }
 }
 
-pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang: &str) -> Result<Value> {
+pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang: &str, with_lanes: bool) -> Result<Value> {
     let cfg = load_config(&app.timeline);
     let range = end - start;
     let bucket = (range / 120).clamp(60, 3600);
@@ -426,7 +426,8 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
         .collect();
 
     // Metric lanes
-    let metric_lanes = futures::future::join_all(cfg.lanes.iter().map(|l| async move {
+    let lanes_cfg: &[Lane] = if with_lanes { &cfg.lanes } else { &[] };
+    let metric_lanes = futures::future::join_all(lanes_cfg.iter().map(|l| async move {
         let series = match app.promql.range(&l.query, start, end, bucket).await {
             Ok(r) => match r.output {
                 Output::Matrix(m) => m.into_iter().next().map(|(_, p)| p).unwrap_or_default(),

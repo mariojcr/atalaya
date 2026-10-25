@@ -242,6 +242,23 @@ const withAlpha = (c, a) => {
   return c;
 };
 
+/** Annotations: a dashed vertical line with a small flag on top per mark ({t, color}) */
+function drawMarks(u, marks) {
+  const ctx = u.ctx, { left, width, top, height } = u.bbox, dpr = devicePixelRatio;
+  ctx.save();
+  ctx.lineWidth = Math.max(1, dpr);
+  for (const m of marks) {
+    const x = Math.round(u.valToPos(m.t, "x", true)) + 0.5;
+    if (x < left || x > left + width) continue;
+    ctx.strokeStyle = ctx.fillStyle = m.color;
+    ctx.setLineDash([3 * dpr, 3 * dpr]);
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + height); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(x - 4 * dpr, top); ctx.lineTo(x + 4 * dpr, top); ctx.lineTo(x, top + 5 * dpr); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
 /**
  * Draws several sets of series in one chart, with tooltip and legend.
  * set: { timeSeries: [{ labels, points, name?, style? }], name (prefix: "A", "F1"…), dashed, shift (s), keys, base }
@@ -249,6 +266,7 @@ const withAlpha = (c, a) => {
  * opts: { type: line|area|bar, log, logBase, height (px or "fit"), unit, decimals, start, end, colors, onZoom,
  *         stack: normal|percent, fill, lineWidth, draw: line|bars|points, interpolation, showPoints, spanNulls,
  *         min, max, softMin, softMax, thresholds: [{value, color}], thresholdsStyle: line|dashed, axis: "hidden",
+ *         marks: [{t, title, detail, color}] (annotations: vertical lines with a tooltip),
  *         legend: { show, mode: list|table, calcs } }
  */
 // No hover pointer (touch): the tooltip is pinned on tap and shown in a bar, not under the finger
@@ -417,8 +435,8 @@ function renderChart(host, legendHost, sets, opts = {}) {
         }
         u.setSelect({ width: 0, height: 0 }, false);
       }],
-      // Thresholds as reference lines
-      draw: steps.length && opts.thresholdsStyle ? [(u) => {
+      // Thresholds as reference lines, and annotations
+      draw: (steps.length && opts.thresholdsStyle ? [(u) => {
         const ctx = u.ctx, { left, width, top, height: h } = u.bbox;
         ctx.save();
         steps.forEach((s) => {
@@ -429,7 +447,7 @@ function renderChart(host, legendHost, sets, opts = {}) {
           ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + width, y); ctx.stroke();
         });
         ctx.restore();
-      }] : [],
+      }] : []).concat(opts.marks?.length ? [(u) => drawMarks(u, opts.marks)] : []),
     },
   }, data, host);
   u.over.appendChild(tooltip);
@@ -455,10 +473,14 @@ function renderChart(host, legendHost, sets, opts = {}) {
     if (COARSE && !pinned && !force) { tooltip.hidden = true; return; }
     if (j == null || u.cursor.left < 0) { if (!pinned) tooltip.hidden = true; return; }
     const rows = all.map((_, i) => [i, valueAt(i, j)]).filter(([i, v]) => v != null && u.series[series.findIndex((s) => s._i === i)]?.show !== false).sort((a, b) => b[1] - a[1]).slice(0, 12);
-    if (!rows.length) { tooltip.hidden = true; return; }
-    tooltip.innerHTML = `<div class="t">${fmtTime(xs[j], span > 86400)}</div>` + rows.map(([i, v]) =>
+    // Annotations under the cursor
+    const near = (opts.marks || []).filter((m) => Math.abs(u.valToPos(m.t, "x") - u.cursor.left) <= 6);
+    if (!rows.length && !near.length) { tooltip.hidden = true; return; }
+    tooltip.innerHTML = `<div class="t">${fmtTime(xs[j], span > 86400)}</div>` + near.map((m, k) =>
+      `<div class="mk" data-k="${k}"><b>${esc(m.title)}</b>${m.detail ? `<span>${esc(m.detail)}</span>` : ""}</div>`).join("") + rows.map(([i, v]) =>
       `<div class="r"><span><i class="swatch" data-i="${i}"></i>${esc(all[i].name)}</span><b>${esc(fmts[i](v))}</b></div>`).join("");
     paintSwatches(tooltip);
+    $$(".mk", tooltip).forEach((e) => { e.style.borderLeftColor = near[+e.dataset.k].color; });
     tooltip.hidden = false;
     if (COARSE) return; // the bar is fixed at the top (CSS)
     const left = u.cursor.left + 16, w = tooltip.offsetWidth;
