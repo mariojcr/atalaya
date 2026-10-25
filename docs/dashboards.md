@@ -42,6 +42,10 @@ title, description
 refresh: 30s                  default auto-refresh interval
 time: 24h                     default range (unless one was picked in the session)
 nowDelay: 45s                 how far "now" lags in relative ranges (time for data to arrive; ATALAYA_NOW_DELAY by default)
+annotations:                  marks on the time series panels: timeline events, with their title and detail on hover
+  - service: <Nomad job>      whose events (all when absent; variables are substituted)
+    types: [alloc_started, restart]  the default; also alloc_stopped, errors, log_burst, alert_firing, alert_resolved
+    color: purple
 variables:                    drop-downs; substituted as $var, ${var}, ${var:regex} and [[var]]
   - name, label, hidden
     query: label_values(metric{…}, label) | label_values(label) | log_values(field)
@@ -55,6 +59,7 @@ sections:                     Grafana rows; collapsed: true does not query until
         type: timeseries | stat | gauge | bargauge | table | timeline | pie | bar | heatmap | logs | text
         grid: [x, y, w, h]    Grafana units: 24 columns, 30 px rows; y relative to the section
         time: 7d              the panel's own range: the last 7d up to the dashboard's end (Grafana's relative time)
+        annotations: false    no marks on this panel
         unit, decimals, min, max, noValue
         thresholds: {mode: absolute|percentage, steps: [[null, green], [80, red]]}
         thresholdsStyle: line | dashed            thresholds as reference lines (timeseries)

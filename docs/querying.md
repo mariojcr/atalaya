@@ -127,6 +127,7 @@ attributes or resource labels (`nomad.job`, `container.name`, …).
 ## Other endpoints
 
 `/api/v1/metricDescriptors` (metrics with kind, unit and active series),
-`/api/v1/labels`, `/api/v1/overview` (home page), `/api/v1/events` (timeline),
+`/api/v1/labels`, `/api/v1/overview` (home page), `/api/v1/events` (timeline;
+`lanes=false` returns only the events, for dashboard annotations),
 `/api/v1/dashboards[/{name}]`, `/api/v1/notebooks[/{id}]`, `/healthz`,
 `/readyz`.
