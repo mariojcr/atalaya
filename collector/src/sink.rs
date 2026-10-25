@@ -4,12 +4,14 @@
 //! Sending to ClickHouse: one gzip-compressed batch per table every flush
 //! interval (JSONEachRow). If ClickHouse does not respond, the batch goes to a
 //! disk spool that is retried in order; when the spool is full the oldest
-//! batches are dropped.
+//! batches are dropped. Staleness markers are a convenience: a batch of them
+//! that cannot be sent is dropped, never spooled, so they cannot hold up points
+//! and logs (a schema without their table only loses the markers).
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,6 +19,8 @@ use flate2::{Compression, write::GzEncoder};
 use serde_json::Value;
 
 pub const TABLES: &[&str] = &["metric_descriptors", "series", "points", "dist_points", "logs"];
+/// The table of staleness markers (best effort)
+const STALE: &str = "stale";
 
 /// Cap on in-memory rows per table between two sends. Normally there are a few
 /// thousand; if sending gets stuck, the oldest are dropped (counted in
@@ -43,6 +47,10 @@ pub struct Sink {
     spool: PathBuf,
     max_spool_bytes: u64,
     pending: Mutex<Vec<Vec<String>>>,
+    /// Staleness markers waiting for the next flush, and whether a failure to
+    /// send them was already reported (once until they get through again)
+    stale: Mutex<Vec<String>>,
+    stale_warned: AtomicBool,
     /// Flushes that have taken the pending rows / the last flush whose rows all
     /// reached ClickHouse or the disk spool. Rows queued before `taken` reaches k
     /// are durable once `done` reaches k (see `mark` and `is_durable`). A flush
@@ -80,6 +88,8 @@ impl Sink {
             spool,
             max_spool_bytes,
             pending: Mutex::new(vec![Vec::new(); TABLES.len()]),
+            stale: Mutex::new(Vec::new()),
+            stale_warned: AtomicBool::new(false),
             taken: AtomicU64::new(0),
             done: AtomicU64::new(0),
             stats: Stats::default(),
@@ -87,6 +97,13 @@ impl Sink {
     }
 
     pub fn push(&self, table: &str, row: Value) {
+        if table == STALE {
+            let mut p = self.stale.lock().unwrap();
+            if p.len() < MAX_PENDING_ROWS {
+                p.push(row.to_string());
+            }
+            return;
+        }
         let i = TABLES.iter().position(|t| *t == table).expect("unknown table");
         let line = row.to_string();
         let mut p = self.pending.lock().unwrap();
@@ -155,6 +172,8 @@ impl Sink {
             let b = p.iter_mut().map(std::mem::take).collect();
             (self.taken.fetch_add(1, Ordering::SeqCst) + 1, b)
         };
+        let stale = std::mem::take(&mut *self.stale.lock().unwrap());
+        self.send_stale(stale).await;
         // What was waiting on disk goes first, to keep the order
         let spool_ok = self.retry_spool().await;
         // Tables in parallel
@@ -202,6 +221,32 @@ impl Sink {
             tracing::warn!("{} rows of {} kept in memory for the next flush", lines.len(), TABLES[i]);
             lines.append(&mut p[i]);
             p[i] = lines;
+        }
+    }
+
+    /// The staleness markers waiting to be sent
+    #[cfg(test)]
+    pub(crate) fn stale_rows(&self) -> Vec<Value> {
+        self.stale.lock().unwrap().iter().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    /// Sends staleness markers, or drops them: they are never spooled
+    async fn send_stale(&self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        let n = lines.len();
+        let sent = match Self::gzip(&lines) {
+            Ok(body) => self.send(STALE, body).await.map_err(|e| e.to_string()),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        match sent {
+            Ok(()) => self.stale_warned.store(false, Ordering::Relaxed),
+            Err(e) => {
+                if !self.stale_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("dropping {n} staleness markers: {e} (until they get through again, this is not repeated)");
+                }
+            }
         }
     }
 
@@ -392,6 +437,27 @@ mod tests {
             }
         });
         format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn staleness_markers_that_cannot_be_sent_are_dropped_not_spooled() {
+        // A schema without the stale table: ClickHouse answers 404
+        let dir = spool_dir("stale");
+        let sink = Sink::new(answering(404).await, "u".into(), test_password(), "atalaya".into(), dir.clone(), 1 << 20).unwrap();
+        sink.push("points", json!({"Metric": "m"}));
+        sink.push("stale", json!({"Metric": "m"}));
+        sink.flush().await;
+        assert!(sink.stale_rows().is_empty(), "not kept for later");
+        let batches = spooled(&dir);
+        assert_eq!(batches.len(), 1, "only the points wait in the spool");
+        assert!(batches[0].contains(r#""Metric":"m""#));
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names[0].ends_with("-points.json.gz"), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

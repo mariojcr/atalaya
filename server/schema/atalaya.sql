@@ -148,6 +148,21 @@ TTL Time + INTERVAL 7 DAY
 SETTINGS index_granularity = 1024, merge_with_ttl_timeout = 86400;
 ALTER TABLE atalaya.dist_points MODIFY SETTING merge_with_ttl_timeout = 86400;
 
+-- Staleness markers: when a series stopped being written (missing from its
+-- target's scrape, a failed scrape, a target that is gone). PromQL does not
+-- take its last value past that time, as in Prometheus. Few rows, kept like
+-- the 10-minute tier. The collectors send them best effort: without this table
+-- they are dropped and nothing else is held up.
+CREATE TABLE IF NOT EXISTS atalaya.stale
+(
+    Metric   LowCardinality(String),
+    SeriesId UInt64,
+    Time     DateTime CODEC(DoubleDelta, ZSTD(1))
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(Time)
+ORDER BY (Metric, SeriesId, Time);
+
 CREATE TABLE IF NOT EXISTS atalaya.dist_points_1m
 (
     Metric   LowCardinality(String),

@@ -103,8 +103,9 @@ sets them up):
 - **The server:** `SELECT` on `atalaya.*` and `readonly` 2 (read-only, but it
   may set query settings).
 - **The collectors:** `INSERT` and `SELECT` on `atalaya.*`. They insert into
-  `series`, `metric_descriptors`, `points`, `dist_points` and `logs`, and the
-  materialized views that fill the aggregate tiers run as the inserting user.
+  `series`, `metric_descriptors`, `points`, `dist_points`, `stale` and `logs`,
+  and the materialized views that fill the aggregate tiers run as the inserting
+  user.
 
 Storage grows with the number of series and log volume. Raw points expire after
 7 days and 1-minute aggregates after 42 days (cleaned once a day, so they can

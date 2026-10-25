@@ -36,6 +36,13 @@ replicas of a job are separate series). Metric labels come through, except that
 `exported_instance`, and labels with empty values are dropped. Ambiguous
 one-to-one matches are an error, as in Prometheus.
 
+Staleness: an instant selector takes a series' latest sample within the last 5
+minutes, but not past the time the series went stale. A series is stale when
+its target's scrape no longer has it, the scrape fails or the target is gone (a
+Nomad allocation that stopped). So a `sum` over allocations does not count the
+old one for 5 minutes after a deployment. Range functions still see every
+sample, as in Prometheus.
+
 ### Aggregated tiers and approximations
 
 Queries read the coarsest tier that keeps the step's resolution (see

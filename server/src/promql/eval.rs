@@ -386,7 +386,9 @@ impl Evaluator<'_> {
                 let mut any = false;
                 for (i, &t) in times.iter().enumerate() {
                     let j = s.ts.partition_point(|&x| x <= t);
-                    if j > 0 && s.ts[j - 1] > t - self.lookback {
+                    // Nor past a staleness marker after it, as in Prometheus
+                    let k = s.stale.partition_point(|&x| x <= t);
+                    if j > 0 && s.ts[j - 1] > t - self.lookback && (k == 0 || s.stale[k - 1] <= s.ts[j - 1]) {
                         vals[i] = Some(f(s.ts[j - 1], s.vals[j - 1]));
                         any = true;
                     }
@@ -1118,6 +1120,7 @@ mod tests {
             labels: labels(&[("__name__", "used"), ("mount", mount)]),
             ts: vec![0],
             vals: vec![v],
+            ..Default::default()
         };
         let data = || vec![("used", vec![used("/b", 20.0), used("/a", 30.0), used("/c", f64::NAN), used("/d", 10.0)])];
         let mounts = |q: &str| run_ordered(q, data()).into_iter().map(|(m, _)| m).collect::<Vec<_>>();
@@ -1161,7 +1164,24 @@ mod tests {
             labels: l,
             ts: (0..n).map(|i| start + i * step).collect(),
             vals: (0..n).map(|i| i as f64 * inc).collect(),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_stale_series_has_no_value_past_its_marker() {
+        // Every 15 s until 60, marked stale at 75 (its target stopped), back at 300
+        let s = Samples {
+            labels: labels(&[("__name__", "mem")]),
+            ts: vec![0, 15, 30, 45, 60, 300],
+            vals: vec![1.0, 1.0, 1.0, 1.0, 1.0, 2.0],
+            stale: vec![75],
+        };
+        let r = run("mem", vec![("mem", vec![s.clone()])], 60, 300, 60);
+        assert_eq!(r[0].1, [(60, 1.0), (300, 2.0)], "not for the rest of the lookback");
+        // A range still has the samples before the marker, as in Prometheus
+        let r = run("max_over_time(mem[2m])", vec![("mem", vec![s])], 120, 120, 60);
+        assert_eq!(r[0].1, [(120, 1.0)]);
     }
 
     #[test]
@@ -1192,21 +1212,25 @@ mod tests {
             labels: labels(&[("__name__", "used"), ("instance", "a"), ("mount", "/")]),
             ts: vec![0],
             vals: vec![30.0],
+            ..Default::default()
         };
         let b = Samples {
             labels: labels(&[("__name__", "used"), ("instance", "b"), ("mount", "/")]),
             ts: vec![0],
             vals: vec![10.0],
+            ..Default::default()
         };
         let ta = Samples {
             labels: labels(&[("__name__", "size"), ("instance", "a"), ("mount", "/")]),
             ts: vec![0],
             vals: vec![100.0],
+            ..Default::default()
         };
         let tb = Samples {
             labels: labels(&[("__name__", "size"), ("instance", "b"), ("mount", "/")]),
             ts: vec![0],
             vals: vec![40.0],
+            ..Default::default()
         };
         let r = run(
             "100 * used / size",
@@ -1235,11 +1259,13 @@ mod tests {
             labels: labels(&[("__name__", "m"), ("instance", "a"), ("cpu", "0")]),
             ts: vec![0],
             vals: vec![2.0],
+            ..Default::default()
         };
         let info = Samples {
             labels: labels(&[("__name__", "info"), ("instance", "a"), ("nodename", "host-1")]),
             ts: vec![0],
             vals: vec![1.0],
+            ..Default::default()
         };
         let r = run(
             "m * on(instance) group_left(nodename) info",
@@ -1258,6 +1284,7 @@ mod tests {
             labels: labels(&[("__name__", "h_bucket"), ("le", le)]),
             ts: vec![0],
             vals: vec![v],
+            ..Default::default()
         };
         let r = run(
             "histogram_quantile(0.5, h_bucket)",
@@ -1275,16 +1302,19 @@ mod tests {
             labels: labels(&[("__name__", "a"), ("job", "x")]),
             ts: vec![0],
             vals: vec![10.0],
+            ..Default::default()
         };
         let b1 = Samples {
             labels: labels(&[("__name__", "b"), ("job", "x"), ("i", "1")]),
             ts: vec![0],
             vals: vec![2.0],
+            ..Default::default()
         };
         let b2 = Samples {
             labels: labels(&[("__name__", "b"), ("job", "x"), ("i", "2")]),
             ts: vec![0],
             vals: vec![5.0],
+            ..Default::default()
         };
         for bs in [vec![b1.clone(), b2.clone()], vec![b2.clone(), b1.clone()]] {
             let e = try_run("a / on(job) b", vec![("a", vec![a.clone()]), ("b", bs)], 0, 0, 15).unwrap_err();
@@ -1303,6 +1333,7 @@ mod tests {
             labels: labels(&[("__name__", "a")]),
             ts: vec![-60],
             vals: vec![1.0],
+            ..Default::default()
         };
         let r = run("timestamp(a)", vec![("a", vec![a.clone()])], 0, 0, 15);
         assert_eq!(r[0].1[0].1, -60.0);
@@ -1316,6 +1347,7 @@ mod tests {
             labels: labels(&[("__name__", "a"), ("x", "1")]),
             ts: vec![0],
             vals: vec![1.0],
+            ..Default::default()
         };
         let r = run("a or vector(0)", vec![("a", vec![a.clone()])], 0, 0, 15);
         assert_eq!(r.len(), 2);
