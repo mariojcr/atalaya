@@ -114,6 +114,8 @@ function buildSeries(w, results) {
     const st = s.q.offset ? { dash: true } : {};
     for (const o of w.series || []) if (matchesOverride(o, s.name, s.q.ref)) Object.assign(st, o);
     if (st.name) s.name = st.name;
+    // Named colors (red, dark-blue…) as in the other panels; the chart takes CSS colors
+    if (st.color) st.color = colorName(st.color);
     delete st.match; delete st.name;
     s.style = st;
   }
