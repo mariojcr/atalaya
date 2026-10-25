@@ -148,12 +148,25 @@ function interpolate(expr, vars) {
 
 /** Variable values: label_values(selector, label), label_values(label),
  *  metrics(regex) or query_result(expr), with Grafana's regex and sort semantics. */
+/** The most frequent values (up to 1000) of a log field in the range, under a
+ *  log query in the explorer's syntax */
+async function logFieldValues(field, src, t) {
+  const { filters, words } = lgParse(src);
+  const p = new URLSearchParams({ start: t.start, end: t.end, field, limit: 1000 });
+  [...filters, ...words.map((w) => `body~${w}`)].forEach((f) => p.append("f", f));
+  const r = await fetch(`/api/v1/logs/values?${p}`);
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j.values.map((x) => x.value);
+}
 async function variableOptions(v, vars, t) {
   const q = interpolate(v.query || "", vars).trim();
   let values = [];
   let m;
   if ((m = /^label_values\(\s*(?:([\s\S]*)\s*,\s*)?([A-Za-z_]\w*)\s*\)$/.exec(q))) {
     values = await promLabelValues(m[2], m[1]?.trim(), t.start, t.end);
+  } else if ((m = /^log_values\(\s*([^\s()]+)\s*\)$/.exec(q))) {
+    values = await logFieldValues(m[1], interpolate(v.logs || "", vars), t);
   } else if ((m = /^metrics\(([\s\S]*)\)$/.exec(q))) {
     const re = new RegExp(m[1].trim() || ".*");
     values = (await promLabelValues("__name__", undefined, t.start, t.end)).filter((x) => re.test(x));

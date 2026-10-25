@@ -44,7 +44,8 @@ time: 24h                     default range (unless one was picked in the sessio
 nowDelay: 45s                 how far "now" lags in relative ranges (time for data to arrive; ATALAYA_NOW_DELAY by default)
 variables:                    drop-downs; substituted as $var, ${var}, ${var:regex} and [[var]]
   - name, label, hidden
-    query: label_values(metric{…}, label) | label_values(label)
+    query: label_values(metric{…}, label) | label_values(label) | log_values(field)
+    logs: 'service:my-app'    with log_values: the log query whose values are listed (the 1000 most frequent)
     regex: /…/                filter (and capture) of the values, as in Grafana
     multi, includeAll, allValue, sort (0 none, 1 asc, 2 desc, 3/4 numeric)
 sections:                     Grafana rows; collapsed: true does not query until opened
@@ -118,7 +119,20 @@ a column per field in `logs.columns`. Its link opens the logs explorer with the
 same query and columns.
 
 Variables are substituted as in PromQL. A variable that allows several values or
-All becomes a regex, so use it with `=~`:
+All becomes a regex, so use it with `=~`. `log_values(field)` lists the most
+frequent values of a log field in the range, under the variable's `logs` query:
+
+```yaml
+variables:
+  - name: client
+    label: Client
+    query: log_values(client)
+    logs: 'nomad.job:dns'
+    includeAll: true
+    allValue: '.*'
+```
+
+Then filter with `client=~$client`, as with `host=~$host` here:
 
 ```yaml
 - title: Blocked domains

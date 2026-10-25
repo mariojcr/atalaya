@@ -114,11 +114,11 @@ pub fn fields_sql(table: &str, filter: &str) -> String {
 
 /// Most frequent values of a field starting with what was typed (search bar
 /// autocomplete); the prefix goes in the `prefix` parameter
-pub fn values_sql(table: &str, filter: &str, col: &str) -> String {
+pub fn values_sql(table: &str, filter: &str, col: &str, limit: u32) -> String {
     format!(
         "SELECT value, count() AS n FROM (SELECT {col} AS value FROM {table} WHERE {filter})
          WHERE value != '' AND ({{prefix:String}} = '' OR startsWith(lowerUTF8(value), lowerUTF8({{prefix:String}})))
-         GROUP BY value ORDER BY n DESC, value LIMIT 10"
+         GROUP BY value ORDER BY n DESC, value LIMIT {limit}"
     )
 }
 
