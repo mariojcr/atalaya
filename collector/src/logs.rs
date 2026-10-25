@@ -393,6 +393,38 @@ impl<'a> LinePatterns<'a> {
     }
 }
 
+/// Nested JSON objects become dotted keys down to this depth, and only under a
+/// key of at most this length: each child repeats it, so a long one would
+/// multiply a line's size (the server does not query longer field names)
+const MAX_JSON_DEPTH: usize = 4;
+const MAX_JSON_PREFIX: usize = 128;
+
+/// A JSON line's fields as attributes, at most 64: nested objects become dotted
+/// keys (`question.name`); arrays, and objects past those limits, stay as JSON
+/// text; nulls are left out
+fn json_attributes(obj: Map<String, Value>) -> Vec<(String, String)> {
+    fn walk(prefix: Option<&str>, obj: Map<String, Value>, depth: usize, out: &mut Vec<(String, String)>) {
+        for (k, v) in obj {
+            if out.len() == 64 {
+                return;
+            }
+            let key = match prefix {
+                Some(p) => format!("{p}.{k}"),
+                None => k,
+            };
+            match v {
+                Value::Null => {}
+                Value::String(s) => out.push((key, s)),
+                Value::Object(o) if depth < MAX_JSON_DEPTH && key.len() <= MAX_JSON_PREFIX => walk(Some(&key), o, depth + 1, out),
+                other => out.push((key, other.to_string())),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(None, obj, 1, &mut out);
+    out
+}
+
 /// Keys whose value is the line's level
 fn is_level_key(k: &str) -> bool {
     matches!(k, "level" | "lvl" | "severity" | "log.level" | "levelname")
@@ -411,12 +443,7 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
     if text.starts_with('{')
         && let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text)
     {
-        for (k, v) in obj.into_iter().take(64) {
-            let s = match v {
-                Value::String(s) => s,
-                Value::Null => continue,
-                other => other.to_string(),
-            };
+        for (k, s) in json_attributes(obj) {
             if level.is_empty() && is_level_key(&k) {
                 level = normalize_level(&s).to_owned();
             }
@@ -564,6 +591,34 @@ mod tests {
         );
         assert!(b.spend("ns/e", Duration::from_millis(3)), "none left for anyone");
         assert_eq!(b.left("ns/f"), Duration::ZERO);
+    }
+
+    #[test]
+    fn nested_json_objects_become_dotted_attributes() {
+        let row = |text: &str| build_row("h", "dns", "stdout", Utc::now(), text.into(), json!({}), LinePatterns::none()).unwrap();
+        let r = row(
+            r#"{"question":{"questionName":"example.com","questionType":"A"},"answers":[{"recordData":"192.0.2.1"}],"responseType":"Cached","rtt":null,"log":{"level":"warn"},"a":{"b":{"c":{"d":{"e":1}}}}}"#,
+        );
+        assert_eq!(
+            r["Attributes"],
+            json!({
+                "question.questionName": "example.com",
+                "question.questionType": "A",
+                "answers": r#"[{"recordData":"192.0.2.1"}]"#,
+                "responseType": "Cached",
+                "log.level": "warn",
+                "a.b.c.d": r#"{"e":1}"#,
+            }),
+            "arrays and objects past MAX_JSON_DEPTH stay as JSON text"
+        );
+        assert_eq!(r["Level"], "WARN", "a nested log.level sets it");
+        // At most 64 attributes, nested or not
+        let wide = format!("{{\"o\":{{{}}}}}", (0..100).map(|i| format!("\"k{i}\":{i}")).collect::<Vec<_>>().join(","));
+        assert_eq!(row(&wide)["Attributes"].as_object().unwrap().len(), 64);
+        // A long key is not repeated in front of each child
+        let long = "k".repeat(MAX_JSON_PREFIX + 1);
+        let r = row(&format!("{{\"{long}\":{{\"a\":1,\"b\":2}}}}"));
+        assert_eq!(r["Attributes"], json!({ long: r#"{"a":1,"b":2}"# }));
     }
 
     #[test]

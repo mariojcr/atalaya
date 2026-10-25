@@ -124,7 +124,9 @@ replicas and services of one job are separate series.
 
 The first run starts at the end of the existing files. The level is taken from
 JSON logs (`level`, `severity`, …) or from the text, and JSON logs keep their
-keys as attributes. Bodies are stored up to 64 KiB.
+keys as attributes, up to 64: nested objects become dotted keys
+(`question.name`) down to four levels, and arrays stay as JSON text. Bodies are
+stored up to 64 KiB.
 
 A Nomad task that logs plain text can have it parsed too. Its
 `atalaya.log_regex` meta key (or, failing that, its group's or job's) holds one
