@@ -68,7 +68,7 @@ sections:                     Grafana rows; collapsed: true does not query until
         style: {draw: line|bars|points, fill: 0-100, lineWidth, interpolation: linear|smooth|stepBefore|stepAfter,
                 showPoints: auto|never|always, stack: normal|percent, softMin, softMax, logBase, axis: hidden, spanNulls}
         legend: {show, mode: list|table, placement: bottom|right, calcs: [mean, max, min, lastNotNull, sum, …]}
-        stat:     {reduce: lastNotNull|last|mean|max|min|sum|first|count, field: <label>, graph: area|none,
+        stat:     {reduce: lastNotNull|last|mean|max|min|sum|first|count, field: <label>, graph: area|none, compare: 7d,
                    colorMode: value|background|none, textMode: auto|value|name|value_and_name|none, orientation}
         gauge:    {reduce, markers: true}
         bargauge: {reduce, mode: basic|gradient|lcd}
@@ -190,6 +190,9 @@ one:
       offset: 7d
       legend: A week before
 ```
+
+On a stat panel, `stat: {compare: 7d}` runs its queries that far back too and
+shows the change under each value (`▲ 12 %`), with the earlier value on hover.
 
 ## Builder dashboards
 
