@@ -51,8 +51,9 @@ sections:                     Grafana rows; collapsed: true does not query until
   - title, collapsed
     widgets:
       - title, description
-        type: timeseries | stat | gauge | bargauge | table | timeline | pie | bar | logs | text
+        type: timeseries | stat | gauge | bargauge | table | timeline | pie | bar | heatmap | logs | text
         grid: [x, y, w, h]    Grafana units: 24 columns, 30 px rows; y relative to the section
+        time: 7d              the panel's own range: the last 7d up to the dashboard's end (Grafana's relative time)
         unit, decimals, min, max, noValue
         thresholds: {mode: absolute|percentage, steps: [[null, green], [80, red]]}
         thresholdsStyle: line | dashed            thresholds as reference lines (timeseries)
@@ -67,6 +68,7 @@ sections:                     Grafana rows; collapsed: true does not query until
         bargauge: {reduce, mode: basic|gradient|lcd}
         pie:      {reduce, donut: true, legend: true}
         timeline: {field: <label>, name: <row name>, showValue: auto|always|never, merge: true}
+        heatmap:  {reduce: mean|sum|max}     hourly values folded into day of week × hour of day cells
         table:    {join: <label>, columns: [{field: <label or query ref>, name, unit, decimals, scale,
                    min, max, cell: text|color-text|color-background|bar, width}], hide: [fields], rename: [{field, name}],
                    sort: {field, desc}, footer: sum|mean|max|min|count, header: true}
@@ -81,6 +83,7 @@ sections:                     Grafana rows; collapsed: true does not query until
             ref: A                                 query name (table columns, bars)
             instant: true                          an instant query (stat, tables…)
             minStep: 1m
+            offset: 7d                             an earlier period, drawn at the current times (dashed)
             hide: true
           - logs: 'service:my-app level:ERROR'     a log query instead of expr (see below)
             by: <field> | [field, …]               up to 3; one series per group
@@ -132,6 +135,39 @@ All becomes a regex, so use it with `=~`:
   logs: {columns: [host, client, qname, qtype, rcode], limit: 100}
   queries:
     - logs: 'nomad.job:dns client:* host=~$host'
+```
+
+## Heatmaps and comparisons
+
+A `heatmap` panel queries hourly points and folds them into a week: one row
+per day of the week (Monday first) and one column per hour, in the browser's
+time zone. A cell is the mean of its hours in the range (`heatmap.reduce`:
+`sum` or `max` instead), the series of all queries added up. Its color goes
+from light to dark in one hue, the accent or `color: fixed:<color>`, or follows
+`thresholds`. Pair it with `time` so it always covers whole weeks:
+
+```yaml
+- title: Queries by day and hour
+  type: heatmap
+  time: 28d
+  grid: [0, 0, 12, 8]
+  queries:
+    - logs: 'nomad.job:dns'
+```
+
+`offset` on a query, PromQL or logs, reads the same range that far back and
+draws it at the current times, dashed, to compare a period with the previous
+one:
+
+```yaml
+- title: Queries, this week and the last one
+  type: timeseries
+  queries:
+    - logs: 'nomad.job:dns'
+      legend: This week
+    - logs: 'nomad.job:dns'
+      offset: 7d
+      legend: A week before
 ```
 
 ## Builder dashboards

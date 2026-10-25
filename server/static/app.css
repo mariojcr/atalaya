@@ -385,6 +385,17 @@ body.nav-collapsed main { padding-left: 24px; }
 .timeline .tl-axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 .timeline .legend-list { flex: none; }
 
+/* Heatmap widget (dash.js): day of week × hour of day */
+.heatmap { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 11px; }
+.heatmap .hm-grid, .heatmap .hm-axis { display: grid; grid-template-columns: 36px repeat(24, minmax(0, 1fr)); gap: 2px; }
+.heatmap .hm-grid { flex: 1; min-height: 0; grid-auto-rows: minmax(6px, 1fr); }
+.heatmap .hm-day { align-self: center; padding-right: 6px; overflow: hidden; text-align: right; white-space: nowrap; }
+.heatmap .hm-cell { border-radius: 2px; background: var(--surface-2); }
+.heatmap .hm-axis { flex: none; white-space: nowrap; }
+.heatmap .hm-legend { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.heatmap .hm-ramp { width: 120px; height: 8px; border-radius: 2px; }
+.widget .wtime { flex: none; margin-left: 6px; color: var(--muted); font-size: 11px; }
+
 /* Text */
 .md { overflow: auto; font-size: 13px; }
 .md h3, .md h4, .md h5, .md h6 { margin: 4px 0; font-weight: 500; }

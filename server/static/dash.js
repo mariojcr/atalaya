@@ -110,7 +110,8 @@ function buildSeries(w, results) {
       : s.labels.__name__ || (Object.keys(s.labels).length ? selectorName(s.labels) : s.q.ref || "");
     for (const [rx, rep] of w.rename || []) { try { name = name.replace(new RegExp(rx), rep); } catch { /* Grafana regex that is not valid in JS */ } }
     s.name = name || s.q.ref || t("q.value");
-    const st = {};
+    // An earlier period (offset) is dashed, like the explorer's comparison
+    const st = s.q.offset ? { dash: true } : {};
     for (const o of w.series || []) if (matchesOverride(o, s.name, s.q.ref)) Object.assign(st, o);
     if (st.name) s.name = st.name;
     delete st.match; delete st.name;
@@ -162,11 +163,20 @@ async function runQueries(w, t, width, signal) {
   return Promise.all(qs.map(async (q, i) => {
     const qq = { ...q, ref: q.ref || LETTERS[i] };
     const minStep = q.minStep ? durSecs(q.minStep) || 15 : 15;
-    if (q.logs != null) return { q: qq, series: await logCounts(q, ctx, t, q.instant ? 0 : niceStep(t.end - t.start, points, minStep), signal), meta: {} };
-    const expr = q.instant ? expandRange(interpolate(q.expr, ctx), t.end - t.start) : interpolate(q.expr, ctx);
-    // Range queries are batched with those of other widgets querying at the same time
-    const r = q.instant ? await promInstant(expr, t.end, signal) : await promRangeBatched(expr, t.start, t.end, niceStep(t.end - t.start, points, minStep), signal);
-    return { q: qq, series: r.series, meta: r.meta };
+    // A heatmap folds hourly buckets into its cells
+    const step = w.type === "heatmap" ? 3600 : niceStep(t.end - t.start, points, minStep);
+    // offset: the query reads an earlier window and its points are drawn at the current times
+    const off = q.offset ? durSecs(q.offset) || 0 : 0;
+    const qt = off ? { start: t.start - off, end: t.end - off } : t;
+    let r;
+    if (q.logs != null) r = { series: await logCounts(q, ctx, qt, q.instant ? 0 : step, signal), meta: {} };
+    else {
+      const expr = q.instant ? expandRange(interpolate(q.expr, ctx), t.end - t.start) : interpolate(q.expr, ctx);
+      // Range queries are batched with those of other widgets querying at the same time
+      r = q.instant ? await promInstant(expr, qt.end, signal) : await promRangeBatched(expr, qt.start, qt.end, step, signal);
+    }
+    const series = off ? r.series.map((s) => ({ ...s, points: s.points.map(([x, v]) => [x + off, v]) })) : r.series;
+    return { q: qq, series, meta: r.meta };
   }));
 }
 
@@ -478,6 +488,42 @@ function renderTimeline(w, body, series, tr) {
   $$(".swatch[data-m]", body).forEach((e) => { const c = colorName(legendItems[+e.dataset.m].color || css("--muted")); e.style.background = c; e.style.borderColor = c; });
 }
 
+/** Heatmap: the hourly points of the series (added up) folded into day of week ×
+ *  hour of day cells, Monday first, in the browser's time zone. Each cell is the
+ *  mean of its hours in the range (or heatmap.reduce: sum, max). */
+function renderHeatmap(w, body, series) {
+  const how = w.heatmap?.reduce || "mean";
+  const slots = Array.from({ length: 7 * 24 }, () => new Map());
+  for (const s of series) for (const [x, v] of s.points) {
+    if (v == null || !Number.isFinite(v)) continue;
+    const d = new Date(x * 1000), m = slots[((d.getDay() + 6) % 7) * 24 + d.getHours()];
+    m.set(x, (m.get(x) || 0) + v);
+  }
+  const vals = slots.map((m) => calc(how, [...m.values()]));
+  const nums = vals.filter((v) => v != null);
+  if (!nums.length) { body.innerHTML = `<div class="empty"><p>${t("chart.nodata")}</p></div>`; return; }
+  const lo = w.min ?? Math.min(...nums), hi = w.max ?? Math.max(...nums);
+  // 2026-03-02 is a Monday
+  const day = (i, weekday) => fmtDate(new Date(2026, 2, 2 + i), { weekday });
+  const hh = (h) => `${String(h % 24).padStart(2, "0")}:00`;
+  const peak = vals.indexOf(Math.max(...nums));
+  const label = t("hm.peak", { when: `${day(Math.floor(peak / 24), "long")} ${hh(peak % 24)}`, v: valueText(w, vals[peak]) });
+  const rows = Array.from({ length: 7 }, (_, di) => `<span class="hm-day">${esc(day(di, "short"))}</span>` + Array.from({ length: 24 }, (_, h) =>
+    `<i class="hm-cell" data-i="${di * 24 + h}" data-tip="${esc(`${day(di, "long")} ${hh(h)}–${hh(h + 1)} · ${valueText(w, vals[di * 24 + h])}`)}"></i>`).join("")).join("");
+  body.innerHTML = `<div class="heatmap" role="img" aria-label="${esc(label)}"><div class="hm-grid">${rows}</div>` +
+    `<div class="hm-axis"><span></span>${Array.from({ length: 24 }, (_, h) => `<span>${h % 3 ? "" : hh(h)}</span>`).join("")}</div>` +
+    `<div class="hm-legend"><span>${esc(valueText(w, lo))}</span><i class="hm-ramp"></i><span>${esc(valueText(w, hi))}</span></div></div>`;
+  // One hue from light to dark (the accent or color: fixed:<c>); thresholds if the panel has them
+  const base = w.color?.startsWith("fixed:") ? colorName(w.color.slice(6)) : css("--accent");
+  const tint = (f) => withAlpha(base, 0.12 + 0.88 * Math.max(0, Math.min(1, f)));
+  const byThresholds = w.thresholds && (w.color ?? "thresholds") === "thresholds";
+  $$(".hm-cell", body).forEach((el) => {
+    const v = vals[+el.dataset.i];
+    if (v != null) el.style.background = byThresholds ? thresholdColor(w.thresholds, v, w.min, w.max) : tint(hi > lo ? (v - lo) / (hi - lo) : 1);
+  });
+  $(".hm-ramp", body).style.background = byThresholds ? "none" : `linear-gradient(90deg, ${tint(0)}, ${tint(1)})`;
+}
+
 /** Log lines: the latest of the widget's log query, newest first, with a
  *  column per field (`logs.columns`) */
 async function renderLogs(w, body, tr, signal) {
@@ -535,7 +581,7 @@ async function runWidget(wd) {
   wd.ctrl?.abort();
   const ctrl = wd.ctrl = new AbortController();
   const w = wd.def, body = wd.body;
-  const tr = dashTime();
+  const tr = widgetTime(w);
   // Free the previous chart before replacing the widget's content
   $$(".chart-host", body).forEach(destroyChart);
   if (w.type === "text") { body.innerHTML = `<div class="md">${markdown(w.content)}</div>`; return; }
@@ -554,6 +600,7 @@ async function runWidget(wd) {
       case "bar": renderBar(w, body, series); break;
       case "table": renderTable(w, body, results.map((r) => ({ q: r.q, series: series.filter((s) => s.q.ref === r.q.ref) }))); break;
       case "timeline": renderTimeline(w, body, series, tr); break;
+      case "heatmap": renderHeatmap(w, body, series); break;
       default:
         if (!series.length) body.innerHTML = `<div class="empty"><p>${t("chart.nodata")}</p></div>`;
         else renderTimeseries(w, body, series, tr);
@@ -596,7 +643,8 @@ function widgetEl(w) {
   el.style.setProperty("--h", gh);
   const logs = (w.queries || []).some((q) => q.logs != null);
   const link = w.type === "text" ? "" : `<a class="icon-btn open" href="${w.legacy ? "#/metrics" : esc(explorerLink(w))}" data-tip="${t(logs ? "dash.open_logs" : "dash.open")}" aria-label="${t("dash.open_aria")}">${ICON_OPEN}</a>`;
-  el.innerHTML = `<header><h3 data-tip="${esc(w.title)}">${esc(w.title)}</h3><span class="tools">${w.description ? `<button class="icon-btn info" data-tip="${esc(w.description)}" data-tip-only aria-label="${esc(t("dash.desc", { d: w.description }))}">${ICON_INFO}</button>` : ""}${link}</span></header><div class="wbody"></div>`;
+  const own = w.time ? `<span class="wtime" data-tip="${esc(t("dash.time", { d: w.time }))}" data-tip-only>${esc(w.time)}</span>` : "";
+  el.innerHTML = `<header><h3 data-tip="${esc(w.title)}">${esc(w.title)}</h3>${own}<span class="tools">${w.description ? `<button class="icon-btn info" data-tip="${esc(w.description)}" data-tip-only aria-label="${esc(t("dash.desc", { d: w.description }))}">${ICON_INFO}</button>` : ""}${link}</span></header><div class="wbody"></div>`;
   return el;
 }
 
@@ -668,6 +716,11 @@ function syncVarsToUrl() {
     if (s.all) qs.append(`var-${v.name}`, "$__all"); else s.values.forEach((x) => qs.append(`var-${v.name}`, x));
   }
   history.replaceState(null, "", `#/dashboards/${board.name}${qs.toString() ? "?" + qs : ""}`);
+}
+/** A widget's range: the dashboard's, or its last `time` (Grafana's relative time) */
+function widgetTime(w) {
+  const tr = dashTime(), secs = w.time ? durSecs(w.time) : NaN;
+  return secs > 0 ? { start: tr.end - secs, end: tr.end } : tr;
 }
 /** Dashboard range. Like Grafana's "now delay": relative ranges are shifted back by
  * the ingestion delay (nowDelay, or the server's NOW_DELAY) so rates at the last point
