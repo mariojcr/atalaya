@@ -150,9 +150,12 @@ ALTER TABLE atalaya.dist_points MODIFY SETTING merge_with_ttl_timeout = 86400;
 
 -- Staleness markers: when a series stopped being written (missing from its
 -- target's scrape, a failed scrape, a target that is gone). PromQL does not
--- take its last value past that time, as in Prometheus. Few rows, kept like
--- the 10-minute tier. The collectors send them best effort: without this table
--- they are dropped and nothing else is held up.
+-- take its last value past that time, as in Prometheus. Series that come and
+-- go with activity (Nomad's own hook timings) make hundreds of thousands a
+-- day, so they are kept like the 1-minute tier: past that, queries read the
+-- 10-minute tier, whose lookback is longer than what a marker saves. The
+-- collectors send them best effort: without this table they are dropped and
+-- nothing else is held up.
 CREATE TABLE IF NOT EXISTS atalaya.stale
 (
     Metric   LowCardinality(String),
@@ -161,7 +164,12 @@ CREATE TABLE IF NOT EXISTS atalaya.stale
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(Time)
-ORDER BY (Metric, SeriesId, Time);
+ORDER BY (Metric, SeriesId, Time)
+TTL Time + INTERVAL 42 DAY
+SETTINGS merge_with_ttl_timeout = 86400;
+-- For tables created without the TTL:
+ALTER TABLE atalaya.stale MODIFY TTL Time + INTERVAL 42 DAY;
+ALTER TABLE atalaya.stale MODIFY SETTING merge_with_ttl_timeout = 86400;
 
 CREATE TABLE IF NOT EXISTS atalaya.dist_points_1m
 (
