@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked \
  && mkdir /out && cp target/release/atalaya-server target/release/atalaya-collector /out/
 
-FROM docker.io/library/debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS server
+FROM docker.io/library/debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS server
 # The server needs no privileges: it runs as atalaya (uid and gid 10001) and
 # keeps notebooks, saved searches and alert state in /var/lib/atalaya, which
 # that user owns. A new named volume mounted there inherits the ownership; one
@@ -35,7 +35,7 @@ WORKDIR /var/lib/atalaya
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/atalaya-server"]
 
-FROM docker.io/library/debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS collector
+FROM docker.io/library/debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS collector
 # The collector runs as root: it reads the host's logs and hardware (sysfs,
 # Nomad allocation logs, Docker logs) and runs smartctl for disk health. See
 # docs/collector.md#privileges.
