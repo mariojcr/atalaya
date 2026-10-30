@@ -6,7 +6,7 @@ resolver = "3"
 
 # One version for both binaries: a release tags them together (see docs/releasing.md)
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Mario Campos <https://github.com/mariojcr>"]
 license = "Apache-2.0"

@@ -1,3 +1,13 @@
+## v0.3.0 (2026-10-30)
+
+### Feat
+
+- **server**: a replicated schema for a ClickHouse cluster (ATALAYA_REPLICATED=1) (#20)
+
+### Fix
+
+- **server**: named colors in time series overrides (#17)
+
 ## v0.2.0 (2026-10-25)
 
 ### Feat
