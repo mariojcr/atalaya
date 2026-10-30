@@ -17,6 +17,23 @@ fn schema_for(db: &str) -> String {
         .replace("CREATE DATABASE IF NOT EXISTS atalaya;", &format!("CREATE DATABASE IF NOT EXISTS {db};"))
 }
 
+/// The schema for a replicated ClickHouse (ATALAYA_REPLICATED=1): every `*MergeTree` engine
+/// becomes its `Replicated*MergeTree` without arguments, so the server's `default_replica_path`
+/// and `default_replica_name` place it in Keeper, and the database is not created here. A
+/// `Replicated` database replicates the DDL but does not convert engines, and it has to be created
+/// on each replica against itself (`ENGINE = Replicated(path, '{shard}', '{replica}')`), which one
+/// connection to one replica cannot do: whoever runs the cluster creates it before the schema.
+fn replicated(schema: &str) -> String {
+    let engine = regex::Regex::new(r"ENGINE = (\w*MergeTree)\b").expect("regex");
+    engine
+        .replace_all(schema, "ENGINE = Replicated$1")
+        .lines()
+        .filter(|l| !l.starts_with("CREATE DATABASE "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 /// Schema statements, without comments
 fn schema_statements(schema: &str) -> Vec<String> {
     schema
@@ -29,7 +46,8 @@ fn schema_statements(schema: &str) -> Vec<String> {
 
 pub async fn schema(apply: bool) -> anyhow::Result<()> {
     let db = ident(&env("ATALAYA_DB", "atalaya"))?;
-    let schema = schema_for(&db);
+    let is_replicated = env("ATALAYA_REPLICATED", "") == "1";
+    let schema = if is_replicated { replicated(&schema_for(&db)) } else { schema_for(&db) };
     if !apply {
         print!("{schema}");
         return Ok(());
@@ -39,6 +57,21 @@ pub async fn schema(apply: bool) -> anyhow::Result<()> {
         env("CLICKHOUSE_USER", "default"),
         std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
     );
+    if is_replicated {
+        let engine = ch
+            .text(
+                "SELECT engine FROM system.databases WHERE name = {db:String}",
+                &[("db".to_owned(), db.clone())],
+                &[],
+            )
+            .await?;
+        if engine.trim() != "Replicated" {
+            anyhow::bail!(
+                "ATALAYA_REPLICATED=1 needs the database {db} to exist on every replica with ENGINE = Replicated (found: {:?})",
+                engine.trim()
+            );
+        }
+    }
     let statements = schema_statements(&schema);
     for (i, st) in statements.iter().enumerate() {
         let first = st.lines().next().unwrap_or_default();
@@ -59,5 +92,20 @@ mod tests {
         assert!(s.contains("CREATE TABLE IF NOT EXISTS other.points"));
         assert!(!s.contains("atalaya.points"));
         assert_eq!(schema_statements(&s).len(), schema_statements(SCHEMA).len());
+    }
+
+    #[test]
+    fn replicated_schema_replicates_every_merge_tree_and_leaves_the_database_alone() {
+        let s = replicated(&schema_for("other"));
+        assert!(!s.contains("CREATE DATABASE"), "the database is the cluster's to create");
+        let engines: Vec<&str> = s.lines().filter_map(|l| l.split("ENGINE = ").nth(1)).collect();
+        assert!(engines.iter().any(|e| e.starts_with("ReplicatedReplacingMergeTree(Updated)")));
+        assert!(engines.iter().any(|e| e.starts_with("ReplicatedAggregatingMergeTree")));
+        for e in &engines {
+            assert!(e.starts_with("Replicated") || e.starts_with("Null"), "not replicated: {e}");
+            assert!(!e.starts_with("ReplicatedReplicated"), "replicated twice: {e}");
+        }
+        // Same statements as the plain schema, minus CREATE DATABASE.
+        assert_eq!(schema_statements(&s).len() + 1, schema_statements(&schema_for("other")).len());
     }
 }

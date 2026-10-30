@@ -94,6 +94,20 @@ Tested with ClickHouse 26.8. Create the schema once and after every upgrade
 CLICKHOUSE_URL=http://clickhouse:8123/ CLICKHOUSE_USER=admin CLICKHOUSE_PASSWORD=… atalaya-server schema --apply
 ```
 
+### Replicated ClickHouse
+
+On a cluster of replicas, set `ATALAYA_REPLICATED=1` when applying the schema.
+Every `*MergeTree` table becomes its `Replicated*MergeTree` without arguments,
+so the servers need `default_replica_path` and `default_replica_name` (for
+example `/clickhouse/tables/{uuid}/{shard}` and `{replica}`). The schema does
+not create the database: create it first on every replica, against itself,
+with `ENGINE = Replicated('/clickhouse/databases/atalaya', '{shard}', '{replica}')`.
+A `Replicated` database replicates the DDL but does not convert table engines,
+and one connection to one replica cannot create it on the others; the schema
+refuses to run while the database is missing or is not `Replicated`. The server
+and the collectors need nothing else: they can reach any replica, for example
+through a load balancer.
+
 Users, one per job so that a leaked password gives away as little as possible
 ([examples/compose/clickhouse-users.xml](../examples/compose/clickhouse-users.xml)
 sets them up):

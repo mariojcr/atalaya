@@ -9,6 +9,7 @@
 | `CLICKHOUSE_USER` | `reader` | A read-only user is enough for the server |
 | `CLICKHOUSE_PASSWORD` | empty | |
 | `ATALAYA_DB` | `atalaya` | Database for queries and for `atalaya-server schema` |
+| `ATALAYA_REPLICATED` | unset | `1`: `atalaya-server schema` writes replicated tables for a ClickHouse cluster (see [deployment](deployment.md#replicated-clickhouse)) |
 | `ATALAYA_DASHBOARDS` | `dashboards` | Directory of dashboard YAML files |
 | `ATALAYA_OVERVIEW` | next to the dashboards directory | `overview.yaml` (home page) |
 | `ATALAYA_TIMELINE` | same | `timeline.yaml` |
