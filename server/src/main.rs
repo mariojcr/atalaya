@@ -18,8 +18,9 @@
 //!                             addresses, localhost and the host of ATALAYA_PUBLIC_URL (comma-separated)
 //!   ATALAYA_DATA              directory where the server keeps notebooks, saved searches and alert state (data)
 //!   ATALAYA_OIDC_ISSUER       OpenID Connect issuer: sign-in required for everything (off when unset)
-//!   ATALAYA_OIDC_CLIENT_ID    public client with PKCE at the provider (atalaya); its callback is
+//!   ATALAYA_OIDC_CLIENT_ID    client at the provider (atalaya), with PKCE; its callback is
 //!                             <ATALAYA_PUBLIC_URL>/auth/callback
+//!   ATALAYA_OIDC_CLIENT_SECRET its secret, for a confidential client (unset: a public one)
 //!   ATALAYA_OIDC_INTERNAL     where the server reaches the provider, if not at the issuer URL
 //!   ATALAYA_SESSION_KEY       secret signing the session cookie, 32+ characters (needed with sign-in)
 //!   ATALAYA_SESSION_DAYS      session length (30)
