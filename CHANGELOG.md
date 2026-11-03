@@ -1,3 +1,10 @@
+## v0.3.1 (2026-11-03)
+
+### Fix
+
+- **server**: a replicated schema waits for a table another replica has just created (#24)
+- **collector**: scrapes send a User-Agent, without which ClickHouse's /metrics answers 500 (#23)
+
 ## v0.3.0 (2026-10-30)
 
 ### Feat
