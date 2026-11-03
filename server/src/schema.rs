@@ -44,6 +44,15 @@ fn schema_statements(schema: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many times (a second apart) a replicated schema retries a statement on a
+/// table another replica has created and this one has not yet
+const REPLICA_RETRIES: u32 = 30;
+
+/// ClickHouse's UNKNOWN_TABLE
+fn unknown_table(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("(UNKNOWN_TABLE)")
+}
+
 pub async fn schema(apply: bool) -> anyhow::Result<()> {
     let db = ident(&env("ATALAYA_DB", "atalaya"))?;
     let is_replicated = env("ATALAYA_REPLICATED", "") == "1";
@@ -75,7 +84,20 @@ pub async fn schema(apply: bool) -> anyhow::Result<()> {
     let statements = schema_statements(&schema);
     for (i, st) in statements.iter().enumerate() {
         let first = st.lines().next().unwrap_or_default();
-        ch.exec(st).await.map_err(|e| anyhow::anyhow!("statement {} ({first}): {e:#}", i + 1))?;
+        let mut tries = 0;
+        loop {
+            match ch.exec(st).await {
+                Ok(()) => break,
+                // The replica that runs a statement answers before the others have
+                // applied it, and behind a load balancer the next one may reach a
+                // replica that has not created the table yet: it will, give it time.
+                Err(e) if is_replicated && tries < REPLICA_RETRIES && unknown_table(&e) => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(e) => anyhow::bail!("statement {} ({first}): {e:#}", i + 1),
+            }
+        }
     }
     println!("schema applied: {} statements", statements.len());
     Ok(())
@@ -107,5 +129,15 @@ mod tests {
         }
         // Same statements as the plain schema, minus CREATE DATABASE.
         assert_eq!(schema_statements(&s).len() + 1, schema_statements(&schema_for("other")).len());
+    }
+
+    #[test]
+    fn only_a_missing_table_is_waited_for() {
+        let missing = anyhow::anyhow!(
+            "ClickHouse: Code: 60. DB::Exception: Table atalaya.points_1m does not exist. Maybe you meant atalaya.points?. (UNKNOWN_TABLE) (version 26.8.15.10 (official build))"
+        );
+        assert!(unknown_table(&missing));
+        let denied = anyhow::anyhow!("ClickHouse: Code: 497. DB::Exception: atalaya_schema: Not enough privileges. (ACCESS_DENIED)");
+        assert!(!unknown_table(&denied));
     }
 }
