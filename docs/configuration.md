@@ -19,6 +19,7 @@
 | `ATALAYA_ALLOWED_HOSTS` | unset | Without sign-in, other names the server answers to (comma-separated; see below) |
 | `ATALAYA_OIDC_ISSUER` | unset | OpenID Connect issuer: sign-in required for everything (see below) |
 | `ATALAYA_OIDC_CLIENT_ID` | `atalaya` | Client at the provider |
+| `ATALAYA_OIDC_CLIENT_SECRET` | unset | Its secret, for a confidential client; unset for a public one |
 | `ATALAYA_OIDC_INTERNAL` | the issuer | Where the server reaches the provider, if not at the issuer URL |
 | `ATALAYA_SESSION_KEY` | unset | Secret that signs the session cookie, 32+ characters (needed with sign-in) |
 | `ATALAYA_SESSION_DAYS` | `30` | Session length |
@@ -42,8 +43,9 @@ create databases and tables.
 With `ATALAYA_OIDC_ISSUER` set, every page and API call needs a session
 (`/healthz`, `/readyz` and `/auth/*` excepted): pages send the browser to the
 provider, API calls get 401 and the UI goes through the sign-in back to the
-same page. Register at the provider a **public client with PKCE** (no secret)
-whose callback URL is `<ATALAYA_PUBLIC_URL>/auth/callback` and whose logout
+same page. Register at the provider a **public client with PKCE** (no secret),
+or a confidential one with its secret in `ATALAYA_OIDC_CLIENT_SECRET` (PKCE is
+sent either way), whose callback URL is `<ATALAYA_PUBLIC_URL>/auth/callback` and whose logout
 URL is `<ATALAYA_PUBLIC_URL>/`; who may sign in is decided there (for example,
 the client's allowed groups in Pocket ID). The session is a cookie signed with
 `ATALAYA_SESSION_KEY`: nothing is stored on the server, and changing the key

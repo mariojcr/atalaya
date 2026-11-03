@@ -8,9 +8,10 @@
 //! sign in, API calls get 401. Without it atalaya stays open, for a network
 //! that is already private.
 //!
-//! Authorization code flow with PKCE as a public client: no client secret to
-//! keep. Who may sign in is up to the provider (in Pocket ID, the client's
-//! allowed groups). The session is a cookie signed with HMAC-SHA256
+//! Authorization code flow with PKCE, as a public client (no secret to keep)
+//! or, with `ATALAYA_OIDC_CLIENT_SECRET`, as a confidential one, which some
+//! providers set up by default. Who may sign in is up to the provider (in
+//! Pocket ID, the client's allowed groups). The session is a cookie signed with HMAC-SHA256
 //! (`ATALAYA_SESSION_KEY`): nothing is stored on the server, and changing the
 //! key signs everyone out.
 
@@ -40,6 +41,8 @@ pub struct Auth {
     /// Where atalaya itself reaches the provider (the issuer unless set)
     internal: String,
     client_id: String,
+    /// Only for a confidential client; PKCE is sent either way
+    client_secret: Option<String>,
     public_url: String,
     key: Vec<u8>,
     session_secs: i64,
@@ -69,6 +72,7 @@ impl Auth {
             internal: trim(if internal.is_empty() { issuer.clone() } else { internal }),
             issuer: trim(issuer),
             client_id: env("ATALAYA_OIDC_CLIENT_ID", "atalaya"),
+            client_secret: Some(env("ATALAYA_OIDC_CLIENT_SECRET", "")).filter(|s| !s.is_empty()),
             public_url,
             key: key.into_bytes(),
             session_secs: days * 86400,
@@ -270,19 +274,29 @@ async fn callback(State(auth): State<SharedAuth>, headers: HeaderMap, Query(p): 
     }
 }
 
+/// The token request for a code: the secret goes in the form
+/// (`client_secret_post`) and only for a confidential client
+fn token_form<'a>(auth: &'a Auth, code: &'a str, redirect: &'a str, verifier: &'a str) -> Vec<(&'static str, &'a str)> {
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect),
+        ("client_id", auth.client_id.as_str()),
+        ("code_verifier", verifier),
+    ];
+    if let Some(secret) = &auth.client_secret {
+        form.push(("client_secret", secret.as_str()));
+    }
+    form
+}
+
 async fn sign_in(auth: &Auth, code: &str, verifier: &str) -> anyhow::Result<(String, String)> {
     let d = auth.discovery().await?;
     let redirect = format!("{}/auth/callback", auth.public_url);
     let res = auth
         .http
         .post(auth.inside(d["token_endpoint"].as_str().unwrap_or_default()))
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", &redirect),
-            ("client_id", &auth.client_id),
-            ("code_verifier", verifier),
-        ])
+        .form(&token_form(auth, code, &redirect, verifier))
         .send()
         .await?;
     let status = res.status();
@@ -339,6 +353,7 @@ mod tests {
             issuer: "https://id.example".into(),
             internal: "https://id.example".into(),
             client_id: "atalaya".into(),
+            client_secret: None,
             public_url: "https://atalaya.example".into(),
             key: b"0123456789abcdef0123456789abcdef".to_vec(),
             session_secs: 3600,
@@ -386,5 +401,20 @@ mod tests {
         assert_eq!(safe_return(Some("/ /evil.example")), "/");
         assert_eq!(safe_return(Some("https://evil.example/")), "/");
         assert_eq!(safe_return(None), "/");
+    }
+
+    #[test]
+    fn only_a_confidential_client_sends_its_secret() {
+        let public = auth();
+        let form = token_form(&public, "c", "https://atalaya.example/auth/callback", "v");
+        assert!(form.iter().all(|(k, _)| *k != "client_secret"));
+        assert!(form.contains(&("code_verifier", "v")));
+        let confidential = Auth {
+            client_secret: Some("s3cret".into()),
+            ..auth()
+        };
+        let form = token_form(&confidential, "c", "https://atalaya.example/auth/callback", "v");
+        assert!(form.contains(&("client_secret", "s3cret")));
+        assert!(form.contains(&("code_verifier", "v")), "PKCE either way");
     }
 }
