@@ -1,3 +1,9 @@
+## v0.4.0 (2026-11-03)
+
+### Feat
+
+- **server**: sign-in with a confidential OIDC client too (ATALAYA_OIDC_CLIENT_SECRET) (#25)
+
 ## v0.3.1 (2026-11-03)
 
 ### Fix
