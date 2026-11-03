@@ -133,20 +133,91 @@ pub fn breakdown_sql(table: &str, filter: &str, col: &str) -> String {
     )
 }
 
+/// What a log query computes per group and bucket: its lines, or a function of
+/// a numeric field over the lines that have one
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Agg {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    /// The latest value (a state that lines report, like a queue's length)
+    Last,
+    Quantile(f64),
+}
+
+impl Agg {
+    /// count, sum, avg, min, max, last, or p50/p90/p95/p99 (any p1–p99)
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "" | "count" => Agg::Count,
+            "sum" => Agg::Sum,
+            "avg" => Agg::Avg,
+            "min" => Agg::Min,
+            "max" => Agg::Max,
+            "last" => Agg::Last,
+            p => match p.strip_prefix('p').and_then(|n| n.parse::<u8>().ok()) {
+                Some(n) if (1..=99).contains(&n) => Agg::Quantile(f64::from(n) / 100.0),
+                _ => bail!("invalid agg: {s} (count, sum, avg, min, max, last, p50, p95…)"),
+            },
+        })
+    }
+
+    /// Whether a bucket without lines is a 0 (a count, a sum) or a gap
+    pub fn zero_when_empty(self) -> bool {
+        matches!(self, Agg::Count | Agg::Sum)
+    }
+
+    fn sql(self, v: &str) -> String {
+        match self {
+            Agg::Count => "count()".into(),
+            Agg::Sum => format!("sum({v})"),
+            Agg::Avg => format!("avg({v})"),
+            Agg::Min => format!("min({v})"),
+            Agg::Max => format!("max({v})"),
+            Agg::Last => format!("argMax({v}, Time)"),
+            Agg::Quantile(q) => format!("quantile({q})({v})"),
+        }
+    }
+}
+
+/// What `counts_sql` computes: `agg` of `value` (a field's SQL; none for a
+/// count), per value of `per` and added up when it is set
+#[derive(Debug, Clone, Copy)]
+pub struct Measure<'a> {
+    pub agg: Agg,
+    pub value: Option<&'a str>,
+    pub per: Option<&'a str>,
+}
+
 /// SQL for line counts grouped by key expressions (`k0`, `k1`… in the result),
 /// keeping the `top` most frequent groups of the range: one count per group,
-/// or one per group and bucket of `{step:Int64}` seconds (`ts`)
-pub fn counts_sql(table: &str, filter: &str, keys: &[String], top: u32, bucketed: bool) -> String {
+/// or one per group and bucket of `{step:Int64}` seconds (`ts`).
+///
+/// With another `agg`, `n` is that function of `value` (a field's SQL, read as a
+/// number; lines where it is not one do not take part). With `per`, it is first
+/// computed for each value of that field and then summed: the 3 replicas'
+/// latest queue lengths add up, as `sum(gauge)` does in PromQL.
+pub fn counts_sql(table: &str, filter: &str, keys: &[String], top: u32, bucketed: bool, m: Measure) -> String {
+    let Measure { agg, value, per } = m;
     let names: Vec<String> = (0..keys.len()).map(|i| format!("k{i}")).collect();
     let mut select: Vec<String> = keys.iter().zip(&names).map(|(k, n)| format!("{k} AS {n}")).collect();
-    let mut group = names;
-    let mut cond = filter.to_owned();
+    let mut group = names.clone();
+    let mut outer_group = names;
+    let v = value.map(|v| format!("toFloat64OrNull({v})")).unwrap_or_default();
+    let mut cond = if agg == Agg::Count {
+        filter.to_owned()
+    } else {
+        format!("{filter} AND isNotNull({v})")
+    };
     let order = if bucketed {
         select.insert(0, "toUnixTimestamp(toStartOfInterval(Time, INTERVAL {step:Int64} SECOND)) AS ts".into());
         group.insert(0, "ts".into());
+        outer_group.insert(0, "ts".into());
         if !keys.is_empty() {
             let k = keys.join(", ");
-            cond = format!("{filter} AND ({k}) IN (SELECT {k} FROM {table} WHERE {filter} GROUP BY {k} ORDER BY count() DESC LIMIT {top})");
+            cond = format!("{cond} AND ({k}) IN (SELECT {k} FROM {table} WHERE {filter} GROUP BY {k} ORDER BY count() DESC LIMIT {top})");
         }
         " ORDER BY ts".to_owned()
     } else if keys.is_empty() {
@@ -154,13 +225,22 @@ pub fn counts_sql(table: &str, filter: &str, keys: &[String], top: u32, bucketed
     } else {
         format!(" ORDER BY n DESC LIMIT {top}")
     };
-    select.push("count() AS n".into());
-    let group = if group.is_empty() {
-        String::new()
-    } else {
-        format!(" GROUP BY {}", group.join(", "))
-    };
-    format!("SELECT {} FROM {table} WHERE {cond}{group}{order}", select.join(", "))
+    let group_by = |g: &[String]| if g.is_empty() { String::new() } else { format!(" GROUP BY {}", g.join(", ")) };
+    match per {
+        None => {
+            select.push(format!("{} AS n", agg.sql(&v)));
+            format!("SELECT {} FROM {table} WHERE {cond}{}{order}", select.join(", "), group_by(&group))
+        }
+        Some(per) => {
+            select.push(format!("{per} AS per"));
+            group.push("per".into());
+            select.push(format!("{} AS n", agg.sql(&v)));
+            let inner = format!("SELECT {} FROM {table} WHERE {cond}{}", select.join(", "), group_by(&group));
+            let mut outer: Vec<String> = outer_group.clone();
+            outer.push("sum(n) AS n".into());
+            format!("SELECT {} FROM ({inner}){}{order}", outer.join(", "), group_by(&outer_group))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,18 +265,90 @@ mod tests {
         assert!(filters_sql(&["host=Thor".into()], &mut params).is_err(), "= alone is not an operator");
     }
 
+    /// The lines themselves
+    const COUNT: Measure = Measure {
+        agg: Agg::Count,
+        value: None,
+        per: None,
+    };
+
     #[test]
     fn counts_keep_the_most_frequent_groups() {
         let keys = ["Host".to_owned(), "Attributes['qname']".to_owned()];
-        assert_eq!(counts_sql("logs", "F", &[], 10, false), "SELECT count() AS n FROM logs WHERE F");
+        assert_eq!(counts_sql("logs", "F", &[], 10, false, COUNT), "SELECT count() AS n FROM logs WHERE F");
         assert_eq!(
-            counts_sql("logs", "F", &keys, 5, false),
+            counts_sql("logs", "F", &keys, 5, false, COUNT),
             "SELECT Host AS k0, Attributes['qname'] AS k1, count() AS n FROM logs WHERE F GROUP BY k0, k1 ORDER BY n DESC LIMIT 5"
         );
         assert_eq!(
-            counts_sql("logs", "F", &keys[..1], 5, true),
+            counts_sql("logs", "F", &keys[..1], 5, true, COUNT),
             "SELECT toUnixTimestamp(toStartOfInterval(Time, INTERVAL {step:Int64} SECOND)) AS ts, Host AS k0, count() AS n FROM logs \
              WHERE F AND (Host) IN (SELECT Host FROM logs WHERE F GROUP BY Host ORDER BY count() DESC LIMIT 5) GROUP BY ts, k0 ORDER BY ts"
         );
+    }
+
+    #[test]
+    fn a_field_can_be_summed_averaged_or_taken_last() {
+        let keys = ["A".to_owned()];
+        // Only the lines whose field reads as a number take part
+        assert_eq!(
+            counts_sql(
+                "logs",
+                "F",
+                &keys,
+                5,
+                false,
+                Measure {
+                    agg: Agg::Sum,
+                    value: Some("C"),
+                    per: None
+                }
+            ),
+            "SELECT A AS k0, sum(toFloat64OrNull(C)) AS n FROM logs WHERE F AND isNotNull(toFloat64OrNull(C)) GROUP BY k0 ORDER BY n DESC LIMIT 5"
+        );
+        assert_eq!(
+            counts_sql(
+                "logs",
+                "F",
+                &[],
+                5,
+                false,
+                Measure {
+                    agg: Agg::Quantile(0.95),
+                    value: Some("C"),
+                    per: None
+                }
+            ),
+            "SELECT quantile(0.95)(toFloat64OrNull(C)) AS n FROM logs WHERE F AND isNotNull(toFloat64OrNull(C))"
+        );
+        // Per replica first, then added up, in each bucket
+        assert_eq!(
+            counts_sql(
+                "logs",
+                "F",
+                &keys,
+                5,
+                true,
+                Measure {
+                    agg: Agg::Last,
+                    value: Some("C"),
+                    per: Some("Host")
+                }
+            ),
+            "SELECT ts, k0, sum(n) AS n FROM (SELECT toUnixTimestamp(toStartOfInterval(Time, INTERVAL {step:Int64} SECOND)) AS ts, A AS k0, \
+             Host AS per, argMax(toFloat64OrNull(C), Time) AS n FROM logs WHERE F AND isNotNull(toFloat64OrNull(C)) \
+             AND (A) IN (SELECT A FROM logs WHERE F GROUP BY A ORDER BY count() DESC LIMIT 5) GROUP BY ts, k0, per) GROUP BY ts, k0 ORDER BY ts"
+        );
+    }
+
+    #[test]
+    fn aggs_parse() {
+        assert_eq!(Agg::parse("").unwrap(), Agg::Count);
+        assert_eq!(Agg::parse("p95").unwrap(), Agg::Quantile(0.95));
+        assert_eq!(Agg::parse("last").unwrap(), Agg::Last);
+        for bad in ["p0", "p100", "median", "sum(x)"] {
+            assert!(Agg::parse(bad).is_err(), "{bad}");
+        }
+        assert!(Agg::Sum.zero_when_empty() && !Agg::Avg.zero_when_empty());
     }
 }

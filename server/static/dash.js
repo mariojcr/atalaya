@@ -147,12 +147,16 @@ function logParams(src, ctx, t) {
   return p;
 }
 /** Line counts of a log query as series (one per group of its `by` fields):
- *  one count over the range (instant) or one per step */
+ *  one count over the range (instant) or one per step. With `agg` and `field`,
+ *  a function of that field instead (sum, avg, last, p95…), per `per` and added */
 async function logCounts(q, ctx, t, step, signal) {
   const p = logParams(q.logs, ctx, t);
   [].concat(q.by || []).forEach((b) => p.append("by", b));
   if (q.top) p.set("top", q.top);
   if (step) p.set("step", step);
+  if (q.agg) p.set("agg", q.agg);
+  if (q.field) p.set("field", q.field);
+  if (q.per) p.set("per", q.per);
   const r = await fetch(`/api/v1/logs/counts?${p}`, { signal });
   const j = await r.json().catch(() => ({ error: r.statusText }));
   if (!r.ok) throw new Error(j.error || r.statusText);

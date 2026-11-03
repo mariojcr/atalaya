@@ -208,6 +208,13 @@ struct CountsParams {
     step: Option<i64>,
     /// How many groups to keep, the most frequent (10 by default, up to 100)
     top: Option<u32>,
+    /// count (the default), sum, avg, min, max, last or p50/p95/…: of `field`
+    #[serde(default)]
+    agg: String,
+    /// The numeric field the agg reads (not for count)
+    field: Option<String>,
+    /// Compute the agg for each value of this field and add them up (replicas)
+    per: Option<String>,
 }
 
 /// At most this many points per series, as in the PromQL API
@@ -217,7 +224,8 @@ const MAX_BY: usize = 3;
 
 /// Line counts for dashboards, as series in the PromQL API's shape: grouped by
 /// the `by=` fields (repeatable), the `top` most frequent groups of the range,
-/// with one count each or one per `step` (0 where there were no lines)
+/// with one count each or one per `step` (0 where there were no lines). With
+/// `agg` and `field`, a function of that field instead of the count.
 async fn log_counts(State(app): State<Shared>, Query(p): Query<CountsParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
     let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
     let mut params: Vec<Param> = vec![("start".into(), start.to_string()), ("end".into(), end.to_string())];
@@ -234,6 +242,15 @@ async fn log_counts(State(app): State<Shared>, Query(p): Query<CountsParams>, Ra
         .enumerate()
         .map(|(i, f)| logsearch::field_sql(f, &mut params, filters.len() + i))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let agg = logsearch::Agg::parse(&p.agg)?;
+    let next = filters.len() + by.len();
+    let value = match (agg, p.field.as_deref()) {
+        (logsearch::Agg::Count, None) => None,
+        (logsearch::Agg::Count, Some(_)) => return Err(anyhow::anyhow!("field goes with an agg other than count").into()),
+        (_, None) => return Err(anyhow::anyhow!("agg {} needs a field", p.agg).into()),
+        (_, Some(f)) => Some(logsearch::field_sql(f, &mut params, next)?),
+    };
+    let per = p.per.as_deref().map(|f| logsearch::field_sql(f, &mut params, next + 1)).transpose()?;
     if let Some(step) = p.step {
         if step <= 0 {
             return Err(anyhow::anyhow!("step must be positive").into());
@@ -245,16 +262,28 @@ async fn log_counts(State(app): State<Shared>, Query(p): Query<CountsParams>, Ra
     }
     let top = p.top.unwrap_or(10).clamp(1, 100);
     let table = format!("{}.logs", app.db);
-    let sql = logsearch::counts_sql(&table, &conds.join(" AND "), &keys, top, p.step.is_some());
+    let sql = logsearch::counts_sql(
+        &table,
+        &conds.join(" AND "),
+        &keys,
+        top,
+        p.step.is_some(),
+        logsearch::Measure {
+            agg,
+            value: value.as_deref(),
+            per: per.as_deref(),
+        },
+    );
     let rows = app.ch.rows(&sql, &params).await?;
-    Ok(Json(json!({ "series": count_series(&by, &rows, start, end, p.step) })))
+    Ok(Json(json!({ "series": count_series(&by, &rows, start, end, p.step, agg.zero_when_empty()) })))
 }
 
 /// The rows of `counts_sql` as series: labels named after the `by` fields and
 /// points every `step` from the bucket holding `start` (0 where a group had no
-/// lines), or a single point at `end`
-fn count_series(by: &[String], rows: &[Value], start: i64, end: i64, step: Option<i64>) -> Vec<Value> {
-    let mut groups: Vec<(serde_json::Map<String, Value>, BTreeMap<i64, u64>)> = Vec::new();
+/// lines, or a gap when `zero` is false: an average of nothing is not 0), or a
+/// single point at `end`
+fn count_series(by: &[String], rows: &[Value], start: i64, end: i64, step: Option<i64>, zero: bool) -> Vec<Value> {
+    let mut groups: Vec<(serde_json::Map<String, Value>, BTreeMap<i64, Value>)> = Vec::new();
     let mut index: HashMap<Vec<String>, usize> = HashMap::new();
     for r in rows {
         let key: Vec<String> = (0..by.len()).map(|i| r[format!("k{i}")].as_str().unwrap_or("").to_owned()).collect();
@@ -263,7 +292,10 @@ fn count_series(by: &[String], rows: &[Value], start: i64, end: i64, step: Optio
             groups.len() - 1
         });
         let ts = step.map_or(end, |_| r["ts"].as_i64().unwrap_or(0));
-        groups[i].1.insert(ts, r["n"].as_u64().unwrap_or(0));
+        // A count is an integer, an agg a float; ClickHouse writes NaN and ∞ as null
+        if !r["n"].is_null() {
+            groups[i].1.insert(ts, r["n"].clone());
+        }
     }
     groups
         .into_iter()
@@ -274,7 +306,10 @@ fn count_series(by: &[String], rows: &[Value], start: i64, end: i64, step: Optio
                     (0..=MAX_POINTS)
                         .map(|k| first + k * step)
                         .take_while(|t| *t < end)
-                        .map(|t| json!([t, counts.get(&t).copied().unwrap_or(0)]))
+                        .filter_map(|t| match counts.get(&t) {
+                            Some(n) => Some(json!([t, n])),
+                            None => zero.then(|| json!([t, 0])),
+                        })
                         .collect()
                 }
                 None => counts.into_iter().map(|(t, n)| json!([t, n])).collect(),
@@ -417,7 +452,7 @@ mod tests {
             json!({"ts": 1800, "k0": "Odin", "n": 2}),
         ];
         // Buckets start at the one holding `start` and stop before `end`
-        let got = count_series(&by, &rows, 1250, 2400, Some(600));
+        let got = count_series(&by, &rows, 1250, 2400, Some(600), true);
         assert_eq!(
             got,
             [
@@ -426,14 +461,18 @@ mod tests {
             ]
         );
         // Never more than MAX_POINTS
-        let got = count_series(&by, &rows[..1], 0, i64::MAX, Some(1));
+        let got = count_series(&by, &rows[..1], 0, i64::MAX, Some(1), true);
         assert_eq!(
             got[0]["points"].as_array().unwrap().len(),
             MAX_POINTS as usize + 1,
             "the bucket holding start, then MAX_POINTS more"
         );
         // Without a step: one count per group, at the end
-        let got = count_series(&by, &[json!({"k0": "Thor", "n": 4})], 0, 3600, None);
+        let got = count_series(&by, &[json!({"k0": "Thor", "n": 4})], 0, 3600, None, true);
         assert_eq!(got, [json!({"labels": {"host": "Thor"}, "points": [[3600, 4]]})]);
+        // An average leaves a gap where there were no lines, and a null (NaN) is no point
+        let rows = [json!({"ts": 1200, "k0": "Thor", "n": 0.25}), json!({"ts": 2400, "k0": "Thor", "n": null})];
+        let got = count_series(&by, &rows, 1200, 3000, Some(600), false);
+        assert_eq!(got, [json!({"labels": {"host": "Thor"}, "points": [[1200, 0.25]]})]);
     }
 }

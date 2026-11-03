@@ -95,6 +95,9 @@ sections:                     Grafana rows; collapsed: true does not query until
             by: <field> | [field, …]               up to 3; one series per group
             top: 10                                the most frequent groups (up to 100)
             instant: true                          one count for the whole range
+            agg: sum                               instead of counting: sum, avg, min, max, last, p50, p95… of field
+            field: <field>                         the numeric field agg reads (lines without a number skip)
+            per: <field>                           agg for each value (e.g. host), then added up
         series:                                    Grafana overrides (the useful subset)
           - match: <exact name> | /regex/ | [name, name]
             name, color, unit, decimals, min, max, negative: true, fill, lineWidth, dash: true,
@@ -120,6 +123,41 @@ can draw it:
   names, keeping the `top` most frequent. In bargauge, bar, pie and table
   panels each group links to the logs explorer, with the query and that
   group's values.
+
+**Values from the lines.** With `agg` and `field`, a log query reads a number
+from each line instead of counting them: `sum`, `avg`, `min`, `max`, `last` (the
+latest value) or a percentile (`p50`, `p90`, `p95`, `p99`, any `p1`–`p99`). Lines
+whose field is missing or not a number do not take part. A bucket without lines is
+0 for `sum` (as for a count) and a gap for the others. With `per`, the agg is
+computed for each value of that field and the results are added up: for a state
+that several replicas report, `agg: last` with `per: host` is the sum of each
+replica's latest value, as `sum(gauge)` is in PromQL.
+
+```yaml
+- title: Cost per model
+  type: timeseries
+  queries:
+    - logs: 'service:gateway -kind:*'
+      by: model
+      agg: sum
+      field: cost
+- title: p95 duration
+  type: stat
+  unit: ms
+  queries:
+    - logs: 'service:gateway -kind:*'
+      agg: p95
+      field: dur_ms
+      instant: true
+- title: In flight per route
+  type: timeseries
+  queries:
+    - logs: 'service:gateway kind:route_state'
+      by: route
+      agg: last
+      field: inflight
+      per: host
+```
 
 A `type: logs` panel lists the latest lines of its log query, newest first, with
 a column per field in `logs.columns`. Its link opens the logs explorer with the
