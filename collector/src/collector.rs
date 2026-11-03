@@ -44,9 +44,12 @@ const MAX_SCRAPE: usize = 32 << 20;
 /// A scrape's body, refused past `max` bytes: by its Content-Length, or as it arrives
 /// The client for scrapes: a short deadline, the cluster's CA if there is one,
 /// and no redirects: a target found in Nomad is scraped only at its
-/// allocation's own address, and a redirect would take the scrape anywhere else
+/// allocation's own address, and a redirect would take the scrape anywhere else.
+/// It says who it is: ClickHouse's and Keeper's /metrics answer 500 ("Not found:
+/// User-Agent") to a request without one.
 pub(crate) fn scrape_client(ca: Option<&reqwest::Certificate>) -> reqwest::Result<reqwest::Client> {
     let mut b = reqwest::Client::builder()
+        .user_agent(concat!("atalaya-collector/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none());
     if let Some(ca) = ca {
@@ -496,6 +499,23 @@ mod tests {
         });
         let resp = scrape_client(None).unwrap().get(format!("http://{addr}/metrics")).send().await.unwrap();
         assert_eq!(resp.status(), 302, "the redirect is the answer, not followed");
+    }
+
+    #[tokio::test]
+    async fn a_scrape_says_who_it_is() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+            String::from_utf8_lossy(&buf[..n]).to_lowercase()
+        });
+        scrape_client(None).unwrap().get(format!("http://{addr}/metrics")).send().await.unwrap();
+        let request = request.await.unwrap();
+        assert!(request.contains("\r\nuser-agent: atalaya-collector/"), "{request}");
     }
 
     /// A collector without Nomad or host sources whose sink cannot send
