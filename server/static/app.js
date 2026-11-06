@@ -333,33 +333,38 @@ function renderChart(host, legendHost, sets, opts = {}) {
     const fill = e.st.fill ?? opts.fill ?? (opts.type === "area" ? 35 : opts.type === "bar" ? 100 : 0);
     return { draw, stack, fill, neg: !!e.st.negative, width: e.st.lineWidth ?? opts.lineWidth ?? (e.set.dashed ? 1.2 : 1.6), dash: e.st.dash || e.set.dashed };
   });
-  // Stacking per group (positive and negative separately), as a fraction of 1 for "percent"
+  // Stacking per group (positive and negative separately), as a fraction of 1 for "percent".
+  // Series hidden from the legend add nothing: they stay in the stack with zero height
   const plot = raw.map((ys, i) => ys.map((v) => (v == null ? null : looks[i].neg ? -v : v)));
   const groupKey = (i) => `${looks[i].stack}:${looks[i].neg ? "-" : "+"}`;
-  const prevInGroup = new Map();
-  const totals = new Map();
-  all.forEach((_, i) => {
-    if (!looks[i].stack || looks[i].stack !== "percent") return;
-    const t = totals.get(groupKey(i)) || new Array(xs.length).fill(0);
-    raw[i].forEach((v, j) => { t[j] += Math.abs(v ?? 0); });
-    totals.set(groupKey(i), t);
-  });
-  const acc = new Map();
-  all.forEach((_, i) => {
-    const L = looks[i]; if (!L.stack) return;
-    const g = groupKey(i);
-    const a = acc.get(g) || new Array(xs.length).fill(0);
-    const tot = totals.get(g);
-    plot[i] = raw[i].map((v, j) => {
-      if (v == null) return null;
-      const x = tot ? (tot[j] ? Math.abs(v) / tot[j] : 0) : Math.abs(v);
-      a[j] += L.neg || v >= 0 || tot ? x : v;
-      return L.neg ? -a[j] : a[j];
+  const muted = new Set();
+  function stack() {
+    const prevInGroup = new Map();
+    const totals = new Map();
+    all.forEach((_, i) => {
+      if (!looks[i].stack || looks[i].stack !== "percent" || muted.has(i)) return;
+      const t = totals.get(groupKey(i)) || new Array(xs.length).fill(0);
+      raw[i].forEach((v, j) => { t[j] += Math.abs(v ?? 0); });
+      totals.set(groupKey(i), t);
     });
-    L.prev = prevInGroup.get(g);
-    prevInGroup.set(g, i);
-    acc.set(g, a);
-  });
+    const acc = new Map();
+    all.forEach((_, i) => {
+      const L = looks[i]; if (!L.stack) return;
+      const g = groupKey(i);
+      const a = acc.get(g) || new Array(xs.length).fill(0);
+      const tot = totals.get(g);
+      plot[i] = raw[i].map((v, j) => {
+        if (v == null) return null;
+        const x = tot ? (tot[j] ? Math.abs(v) / tot[j] : 0) : Math.abs(v);
+        a[j] += muted.has(i) ? 0 : L.neg || v >= 0 || tot ? x : v;
+        return L.neg ? -a[j] : a[j];
+      });
+      L.prev = prevInGroup.get(g);
+      prevInGroup.set(g, i);
+      acc.set(g, a);
+    });
+  }
+  stack();
   const hasNeg = looks.some((l) => l.neg);
   const series = [{}];
   const data = [xs];
@@ -525,7 +530,16 @@ function renderChart(host, legendHost, sets, opts = {}) {
     paintSwatches(legendHost);
     $$("[data-s]", legendHost).forEach((el) => {
       const si = +el.dataset.s;
-      const toggle = () => { u.setSeries(si, { show: !(series[si].show ?? true) }); series[si].show = u.series[si].show; drawLegend(); };
+      const toggle = () => {
+        u.setSeries(si, { show: !(series[si].show ?? true) }); series[si].show = u.series[si].show;
+        // Restack without the hidden series, or the visible ones keep the height of the hidden ones below
+        const i = series[si]._i;
+        if (looks[i].stack) {
+          if (series[si].show) muted.delete(i); else muted.add(i);
+          stack(); u.setData([xs, ...order.map((k) => plot[k])]);
+        }
+        drawLegend();
+      };
       el.onclick = toggle;
       el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
       el.onmouseenter = () => u.setSeries(si, { focus: true });
