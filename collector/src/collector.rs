@@ -349,7 +349,7 @@ impl Collector {
         let host: Labels = [("host.name".to_owned(), self.cfg.node.clone())].into();
         let mut jobs = Vec::new();
         for t in &self.cfg.scrape.static_targets {
-            jobs.push((t.service.clone(), t.url.clone(), None, host.clone()));
+            jobs.push((t.service.clone(), t.url.clone(), t.token_file.clone(), host.clone()));
         }
         // Without a full list of targets (discovery failed), none counts as gone
         let mut complete = true;
@@ -592,6 +592,51 @@ mod tests {
         assert!(err.contains("is empty") && err.contains(&token.display().to_string()), "{err}");
         std::fs::write(&token, "s3cret\nwith a line break").unwrap();
         assert!(!bearer(&token).unwrap_err().to_string().contains("s3cret"), "errors never carry the token");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A static target outside Nomad (the plane's /metrics, on its VM) can ask
+    /// for a token too: scrape_all sends it, and a static target without one
+    /// sends nothing
+    #[tokio::test]
+    async fn a_static_target_sends_its_token_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nup 1\n").await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("atalaya-collector-static-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("plane");
+        std::fs::write(&token, "pl4ne\n").unwrap();
+        let (mut c, _) = collector("static-token");
+        c.cfg.scrape.static_targets = vec![
+            crate::config::StaticTarget {
+                service: "plane".into(),
+                url: format!("http://{addr}/metrics"),
+                token_file: Some(token),
+            },
+            crate::config::StaticTarget {
+                service: "web".into(),
+                url: format!("http://{addr}/web"),
+                token_file: None,
+            },
+        ];
+        Arc::new(c).scrape_all().await;
+        let mut got = vec![requests.recv().await.unwrap(), requests.recv().await.unwrap()];
+        got.sort();
+        assert!(
+            got[0].starts_with("get /metrics ") && got[0].contains("\r\nauthorization: bearer pl4ne\r\n"),
+            "{got:?}"
+        );
+        assert!(got[1].starts_with("get /web ") && !got[1].contains("authorization"), "{got:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

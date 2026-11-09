@@ -29,6 +29,8 @@ scrape:
   interval: 15s                # default 15s
   static_targets:              # endpoints that are not discovered through Nomad
     - { service: node-exporter, url: http://localhost:9100/metrics }
+    # optional token_file: a bearer token, read on every scrape
+    - { service: app, url: http://localhost:8080/metrics, token_file: /run/secrets/app-metrics }
 
 logs:
   enabled: true                # default true
