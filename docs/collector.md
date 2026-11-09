@@ -23,6 +23,7 @@ nomad:                         # optional: service discovery and allocation logs
   node_id: 9b1c…               # this client's node ID
   ca_file: /etc/nomad.d/tls/ca.pem   # optional: the cluster's CA (also trusted by the scrapes)
   token_file: /secrets/nomad-token   # optional: ACL token with read-job; read once at start
+  scrape_tokens: /secrets/scrape     # optional: bearer tokens for services tagged metrics_token=<name>
 
 scrape:
   interval: 15s                # default 15s
@@ -79,7 +80,9 @@ Running as root, it does not let the jobs it watches steer it:
   by swapping its `logs` directory.
 - **Nomad targets:** a service registration's address is the job's to choose,
   so a target is only scraped at an address of its own allocation (see
-  [Sources](#sources)), and a redirect in its answer is not followed.
+  [Sources](#sources)), and a redirect in its answer is not followed. A scrape
+  token is only sent to an allocation of the job it was left for (see
+  [Scrape tokens](#scrape-tokens)).
 - **Answers:** a scrape over 32 MiB fails instead of filling the collector's
   memory.
 
@@ -106,8 +109,10 @@ What Nomad discovery covers:
 
 - services registered with Nomad's own provider (`provider = "nomad"`), not
   Consul;
-- the `default` namespace;
-- plain `http://` endpoints;
+- every namespace the token can read (`read-job` on each), or all of them
+  without ACLs;
+- plain `http://` endpoints, with a bearer token if the service asks for one
+  (see [Scrape tokens](#scrape-tokens));
 - addresses of the service's own allocation: its address in its group network
   (`address_mode = "alloc"`, any port) or a host address and port the
   allocation was given (`address_mode = "host"` or `"auto"`). A registration
@@ -118,7 +123,9 @@ What Nomad discovery covers:
 The service of a discovered target (`job` in PromQL) is its Nomad job ID. The
 series also record the Nomad service, task group and allocation index
 (`nomad_service`, `nomad_group` and `nomad_alloc_index` in PromQL), so the
-replicas and services of one job are separate series.
+replicas and services of one job are separate series. Outside the `default`
+namespace they record the namespace too (`nomad_namespace`), so jobs with the
+same name in two namespaces stay apart.
 
 **Logs.**
 
@@ -259,6 +266,32 @@ network; `host_chrony_up` is 0 on a host without chronyd.
 - `_rows_sent_total`, `_batches_sent_total` and `_send_errors_total`;
 - `_spooled_batches_total`, `_spool_bytes`, `_dropped_batches_total` and
   `_dropped_rows_total`.
+
+## Scrape tokens
+
+A service whose `/metrics` asks for a bearer token tags itself
+`metrics_token=<name>`, and the collector sends the token in the file
+`<scrape_tokens>/<namespace>/<job>/<name>`. The namespace and job are those of
+the service's allocation as Nomad reports it, the parent job for a dispatched
+or periodic one, so a job can only get the token left for that job, and only at
+an address of its own allocation. The name is a plain file name (letters,
+digits, `-`, `_` and `.`, not starting with a dot).
+
+The file is read on every scrape, so a rotated token is used without a
+restart. A target whose token is missing, empty or unreadable is not scraped:
+its `up` is 0 and the reason, with the file but never the token, goes to the
+collector's log. A target that asks for a token without `scrape_tokens` set is
+not scraped either, and the collector says so once. With Nomad, render the
+files from variables into the task's secrets directory:
+
+```hcl
+template {
+  destination = "${NOMAD_SECRETS_DIR}/scrape/my-namespace/my-job/metrics"
+  change_mode = "noop"
+  perms       = "0400"
+  data        = "{{ with nomadVar \"nomad/jobs/atalaya-collector/my-job\" }}{{ .token }}{{ end }}"
+}
+```
 
 ## Metric rules
 

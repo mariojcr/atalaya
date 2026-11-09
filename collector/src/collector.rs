@@ -4,6 +4,7 @@
 //! The collector: scrapes targets, reads the host and writes series and points.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -132,15 +133,45 @@ pub(crate) struct Collector {
 /// Resource of a target discovered in Nomad: the host plus the Nomad service,
 /// task group and allocation index, so the replicas and services of one job
 /// stay apart (the server turns them into the PromQL labels `nomad_service`,
-/// `nomad_group` and `nomad_alloc_index`)
+/// `nomad_group` and `nomad_alloc_index`). Outside `default`, its namespace
+/// too (`nomad_namespace`), so two jobs with the same name in two namespaces
+/// do not share series; not in `default`, whose series were written without
+/// it and would start over (the resource is part of a series' identity).
 fn nomad_resource(host: &Labels, service: &str, alloc: Option<AllocInfo>) -> Labels {
     let mut res = host.clone();
     res.insert("nomad.service".into(), service.to_owned());
     if let Some(a) = alloc {
         res.insert("nomad.group".into(), a.group);
         res.insert("nomad.alloc_index".into(), a.index);
+        if !a.namespace.is_empty() && a.namespace != "default" {
+            res.insert("nomad.namespace".into(), a.namespace);
+        }
     }
     res
+}
+
+/// Most a scrape token file may hold
+const MAX_TOKEN: u64 = 4096;
+
+/// The bearer token in a file: read on every scrape (a few bytes), so a
+/// rotated one is picked up without a restart. Errors name the file, never
+/// its content.
+fn bearer(path: &std::path::Path) -> anyhow::Result<reqwest::header::HeaderValue> {
+    use std::io::Read;
+    let failed = |e: std::io::Error| anyhow::anyhow!("reading its token {}: {e}", path.display());
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .map_err(failed)?
+        .take(MAX_TOKEN + 1)
+        .read_to_string(&mut text)
+        .map_err(failed)?;
+    anyhow::ensure!(text.len() as u64 <= MAX_TOKEN, "its token {} is over {MAX_TOKEN} bytes", path.display());
+    let token = text.trim();
+    anyhow::ensure!(!token.is_empty(), "its token {} is empty", path.display());
+    let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| anyhow::anyhow!("its token {} is not a valid header value", path.display()))?;
+    v.set_sensitive(true);
+    Ok(v)
 }
 
 /// The source of a target's own `up` and `scrape_duration_seconds`
@@ -234,10 +265,16 @@ impl Collector {
         );
     }
 
-    pub(crate) async fn scrape_one(&self, service: String, url: String, resource: Labels, now: i64) {
+    /// Scrapes a target, with the bearer token in `token` if it has one (a
+    /// target that asks for a token that cannot be read fails, unsent)
+    pub(crate) async fn scrape_one(&self, service: String, url: String, token: Option<PathBuf>, resource: Labels, now: i64) {
         let started = Instant::now();
         let result = async {
-            let resp = self.http.get(&url).send().await?;
+            let mut req = self.http.get(&url);
+            if let Some(path) = &token {
+                req = req.header(reqwest::header::AUTHORIZATION, bearer(path)?);
+            }
+            let resp = req.send().await?;
             // Anything but a 2xx is a failed scrape, a redirect too (it is not followed)
             anyhow::ensure!(resp.status().is_success(), "HTTP {}", resp.status());
             let text = read_body(resp, MAX_SCRAPE).await?;
@@ -312,7 +349,7 @@ impl Collector {
         let host: Labels = [("host.name".to_owned(), self.cfg.node.clone())].into();
         let mut jobs = Vec::new();
         for t in &self.cfg.scrape.static_targets {
-            jobs.push((t.service.clone(), t.url.clone(), host.clone()));
+            jobs.push((t.service.clone(), t.url.clone(), None, host.clone()));
         }
         // Without a full list of targets (discovery failed), none counts as gone
         let mut complete = true;
@@ -321,7 +358,7 @@ impl Collector {
                 Ok(targets) => {
                     for t in targets {
                         let res = nomad_resource(&host, &t.service, nomad.alloc(&t.alloc).await);
-                        jobs.push((t.job, t.url, res));
+                        jobs.push((t.job, t.url, t.token, res));
                     }
                 }
                 Err(e) => {
@@ -330,7 +367,7 @@ impl Collector {
                 }
             }
         }
-        let targets: HashSet<String> = jobs.iter().map(|(_, url, _)| url.clone()).collect();
+        let targets: HashSet<String> = jobs.iter().map(|(_, url, _, _)| url.clone()).collect();
         let mut handles: Vec<_> = Vec::new();
         if let Some(h) = self.host.clone() {
             handles.push(self.read_host("sysfs", &host, now, move || h.lock().unwrap().collect()));
@@ -339,9 +376,9 @@ impl Collector {
             let addr = self.cfg.host.chrony.address;
             handles.push(self.read_host("chronyd", &host, now, move || chrony::collect(addr)));
         }
-        handles.extend(jobs.into_iter().map(|(service, url, res)| {
+        handles.extend(jobs.into_iter().map(|(service, url, token, res)| {
             let me = self.clone();
-            tokio::spawn(async move { me.scrape_one(service, url, res, now).await })
+            tokio::spawn(async move { me.scrape_one(service, url, token, res, now).await })
         }));
         for h in handles {
             let _ = h.await;
@@ -518,6 +555,46 @@ mod tests {
         assert!(request.contains("\r\nuser-agent: atalaya-collector/"), "{request}");
     }
 
+    #[tokio::test]
+    async fn a_scrape_sends_its_token_and_without_it_is_not_sent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nup 1\n").await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("atalaya-collector-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("metrics");
+        std::fs::write(&token, "s3cret\n").unwrap();
+        let (c, _) = collector("token");
+
+        c.scrape_one("scan".into(), url.clone(), Some(token.clone()), Labels::new(), 100).await;
+        let request = requests.recv().await.unwrap();
+        assert!(request.contains("\r\nauthorization: bearer s3cret\r\n"), "{request}");
+        c.scrape_one("web".into(), url.clone(), None, Labels::new(), 100).await;
+        assert!(!requests.recv().await.unwrap().contains("authorization"), "no token, no header");
+
+        // Gone or empty (a template not rendered yet): the scrape fails without
+        // reaching the target
+        std::fs::write(&token, " \n").unwrap();
+        c.scrape_one("scan".into(), url.clone(), Some(token.clone()), Labels::new(), 115).await;
+        c.scrape_one("scan".into(), url, Some(dir.join("missing")), Labels::new(), 130).await;
+        assert!(requests.try_recv().is_err(), "nothing was sent");
+        assert_eq!(c.stats.lock().await.get("scrape_errors"), Some(&2.0));
+        let err = bearer(&token).unwrap_err().to_string();
+        assert!(err.contains("is empty") && err.contains(&token.display().to_string()), "{err}");
+        std::fs::write(&token, "s3cret\nwith a line break").unwrap();
+        assert!(!bearer(&token).unwrap_err().to_string().contains("s3cret"), "errors never carry the token");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A collector without Nomad or host sources whose sink cannot send
     fn collector(name: &str) -> (Collector, Arc<Sink>) {
         let cfg: Config = serde_saphyr::from_str("node: h\nstate_dir: /s\nclickhouse: { url: 'http://127.0.0.1:1/', user: u }\n").unwrap();
@@ -643,6 +720,15 @@ mod tests {
                 ("nomad.group", "api"),
                 ("nomad.service", "web-metrics")
             ]
+        );
+        // Outside `default`, its namespace too
+        let scans = AllocInfo {
+            namespace: "scans".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            nomad_resource(&host, "scan", Some(scans)).get("nomad.namespace").map(String::as_str),
+            Some("scans")
         );
     }
 }

@@ -21,7 +21,9 @@ driver and its options):
   collector reads SMART from the disks) and `volumes { enabled = true }`.
 - **Services to scrape:** tag them `metrics=true` and, if the endpoint is not
   `/metrics`, `metrics_path=/other`. The collector on each node scrapes the
-  services of that node.
+  services of that node, in every namespace its token can read. An endpoint
+  that wants a bearer token tags itself `metrics_token=<name>` (see
+  [scrape tokens](../../docs/collector.md#scrape-tokens)).
 
 ## Run
 

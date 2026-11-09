@@ -110,6 +110,12 @@ pub(crate) struct NomadConfig {
     /// ACL token for the Nomad API, read once at start
     #[serde(default)]
     pub(crate) token_file: Option<PathBuf>,
+    /// Bearer tokens for scrapes: a service tagged `metrics_token=<name>` is
+    /// scraped with the one in `<dir>/<namespace>/<job>/<name>`, its
+    /// allocation's namespace and job (the parent of a dispatched or periodic
+    /// one), read on every scrape
+    #[serde(default)]
+    pub(crate) scrape_tokens: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]

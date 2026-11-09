@@ -1,16 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Nomad API queries: this node's services that expose metrics and the details
-//! of each allocation (job, group, index, log patterns), cached.
+//! Nomad API queries: this node's services that expose metrics, in every
+//! namespace the token can read, and the details of each allocation (job,
+//! group, index, log patterns), cached.
 //!
 //! A service registration's address and port are the job's to choose, and the
 //! collector scrapes from the host's network: a target is only scraped at an
 //! address of its own allocation (its address in its network namespace, or a
-//! host port it was given), never wherever a job points it.
+//! host port it was given), never wherever a job points it. The same goes for
+//! a scrape token: it is only sent to an allocation of the job it was left for.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,11 +28,16 @@ pub struct Target {
     pub service: String,
     pub url: String,
     pub alloc: String,
+    /// The file with the bearer token its scrape sends, if it asks for one
+    pub token: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AllocInfo {
     pub job: String,
+    /// The job whose spec it runs: its own, or the parent of a dispatched or
+    /// periodic one (each child has its own ID)
+    pub parent: String,
     pub group: String,
     pub namespace: String,
     /// Allocation index (job.group[N]): tells replicas apart without changing on every deployment
@@ -81,8 +89,12 @@ impl Reach {
     }
 }
 
+/// One namespace's services, as `/v1/services?namespace=*` lists them: one
+/// entry per namespace the token can read
 #[derive(Deserialize)]
 struct ServiceList {
+    #[serde(rename = "Namespace")]
+    namespace: String,
     #[serde(rename = "Services")]
     services: Vec<ServiceStub>,
 }
@@ -236,11 +248,16 @@ impl Allocation {
         Reach { own, ports }
     }
 
+    /// Its job, or the parent of a dispatched or periodic one
+    fn parent(&self) -> &str {
+        let parent = self.job.as_ref().map_or("", |j| j.parent.as_str());
+        if parent.is_empty() { &self.job_id } else { parent }
+    }
+
     /// Whose share of pattern slots and time the allocation uses: its job, or
     /// the parent of a dispatched or periodic one (each child has its own ID)
     fn owner(&self) -> String {
-        let parent = self.job.as_ref().map_or("", |j| j.parent.as_str());
-        format!("{}/{}", self.namespace, if parent.is_empty() { &self.job_id } else { parent })
+        format!("{}/{}", self.namespace, self.parent())
     }
 
     /// Each task's log patterns: its `atalaya.log_regex`, or its group's, or
@@ -309,8 +326,31 @@ fn pattern(compiled: &mut Patterns, src: &str, job: &str) -> std::result::Result
     Ok(re)
 }
 
+/// A file or directory name taken from Nomad that goes into a path: letters,
+/// digits, `-`, `_` and `.`, not starting with a dot (so never `..`)
+fn path_part(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('.') && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The token file a `metrics_token=<name>` tag asks for:
+/// `<tokens>/<namespace>/<job>/<name>`, with the namespace and job of the
+/// allocation (the parent job for a dispatched or periodic one), never of the
+/// registration. A job can only have the collector send a token left for that
+/// same job, and only to an address of its own allocation.
+fn token_path(name: &str, alloc: &AllocInfo, tokens: Option<&Path>) -> std::result::Result<PathBuf, String> {
+    let Some(dir) = tokens else {
+        return Err("it asks for a metrics_token and nomad.scrape_tokens is not set".to_owned());
+    };
+    for (what, part) in [("metrics_token", name), ("namespace", &alloc.namespace), ("job", &alloc.parent)] {
+        if !path_part(part) {
+            return Err(format!("{what} {part:?} is not a valid file name"));
+        }
+    }
+    Ok(dir.join(&alloc.namespace).join(&alloc.parent).join(name))
+}
+
 /// The target a registration describes, if it points at its own allocation
-fn target(r: Registration, reach: &Reach) -> std::result::Result<Target, String> {
+fn target(r: Registration, alloc: &AllocInfo, tokens: Option<&Path>) -> std::result::Result<Target, String> {
     let path = r.tags.iter().find_map(|t| t.strip_prefix("metrics_path=")).unwrap_or("/metrics");
     // A path, never an authority: `@host/` after the port would make the
     // address a user name and send the scrape to `host`
@@ -318,14 +358,19 @@ fn target(r: Registration, reach: &Reach) -> std::result::Result<Target, String>
         return Err(format!("metrics_path {path:?} does not start with /"));
     }
     let ip: IpAddr = r.address.parse().map_err(|_| format!("address {:?} is not an IP", r.address))?;
-    if !reach.allows(ip, r.port) {
+    if !alloc.reach.allows(ip, r.port) {
         return Err(format!("{} is not an address of its allocation", SocketAddr::new(ip, r.port)));
     }
+    let token = match r.tags.iter().find_map(|t| t.strip_prefix("metrics_token=")) {
+        Some(name) => Some(token_path(name, alloc, tokens)?),
+        None => None,
+    };
     Ok(Target {
         job: r.job_id,
         service: r.service,
         url: format!("http://{}{path}", SocketAddr::new(ip, r.port)),
         alloc: r.alloc_id,
+        token,
     })
 }
 
@@ -337,6 +382,8 @@ pub struct Nomad {
     http: reqwest::Client,
     addr: String,
     node_id: String,
+    /// Where the tokens of `metrics_token=` tags are (nomad.scrape_tokens)
+    tokens: Option<PathBuf>,
     allocs: Mutex<Cache>,
     /// Warnings already logged (registrations not scraped, log patterns left
     /// out): once each
@@ -379,34 +426,52 @@ impl Nomad {
             http: b.build()?,
             addr: addr.trim_end_matches('/').to_owned(),
             node_id,
+            tokens: None,
             allocs: Mutex::new(HashMap::new()),
             warned: Mutex::new(HashSet::new()),
             patterns: Mutex::new(HashMap::new()),
         })
     }
 
-    async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let r = self.http.get(format!("{}{path}", self.addr)).send().await?.error_for_status()?;
+    /// The directory of the tokens that `metrics_token=` tags name
+    pub fn with_scrape_tokens(mut self, dir: Option<PathBuf>) -> Self {
+        self.tokens = dir;
+        self
+    }
+
+    async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str, query: &[(&str, &str)]) -> Result<T> {
+        let r = self.http.get(format!("{}{path}", self.addr)).query(query).send().await?.error_for_status()?;
         Ok(r.json().await?)
     }
 
-    /// This node's services tagged `metrics=true`, at an address of their own
-    /// allocation. The path can be changed with the tag `metrics_path=/other`.
+    /// This node's services tagged `metrics=true`, in every namespace the
+    /// token can read, at an address of their own allocation. The path can be
+    /// changed with the tag `metrics_path=/other`, and `metrics_token=<name>`
+    /// sends a bearer token (see `token_path`).
     pub async fn targets(&self) -> Result<Vec<Target>> {
-        let lists: Vec<ServiceList> = self.get("/v1/services").await?;
+        // `*`: every namespace the token may read (each one needs read-job),
+        // one list per namespace. Without it, only `default`.
+        let lists: Vec<ServiceList> = self.get("/v1/services", &[("namespace", "*")]).await?;
         let mut out = Vec::new();
         // Collect the names first: an iterator with closures alive across awaits
         // makes the future non-Send for tokio::spawn.
-        let names: Vec<String> = lists.into_iter().flat_map(|l| l.services).map(|s| s.name).collect();
-        for name in names {
-            let regs: Vec<Registration> = self.get(&format!("/v1/service/{name}")).await?;
+        let names: Vec<(String, String)> = lists
+            .into_iter()
+            .flat_map(|l| {
+                let ns = l.namespace;
+                l.services.into_iter().map(move |s| (ns.clone(), s.name))
+            })
+            .collect();
+        for (ns, name) in names {
+            // A service is looked up in its namespace: by default, `default`
+            let regs: Vec<Registration> = self.get(&format!("/v1/service/{name}"), &[("namespace", &ns)]).await?;
             for r in regs {
                 if r.node_id != self.node_id || !r.tags.iter().any(|t| t == "metrics=true") {
                     continue;
                 }
                 let key = format!("{}/{}", r.alloc_id, r.service);
                 let found = match self.alloc(&r.alloc_id).await {
-                    Some(info) => target(r, &info.reach),
+                    Some(info) => target(r, &info, self.tokens.as_deref()),
                     None => Err("its allocation could not be read".to_owned()),
                 };
                 match found {
@@ -441,7 +506,8 @@ impl Nomad {
             *used = now;
             return Some(a.clone());
         }
-        let a: Allocation = self.get(&format!("/v1/allocation/{id}")).await.ok()?;
+        // By ID in any namespace: Nomad checks read-job on the allocation's own
+        let a: Allocation = self.get(&format!("/v1/allocation/{id}"), &[]).await.ok()?;
         let index = a.name.rsplit_once('[').and_then(|(_, i)| i.strip_suffix(']')).unwrap_or("0").to_owned();
         let reach = a.reach();
         let (log_regex, skipped) = a.log_regex(&mut self.patterns.lock().unwrap());
@@ -456,8 +522,10 @@ impl Nomad {
         };
         let log_regex = Arc::new(log_regex);
         let owner = a.owner();
+        let parent = a.parent().to_owned();
         let info = AllocInfo {
             job: a.job_id,
+            parent,
             group: a.task_group,
             namespace: a.namespace,
             index,
@@ -483,11 +551,17 @@ mod tests {
     fn info(job: &str) -> AllocInfo {
         AllocInfo {
             job: job.into(),
+            parent: job.into(),
             group: "g".into(),
             namespace: "default".into(),
             index: "0".into(),
             ..Default::default()
         }
+    }
+
+    /// An allocation of `job` (namespace `default`) that answers at `reach`
+    fn reached(reach: Reach) -> AllocInfo {
+        AllocInfo { reach, ..info("job") }
     }
 
     fn registration(address: &str, port: u16, tags: &[&str]) -> Registration {
@@ -519,28 +593,133 @@ mod tests {
                     "Ports":[{"Label":"metrics","Value":9100,"To":0,"HostIP":"192.168.0.203"}]}}}"#,
         )
         .unwrap();
-        let (cni, host) = (cni.reach(), host.reach());
+        let (cni, host) = (reached(cni.reach()), reached(host.reach()));
 
-        let t = target(registration("10.10.100.2", 8090, &["metrics=true"]), &cni).unwrap();
+        let t = target(registration("10.10.100.2", 8090, &["metrics=true"]), &cni, None).unwrap();
         assert_eq!(t.url, "http://10.10.100.2:8090/metrics", "any port of its own address");
-        let t = target(registration("192.168.0.203", 9100, &["metrics=true", "metrics_path=/m"]), &host).unwrap();
+        let t = target(registration("192.168.0.203", 9100, &["metrics=true", "metrics_path=/m"]), &host, None).unwrap();
         assert_eq!(t.url, "http://192.168.0.203:9100/m");
 
         // Somewhere else: another host, the host itself on a port it was not
         // given, or the node's address for a CNI allocation
         for (addr, port, reach) in [("169.254.169.254", 80, &cni), ("192.168.0.203", 4646, &host), ("192.168.0.201", 8090, &cni)] {
-            assert!(target(registration(addr, port, &[]), reach).is_err(), "{addr}:{port}");
+            assert!(target(registration(addr, port, &[]), reach, None).is_err(), "{addr}:{port}");
         }
         // A metrics_path that would move the scrape to another host, or a name for an address
-        let err = target(registration("10.10.100.2", 8090, &["metrics_path=@evil.example/x"]), &cni).unwrap_err();
+        let err = target(registration("10.10.100.2", 8090, &["metrics_path=@evil.example/x"]), &cni, None).unwrap_err();
         assert!(err.contains("metrics_path"), "{err}");
-        assert!(target(registration("localhost", 8090, &[]), &cni).is_err());
+        assert!(target(registration("localhost", 8090, &[]), &cni, None).is_err());
         // IPv6 gets its brackets
-        let v6 = Reach {
+        let v6 = reached(Reach {
             own: Some("fd00::2".parse().unwrap()),
             ports: Vec::new(),
+        });
+        assert_eq!(
+            target(registration("fd00::2", 9100, &[]), &v6, None).unwrap().url,
+            "http://[fd00::2]:9100/metrics"
+        );
+    }
+
+    #[test]
+    fn a_scrape_token_is_the_one_left_for_its_own_job() {
+        let tokens = Path::new("/secrets/scrape");
+        let own = || Reach {
+            own: Some("10.10.100.2".parse().unwrap()),
+            ports: Vec::new(),
         };
-        assert_eq!(target(registration("fd00::2", 9100, &[]), &v6).unwrap().url, "http://[fd00::2]:9100/metrics");
+        // A dispatched child of `scan` in namespace `scans`; the registration
+        // says another job, but the path follows the allocation
+        let alloc = AllocInfo {
+            job: "scan/dispatch-1".into(),
+            parent: "scan".into(),
+            namespace: "scans".into(),
+            reach: own(),
+            ..Default::default()
+        };
+        let tagged = |tags: &[&str]| registration("10.10.100.2", 8090, tags);
+        let t = target(tagged(&["metrics=true", "metrics_token=metrics"]), &alloc, Some(tokens)).unwrap();
+        assert_eq!(t.token.as_deref(), Some(Path::new("/secrets/scrape/scans/scan/metrics")));
+        assert!(
+            target(tagged(&["metrics=true"]), &alloc, Some(tokens)).unwrap().token.is_none(),
+            "only when asked for"
+        );
+
+        // A name that would leave its job's directory, or no directory at all
+        for name in ["../../default/other/metrics", "..", ".hidden", "a/b", ""] {
+            let err = target(tagged(&[&format!("metrics_token={name}")]), &alloc, Some(tokens)).unwrap_err();
+            assert!(err.contains("metrics_token"), "{name}: {err}");
+        }
+        let err = target(tagged(&["metrics_token=metrics"]), &alloc, None).unwrap_err();
+        assert!(err.contains("scrape_tokens"), "{err}");
+        // Nor a job or namespace that is not a plain name
+        let odd = AllocInfo {
+            parent: "..".into(),
+            ..alloc.clone()
+        };
+        assert!(target(tagged(&["metrics_token=metrics"]), &odd, Some(tokens)).unwrap_err().contains("job"));
+    }
+
+    #[tokio::test]
+    async fn services_are_discovered_in_every_namespace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A Nomad API that only answers the namespaced lookups: the list of
+        // every namespace, and each service in its own
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let (status, body) = match path.as_str() {
+                    "/v1/services?namespace=*" => (
+                        200,
+                        r#"[{"Namespace":"default","Services":[{"ServiceName":"web","Tags":["metrics=true"]}]},
+                            {"Namespace":"scans","Services":[{"ServiceName":"scan","Tags":["metrics=true"]}]}]"#,
+                    ),
+                    "/v1/service/web?namespace=default" => (
+                        200,
+                        r#"[{"NodeID":"n","Address":"10.10.100.2","Port":8090,"Tags":["metrics=true"],"JobID":"web","AllocID":"a-web","ServiceName":"web","Namespace":"default"}]"#,
+                    ),
+                    "/v1/service/scan?namespace=scans" => (
+                        200,
+                        r#"[{"NodeID":"n","Address":"10.10.100.3","Port":17900,"Tags":["metrics=true","metrics_token=metrics"],"JobID":"scan","AllocID":"a-scan","ServiceName":"scan","Namespace":"scans"},
+                            {"NodeID":"other","Address":"10.10.100.9","Port":17900,"Tags":["metrics=true"],"JobID":"scan","AllocID":"a-far","ServiceName":"scan","Namespace":"scans"}]"#,
+                    ),
+                    "/v1/allocation/a-web" => (
+                        200,
+                        r#"{"JobID":"web","TaskGroup":"web","Namespace":"default","Name":"web.web[0]","ClientStatus":"running","NetworkStatus":{"Address":"10.10.100.2"}}"#,
+                    ),
+                    "/v1/allocation/a-scan" => (
+                        200,
+                        r#"{"JobID":"scan","TaskGroup":"scan","Namespace":"scans","Name":"scan.scan[0]","ClientStatus":"running","NetworkStatus":{"Address":"10.10.100.3"}}"#,
+                    ),
+                    _ => (404, "not found"),
+                };
+                let head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body.as_bytes()).await;
+            }
+        });
+        let nomad = Nomad::new(format!("http://{addr}"), "n".into(), None, None)
+            .unwrap()
+            .with_scrape_tokens(Some("/secrets/scrape".into()));
+        let mut got: Vec<(String, String, Option<PathBuf>)> = nomad.targets().await.unwrap().into_iter().map(|t| (t.job, t.url, t.token)).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (
+                    "scan".into(),
+                    "http://10.10.100.3:17900/metrics".into(),
+                    Some("/secrets/scrape/scans/scan/metrics".into())
+                ),
+                ("web".into(), "http://10.10.100.2:8090/metrics".into(), None),
+            ],
+            "both namespaces, only this node's registrations"
+        );
+        assert_eq!(nomad.alloc("a-scan").await.unwrap().namespace, "scans");
     }
 
     #[tokio::test]
