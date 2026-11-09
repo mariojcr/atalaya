@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
         nomad: cfg
             .nomad
             .as_ref()
-            .map(|n| Nomad::new(n.addr.clone(), n.node_id.clone(), ca.clone(), token.as_deref()))
+            .map(|n| Nomad::new(n.addr.clone(), n.node_id.clone(), ca.clone(), token.as_deref()).map(|c| c.with_scrape_tokens(n.scrape_tokens.clone())))
             .transpose()?,
         http: collector::scrape_client(ca.as_ref())?,
         rules: Mutex::new(Rules::new(&cfg.rules)?),
