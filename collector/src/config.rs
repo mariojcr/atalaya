@@ -144,6 +144,11 @@ impl Default for ScrapeConfig {
 pub(crate) struct StaticTarget {
     pub(crate) service: String,
     pub(crate) url: String,
+    /// Bearer token its scrape sends, read on every scrape like the Nomad
+    /// ones (nomad.scrape_tokens): a target that asks for one that cannot be
+    /// read fails, unsent
+    #[serde(default)]
+    pub(crate) token_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +273,15 @@ mod tests {
         assert!(cfg.nomad.is_none());
         assert!(cfg.logs.docker_dir.is_some());
         assert_eq!(cfg.scrape.static_targets.len(), 1);
+    }
+
+    #[test]
+    fn a_static_target_may_name_its_token_file() {
+        let yaml = "node: h\nstate_dir: /s\nclickhouse: { url: 'http://c:8123/', user: u }\nscrape:\n  static_targets:\n    - { service: plane, url: 'http://127.0.0.1:8080/metrics', token_file: /run/atalaya/plane-token }\n    - { service: web, url: 'http://127.0.0.1:9000/metrics' }\n";
+        let cfg: Config = serde_saphyr::from_str(yaml).unwrap();
+        let t = &cfg.scrape.static_targets;
+        assert_eq!(t[0].token_file.as_deref(), Some(std::path::Path::new("/run/atalaya/plane-token")));
+        assert!(t[1].token_file.is_none());
     }
 
     #[test]
