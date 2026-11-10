@@ -50,9 +50,15 @@ Queries read the coarsest tier that keeps the step's resolution (see
 approximation, not sample-exact Prometheus:
 
 - A bucket keeps min, max, sum, count and the time of its last sample. A gauge
-  reads as the bucket mean and a counter as its maximum; `max_over_time` over a
-  tier therefore sees bucket values, not every raw sample, so short peaks can
-  flatten in gauges.
+  reads as the bucket mean; `max_over_time` over a tier therefore sees bucket
+  values, not every raw sample, so short peaks can flatten in gauges.
+- A counter bucket reads as two samples: its minimum just after the bucket
+  starts and its maximum at its last sample. `increase` and `rate` over a window
+  aligned with the buckets (an hourly bar) then measure from the window's start,
+  and count a new series from its first bucket; functions that count samples
+  (`changes`, `count_over_time`) see two per counter bucket.
+- A query reads the buckets that start before its end, so the last step does not
+  count data from after it.
 - Short windows are widened to two buckets so that `rate(x[1m])` on a 10-minute
   tier still returns something.
 - Counter resets inside a bucket are detected from the bucket's minimum.

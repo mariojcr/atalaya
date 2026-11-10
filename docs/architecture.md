@@ -111,9 +111,10 @@ flowchart TD
     B -->|no| R[("raw points")]
 ```
 
-A bucket reads as its mean for gauges and its maximum for counters, stamped
-with the time of its last sample, so `rate()` and counter resets behave across
-tiers; min and max keep peaks visible after downsampling. See [querying](querying.md) for what this means for results.
+A bucket reads as its mean for gauges, stamped with the time of its last
+sample. A counter bucket reads as two samples, its minimum at the bucket's start
+and its maximum at its last sample, so `rate()`, `increase()` and counter resets
+behave across tiers; min and max keep peaks visible after downsampling. See [querying](querying.md) for what this means for results.
 
 ## Alerts
 

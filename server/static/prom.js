@@ -40,9 +40,8 @@ const parseRange = (j, step) => {
   return { series: result.map((r) => ({ labels: r.metric || {}, points: r.values.map(([t, v]) => [t, promValue(v)]) })), meta: { step, ...(j.atalaya || {}) } };
 };
 // Like Grafana, align the bounds to the step: the last evaluated point then falls
-// exactly on `end` and the aggregation bucket in progress (its sample sits at the end
-// of the window) is part of the last evaluation; otherwise a brand-new series with a
-// single bucket would not show up until the next one.
+// exactly on `end`. The server does not read an aggregation bucket that starts at
+// `end`, so the last bar ends with its window.
 function alignRange(start, end, step) {
   const s = Math.max(1, Math.round(step));
   return { start: Math.floor(start / s) * s, end: Math.floor(end / s) * s };
