@@ -147,6 +147,22 @@ type Wanted = (String, Kind, Option<Field>);
 /// Distribution row: time, count, sum and buckets
 type DistRow = (i64, f64, f64, Vec<f64>);
 
+/// Scalar row: a raw sample, or in the aggregated tiers a bucket (or a group of
+/// buckets with long steps)
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScalarRow {
+    /// Time of its last sample
+    t: i64,
+    /// Mean (gauges)
+    g: f64,
+    /// Maximum (counters)
+    c: f64,
+    /// Minimum of its last bucket
+    mn: f64,
+    /// Start and minimum of its first bucket; a raw sample is its own (t, value)
+    first: (i64, f64),
+}
+
 pub struct Store {
     ch: ClickHouse,
     db: String,
@@ -516,8 +532,9 @@ impl Store {
     }
 
     /// Samples of the series in (from, to]. In aggregated tiers each bucket
-    /// yields one sample at the time of its last sample: the maximum for
-    /// counters and the mean otherwise. With `group` (seconds, a multiple of
+    /// yields a sample at the time of its last sample: the mean for gauges and
+    /// the maximum for counters, which also get one at the bucket's start with
+    /// its minimum (see `counter_samples`). With `group` (seconds, a multiple of
     /// the tier resolution) ClickHouse keeps the last sample of each group, like
     /// Cloud Monitoring alignment: a year at 10 minutes is not transferred in
     /// full when the chart has one point every half day.
@@ -535,67 +552,18 @@ impl Store {
         let has_scalar = series.iter().any(|s| s.kind != Kind::Distribution);
         let db = &self.db;
         let res = tier.res();
-        let sfx = tier.suffix();
         let params: Vec<Param> = vec![
             ("metrics".into(), crate::ch::array_param(&metrics)),
             ("ids".into(), serde_json::to_string(&ids)?),
             ("from".into(), (from - if tier == Tier::Raw { 0 } else { res }).to_string()),
             ("to".into(), to.to_string()),
         ];
-        let filter = "Metric IN {metrics:Array(String)} AND SeriesId IN {ids:Array(UInt64)}
-                      AND Time > toDateTime({from:Int64}) AND Time <= toDateTime({to:Int64})";
+        let (scalar_sql, dist_sql) = sample_queries(db, tier, group);
 
-        // id → (t, gauge value, counter value, bucket minimum)
-        let mut scalar: HashMap<u64, Vec<(i64, f64, f64, f64)>> = HashMap::new();
+        // id → its rows
+        let mut scalar: HashMap<u64, Vec<ScalarRow>> = HashMap::new();
         // id → (t, count, sum, buckets)
         let mut dist: HashMap<u64, Vec<DistRow>> = HashMap::new();
-
-        // One row per sample: (SeriesId, t, gauge value, counter value, bucket minimum)
-        let scalar_rows = if tier == Tier::Raw {
-            format!("SELECT SeriesId, toUnixTimestamp(Time) AS t, Value AS g, Value AS c, Value AS mn FROM {db}.points WHERE {filter}")
-        } else {
-            // GROUP BY on the sort key prefix (Metric, SeriesId, Time): ClickHouse
-            // aggregates in streaming, without a hash table for the whole range
-            format!(
-                // The current bucket can have a LastTime past the end of the window
-                // (the collector lags behind nowDelay): clamp it to `to`, or the only
-                // bucket of a new series would be "in the future" and nothing would show
-                "SELECT SeriesId, toUnixTimestamp(least(max(LastTime), toDateTime({{to:Int64}}))) AS t, sum(Sum) / sum(Count) AS g, max(Max) AS c, min(Min) AS mn
-                 FROM {db}.points{sfx} WHERE {filter} GROUP BY Metric, SeriesId, Time"
-            )
-        };
-        // (SeriesId, t, count, sum, buckets)
-        let dist_rows = if tier == Tier::Raw {
-            format!("SELECT SeriesId, toUnixTimestamp(Time) AS t, Count AS n, Sum AS s, Buckets AS b FROM {db}.dist_points WHERE {filter}")
-        } else {
-            format!(
-                "SELECT SeriesId, t, l.1 AS n, l.2 AS s, l.3 AS b FROM (
-                   SELECT SeriesId, Time, least(toUnixTimestamp(Time) + {res}, {{to:Int64}}) AS t, argMaxMerge(Last) AS l FROM {db}.dist_points{sfx}
-                   WHERE {filter} GROUP BY Metric, SeriesId, Time)"
-            )
-        };
-        // RowBinary with fixed types (UInt64, Int64, Float64, Array(UInt64)):
-        // parsing text for hundreds of thousands of rows cost more than the
-        // query itself
-        let (scalar_sql, dist_sql) = if group > res {
-            (
-                format!(
-                    "SELECT toUInt64(SeriesId), toInt64(max(t)) AS tt, toFloat64(argMax(g, t)), toFloat64(argMax(c, t)), toFloat64(argMax(mn, t)) FROM ({scalar_rows})
-                     GROUP BY SeriesId, intDiv(t, {group}) ORDER BY SeriesId, tt FORMAT RowBinary"
-                ),
-                format!(
-                    "SELECT toUInt64(SeriesId), toInt64(max(t)) AS tt, toUInt64(argMax(n, t)), toFloat64(argMax(s, t)), argMax(b, t) FROM ({dist_rows})
-                     GROUP BY SeriesId, intDiv(t, {group}) ORDER BY SeriesId, tt FORMAT RowBinary"
-                ),
-            )
-        } else {
-            (
-                format!(
-                    "SELECT toUInt64(SeriesId), toInt64(t), toFloat64(g), toFloat64(c), toFloat64(mn) FROM ({scalar_rows}) ORDER BY SeriesId, t FORMAT RowBinary"
-                ),
-                format!("SELECT toUInt64(SeriesId), toInt64(t), toUInt64(n), toFloat64(s), b FROM ({dist_rows}) ORDER BY SeriesId, t FORMAT RowBinary"),
-            )
-        };
         let settings: &[(&str, &str)] = &[("optimize_aggregation_in_order", "1"), ("max_threads", "8")];
         let stale_sql = format!(
             "SELECT toUInt64(SeriesId), toInt64(toUnixTimestamp(Time)) AS t FROM {db}.stale
@@ -637,16 +605,7 @@ impl Store {
             Err(_) => {}
         }
         if let Some(body) = a? {
-            let mut r = Cursor::new(&body);
-            while let (Some(id), Some(t), Some(g), Some(c), Some(mn)) = (r.u64(), r.i64(), r.f64(), r.f64(), r.f64()) {
-                let v = scalar.entry(id).or_default();
-                // Duplicate points (e.g. an overlapping import): keep the first
-                if v.last().is_some_and(|p| p.0 == t) {
-                    continue;
-                }
-                v.push((t, g, c, mn));
-            }
-            r.finish("points")?;
+            scalar = read_scalar_rows(&body, tier, group > res)?;
         }
         if let Some(body) = b? {
             let mut r = Cursor::new(&body);
@@ -670,12 +629,12 @@ impl Store {
                 };
                 match s.field {
                     Field::Value => {
-                        let pts = scalar.get(&s.id).map(Vec::as_slice).unwrap_or_default();
-                        out.ts.extend(pts.iter().map(|p| p.0));
+                        let rows = scalar.get(&s.id).map(Vec::as_slice).unwrap_or_default();
                         if s.kind == Kind::Counter {
-                            out.vals = counter_levels(pts, group.max(res));
+                            (out.ts, out.vals) = counter_samples(rows, group.max(res));
                         } else {
-                            out.vals.extend(pts.iter().map(|p| p.1));
+                            out.ts.extend(rows.iter().map(|p| p.t));
+                            out.vals.extend(rows.iter().map(|p| p.g));
                         }
                     }
                     f => {
@@ -749,24 +708,146 @@ impl Store {
     }
 }
 
-/// Counter level for each bucket. The level is the bucket maximum at the time
-/// of its last sample, but if the counter reset inside the bucket (its minimum
-/// drops below the previous bucket's maximum while its maximum continues it)
-/// that maximum predates the reset and the rate spikes: the real level at that
-/// time is, give or take one sample, the first value of the next bucket (if
-/// contiguous; otherwise this bucket's first value).
-fn counter_levels(pts: &[(i64, f64, f64, f64)], span: i64) -> Vec<f64> {
-    let mut out: Vec<f64> = pts.iter().map(|p| p.2).collect();
-    for i in 1..pts.len() {
-        let (prev, cur) = (&pts[i - 1], &pts[i]);
-        if cur.3 < prev.2 && cur.2 >= prev.2 {
-            out[i] = match pts.get(i + 1) {
-                Some(next) if next.0 - cur.0 <= 2 * span => next.3,
-                _ => cur.3,
+/// Queries for the samples: scalar rows of (SeriesId, t, gauge value, counter
+/// value, minimum of its last bucket) and distribution rows of (SeriesId, t,
+/// count, sum, buckets). With `group` above the tier resolution a row is a group
+/// of buckets, and scalar rows add their first bucket: the time of its last
+/// sample and its minimum.
+fn sample_queries(db: &str, tier: Tier, group: i64) -> (String, String) {
+    let res = tier.res();
+    let sfx = tier.suffix();
+    // A raw point is a sample at its Time, but an aggregated row is a bucket that
+    // starts at its Time: the one starting at `to` holds nothing from before it (a
+    // sample exactly at `to` at most), and reading it put up to a whole bucket
+    // from after the window into the last step (an hourly bar on the 10-minute
+    // tier also counted the next 10 minutes)
+    let upper = if tier == Tier::Raw { "<=" } else { "<" };
+    let filter = format!(
+        "Metric IN {{metrics:Array(String)}} AND SeriesId IN {{ids:Array(UInt64)}}
+                      AND Time > toDateTime({{from:Int64}}) AND Time {upper} toDateTime({{to:Int64}})"
+    );
+
+    // One row per sample: (SeriesId, t, gauge value, counter value, bucket minimum)
+    let scalar_rows = if tier == Tier::Raw {
+        format!("SELECT SeriesId, toUnixTimestamp(Time) AS t, Value AS g, Value AS c, Value AS mn FROM {db}.points WHERE {filter}")
+    } else {
+        // GROUP BY on the sort key prefix (Metric, SeriesId, Time): ClickHouse
+        // aggregates in streaming, without a hash table for the whole range
+        format!(
+            // The bucket that holds `to` can have a LastTime past it (the bucket in
+            // progress, with data newer than nowDelay): clamp it to `to`, or the only
+            // bucket of a new series would be "in the future" and nothing would show
+            "SELECT SeriesId, toUnixTimestamp(least(max(LastTime), toDateTime({{to:Int64}}))) AS t, sum(Sum) / sum(Count) AS g, max(Max) AS c, min(Min) AS mn
+             FROM {db}.points{sfx} WHERE {filter} GROUP BY Metric, SeriesId, Time"
+        )
+    };
+    // (SeriesId, t, count, sum, buckets)
+    let dist_rows = if tier == Tier::Raw {
+        format!("SELECT SeriesId, toUnixTimestamp(Time) AS t, Count AS n, Sum AS s, Buckets AS b FROM {db}.dist_points WHERE {filter}")
+    } else {
+        format!(
+            "SELECT SeriesId, t, l.1 AS n, l.2 AS s, l.3 AS b FROM (
+               SELECT SeriesId, Time, least(toUnixTimestamp(Time) + {res}, {{to:Int64}}) AS t, argMaxMerge(Last) AS l FROM {db}.dist_points{sfx}
+               WHERE {filter} GROUP BY Metric, SeriesId, Time)"
+        )
+    };
+    // RowBinary with fixed types (UInt64, Int64, Float64, Array(UInt64)):
+    // parsing text for hundreds of thousands of rows cost more than the
+    // query itself
+    if group > res {
+        (
+            format!(
+                "SELECT toUInt64(SeriesId), toInt64(max(t)) AS tt, toFloat64(argMax(g, t)), toFloat64(argMax(c, t)), toFloat64(argMax(mn, t)),
+                        toInt64(min(t)), toFloat64(argMin(mn, t)) FROM ({scalar_rows})
+                 GROUP BY SeriesId, intDiv(t, {group}) ORDER BY SeriesId, tt FORMAT RowBinary"
+            ),
+            format!(
+                "SELECT toUInt64(SeriesId), toInt64(max(t)) AS tt, toUInt64(argMax(n, t)), toFloat64(argMax(s, t)), argMax(b, t) FROM ({dist_rows})
+                 GROUP BY SeriesId, intDiv(t, {group}) ORDER BY SeriesId, tt FORMAT RowBinary"
+            ),
+        )
+    } else {
+        (
+            format!(
+                "SELECT toUInt64(SeriesId), toInt64(t), toFloat64(g), toFloat64(c), toFloat64(mn) FROM ({scalar_rows}) ORDER BY SeriesId, t FORMAT RowBinary"
+            ),
+            format!("SELECT toUInt64(SeriesId), toInt64(t), toUInt64(n), toFloat64(s), b FROM ({dist_rows}) ORDER BY SeriesId, t FORMAT RowBinary"),
+        )
+    }
+}
+
+/// Scalar rows of `sample_queries` per series
+fn read_scalar_rows(body: &[u8], tier: Tier, grouped: bool) -> Result<HashMap<u64, Vec<ScalarRow>>> {
+    let res = tier.res();
+    let mut out: HashMap<u64, Vec<ScalarRow>> = HashMap::new();
+    let mut r = Cursor::new(body);
+    loop {
+        let at = r.i;
+        let row = (r.u64(), r.i64(), r.f64(), r.f64(), r.f64());
+        // An ungrouped row is its own first bucket
+        let first = if grouped { (r.i64(), r.f64()) } else { (row.1, row.4) };
+        let ((Some(id), Some(t), Some(g), Some(c), Some(mn)), (Some(first_t), Some(first_min))) = (row, first) else {
+            // A row cut short stays unread, for finish() to report it
+            r.i = at;
+            break;
+        };
+        // Buckets start on multiples of the resolution (toStartOfMinute and
+        // toStartOfInterval count from the epoch), and the time of a bucket's last
+        // sample, clamped to `to` or not, falls inside it
+        let start = if tier == Tier::Raw { first_t } else { first_t - first_t.rem_euclid(res) };
+        let v = out.entry(id).or_default();
+        // Duplicate points (e.g. an overlapping import): keep the first
+        if v.last().is_some_and(|p| p.t == t) {
+            continue;
+        }
+        v.push(ScalarRow {
+            t,
+            g,
+            c,
+            mn,
+            first: (start, first_min),
+        });
+    }
+    r.finish("points")?;
+    Ok(out)
+}
+
+/// Samples of a counter series. A row's level is its maximum at the time of its
+/// last sample, but if the counter reset inside it (its minimum drops below the
+/// previous row's maximum while its maximum continues it) that maximum predates
+/// the reset and the rate spikes: the real level at that time is, give or take
+/// one sample, the first value of the next row (if contiguous; otherwise this
+/// row's first value).
+///
+/// In the aggregated tiers a row also starts with its first bucket's minimum (the
+/// counter's value at its first sample), one second after that bucket starts:
+/// windows are open at their start, so a bucket aligned with a step would
+/// otherwise start in the window before. With only each row's end, a window
+/// (t - range, t] began at the end of its first row and only extrapolated what
+/// the counter gained before (half the window with hourly steps on the
+/// 10-minute tier, where a row is half an hour), and a new series' first row
+/// was its baseline: what it counted in its first bucket was lost.
+fn counter_samples(rows: &[ScalarRow], span: i64) -> (Vec<i64>, Vec<f64>) {
+    let mut ts = Vec::with_capacity(2 * rows.len());
+    let mut vals = Vec::with_capacity(2 * rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        // A raw sample is its own first bucket and adds nothing
+        let (start, first) = (row.first.0 + 1, row.first.1);
+        if start < row.t && ts.last().is_none_or(|&p| p < start) {
+            ts.push(start);
+            vals.push(first);
+        }
+        let mut level = row.c;
+        if i > 0 && row.mn < rows[i - 1].c && row.c >= rows[i - 1].c {
+            level = match rows.get(i + 1) {
+                Some(next) if next.t - row.t <= 2 * span => next.mn,
+                _ => row.mn,
             };
         }
+        ts.push(row.t);
+        vals.push(level);
     }
-    out
+    (ts, vals)
 }
 
 #[cfg(test)]
@@ -822,32 +903,227 @@ mod label_tests {
 
 #[cfg(test)]
 mod counter_tests {
-    use super::counter_levels;
+    use super::*;
+
+    /// A row that is a single sample (its first bucket starts where it ends): it
+    /// yields only its level
+    fn end_only(t: i64, max: f64, min: f64) -> ScalarRow {
+        ScalarRow {
+            t,
+            g: 0.0,
+            c: max,
+            mn: min,
+            first: (t, min),
+        }
+    }
+
+    fn levels(rows: &[ScalarRow]) -> Vec<f64> {
+        let (ts, vals) = counter_samples(rows, 600);
+        assert_eq!(ts, rows.iter().map(|r| r.t).collect::<Vec<_>>());
+        vals
+    }
 
     #[test]
     fn reset_inside_bucket_uses_next_minimum() {
-        // (t, g, max, min): reset inside bucket 1200 (min 37, stale max 7000)
-        let pts = [
-            (600, 0.0, 6500.0, 6000.0),
-            (1200, 0.0, 7000.0, 37.0),
-            (1800, 0.0, 1012.0, 442.0),
-            (2400, 0.0, 1591.0, 1022.0),
+        // Reset inside bucket 1200 (min 37, stale max 7000)
+        let rows = [
+            end_only(600, 6500.0, 6000.0),
+            end_only(1200, 7000.0, 37.0),
+            end_only(1800, 1012.0, 442.0),
+            end_only(2400, 1591.0, 1022.0),
         ];
-        assert_eq!(counter_levels(&pts, 600), vec![6500.0, 442.0, 1012.0, 1591.0]);
+        assert_eq!(levels(&rows), vec![6500.0, 442.0, 1012.0, 1591.0]);
     }
 
     #[test]
     fn reset_between_buckets_is_untouched() {
-        let pts = [(600, 0.0, 7000.0, 6500.0), (1200, 0.0, 85.0, 37.0), (1800, 0.0, 600.0, 95.0)];
-        assert_eq!(counter_levels(&pts, 600), vec![7000.0, 85.0, 600.0]);
+        let rows = [end_only(600, 7000.0, 6500.0), end_only(1200, 85.0, 37.0), end_only(1800, 600.0, 95.0)];
+        assert_eq!(levels(&rows), vec![7000.0, 85.0, 600.0]);
     }
 
     #[test]
     fn reset_inside_last_bucket_or_before_a_gap_uses_own_minimum() {
-        let pts = [(600, 0.0, 6500.0, 6000.0), (1200, 0.0, 7000.0, 37.0), (6000, 0.0, 5000.0, 4400.0)];
-        assert_eq!(counter_levels(&pts, 600), vec![6500.0, 37.0, 5000.0]);
-        let pts = [(600, 0.0, 6500.0, 6000.0), (1200, 0.0, 7000.0, 37.0)];
-        assert_eq!(counter_levels(&pts, 600), vec![6500.0, 37.0]);
+        let rows = [end_only(600, 6500.0, 6000.0), end_only(1200, 7000.0, 37.0), end_only(6000, 5000.0, 4400.0)];
+        assert_eq!(levels(&rows), vec![6500.0, 37.0, 5000.0]);
+        let rows = [end_only(600, 6500.0, 6000.0), end_only(1200, 7000.0, 37.0)];
+        assert_eq!(levels(&rows), vec![6500.0, 37.0]);
+    }
+
+    #[test]
+    fn an_aggregated_row_starts_with_its_first_minimum_and_a_raw_sample_does_not() {
+        // A new series: its first bucket starts at 1800, its first sample was 0.05
+        let rows = [
+            ScalarRow {
+                t: 2395,
+                g: 0.0,
+                c: 0.6,
+                mn: 0.05,
+                first: (1800, 0.05),
+            },
+            ScalarRow {
+                t: 2995,
+                g: 0.0,
+                c: 1.5,
+                mn: 0.65,
+                first: (2400, 0.65),
+            },
+        ];
+        assert_eq!(counter_samples(&rows, 600), (vec![1801, 2395, 2401, 2995], vec![0.05, 0.6, 0.65, 1.5]));
+        let raw = [end_only(15, 1.0, 1.0), end_only(30, 2.0, 2.0)];
+        assert_eq!(counter_samples(&raw, 15), (vec![15, 30], vec![1.0, 2.0]));
+    }
+
+    const fn hm(h: i64, m: i64, s: i64) -> i64 {
+        h * 3600 + m * 60 + s
+    }
+
+    /// A half-hour row of the 10-minute tier (hourly steps): its end, level and
+    /// last bucket's minimum, and the start and minimum of its first bucket
+    fn half_hour(t: i64, c: f64, mn: f64, first: (i64, f64)) -> ScalarRow {
+        ScalarRow { t, g: 0.0, c, mn, first }
+    }
+
+    /// increase(x[1h]) every hour, as a chart with hourly steps evaluates it on
+    /// the 10-minute tier (half-hour groups: windows of at least an hour)
+    fn hourly_increase(rows: &[ScalarRow], from: i64, to: i64) -> Vec<(i64, Option<f64>)> {
+        let (ts, vals) = counter_samples(rows, 1800);
+        let s = Samples {
+            labels: [("__name__".to_string(), "cost_total".to_string())].into(),
+            ts,
+            vals,
+            ..Default::default()
+        };
+        let data: HashMap<String, Vec<Samples>> = [("cost_total".to_string(), vec![s])].into();
+        let ev = crate::promql::eval::Evaluator {
+            start: from,
+            end: to,
+            step: 3600,
+            n: ((to - from) / 3600 + 1) as usize,
+            lookback: 3600,
+            min_range: 3600,
+            data: &data,
+        };
+        let expr = promql_parser::parser::parse("increase(cost_total[1h])").unwrap();
+        let crate::promql::Output::Matrix(m) = ev.run(&expr).unwrap() else {
+            panic!("expected a vector")
+        };
+        let got: HashMap<i64, f64> = m.into_iter().flat_map(|(_, p)| p).collect();
+        (0..ev.n as i64).map(|i| from + i * 3600).map(|t| (t, got.get(&t).copied())).collect()
+    }
+
+    fn assert_close(got: &[(i64, Option<f64>)], want: &[(i64, Option<f64>)]) {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for ((t, g), (_, w)) in got.iter().zip(want) {
+            let ok = match (g, w) {
+                (Some(g), Some(w)) => (g - w).abs() <= 0.02 * w.abs().max(0.01),
+                (None, None) => true,
+                _ => false,
+            };
+            assert!(ok, "at {}:00: {g:?}, want {w:?} (all: {got:?})", t / 3600);
+        }
+    }
+
+    // A cost counter as the 10-minute tier holds it: born at 13:33 having counted
+    // 0.05, at 1.71 by 13:52, then +0.06 (14:10-14:20), +0.50 (15:05-15:25) and
+    // +0.34 (15:40-15:50). In half-hour rows that end 5 s before the half hour.
+    fn new_series() -> Vec<ScalarRow> {
+        vec![
+            half_hour(hm(13, 59, 55), 1.71, 1.55, (hm(13, 30, 0), 0.05)),
+            half_hour(hm(14, 29, 55), 1.77, 1.77, (hm(14, 0, 0), 1.71)),
+            half_hour(hm(14, 59, 55), 1.77, 1.77, (hm(14, 30, 0), 1.77)),
+            half_hour(hm(15, 29, 55), 2.27, 2.15, (hm(15, 0, 0), 1.77)),
+            half_hour(hm(15, 59, 55), 2.61, 2.61, (hm(15, 30, 0), 2.27)),
+        ]
+    }
+
+    #[test]
+    fn hourly_increase_counts_the_first_bucket_of_a_new_counter() {
+        let got = hourly_increase(&new_series(), hm(13, 0, 0), hm(16, 0, 0));
+        // 14:00 had a single row (no value, a bar of 0) and the burst early in
+        // the 15:00 and 16:00 hours was outside their windows (0 and 2 × 0.34)
+        assert_close(
+            &got,
+            &[
+                (hm(13, 0, 0), None),
+                (hm(14, 0, 0), Some(1.71)),
+                (hm(15, 0, 0), Some(0.06)),
+                (hm(16, 0, 0), Some(0.84)),
+            ],
+        );
+    }
+
+    #[test]
+    fn hourly_increase_measures_the_first_half_hour_of_each_window() {
+        // The same increases on a counter that already existed (at 1000)
+        let mut rows = vec![
+            half_hour(hm(12, 59, 55), 1000.0, 1000.0, (hm(12, 30, 0), 1000.0)),
+            half_hour(hm(13, 29, 55), 1000.0, 1000.0, (hm(13, 0, 0), 1000.0)),
+        ];
+        for r in new_series() {
+            let base = |v: f64| 1000.0 + v - 0.05;
+            rows.push(half_hour(r.t, base(r.c), base(r.mn), (r.first.0, base(r.first.1).max(1000.0))));
+        }
+        let got = hourly_increase(&rows, hm(14, 0, 0), hm(16, 0, 0));
+        // It read only the second half of each hour, twice: 3.32, 0 and 0.68
+        assert_close(&got, &[(hm(14, 0, 0), Some(1.66)), (hm(15, 0, 0), Some(0.06)), (hm(16, 0, 0), Some(0.84))]);
+    }
+}
+
+#[cfg(test)]
+mod sample_query_tests {
+    use super::*;
+
+    fn row(id: u64, t: i64, c: f64, mn: f64, first: Option<(i64, f64)>) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(id.to_le_bytes());
+        b.extend(t.to_le_bytes());
+        b.extend(0.0f64.to_le_bytes());
+        b.extend(c.to_le_bytes());
+        b.extend(mn.to_le_bytes());
+        if let Some((ft, fm)) = first {
+            b.extend(ft.to_le_bytes());
+            b.extend(fm.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn aggregated_tiers_do_not_read_the_bucket_that_starts_at_the_end() {
+        for tier in [Tier::OneMinute, Tier::TenMinutes] {
+            for group in [tier.res(), 3 * tier.res()] {
+                let (scalar, dist) = sample_queries("atalaya", tier, group);
+                for sql in [&scalar, &dist] {
+                    assert!(sql.contains("Time < toDateTime({to:Int64})"), "{}: {sql}", tier.name());
+                    assert!(!sql.contains("Time <= toDateTime({to:Int64})"), "{}: {sql}", tier.name());
+                }
+            }
+        }
+        // A raw point at `to` is part of (from, to]
+        let (scalar, dist) = sample_queries("atalaya", Tier::Raw, 15);
+        assert!(scalar.contains("Time <= toDateTime({to:Int64})") && dist.contains("Time <= toDateTime({to:Int64})"));
+    }
+
+    #[test]
+    fn scalar_rows_know_where_their_first_bucket_starts() {
+        // Grouped: the first bucket's last sample at 13:39:55 → it starts at 13:30
+        let body = row(7, 50395, 1.71, 1.55, Some((49195, 0.05)));
+        let rows = read_scalar_rows(&body, Tier::TenMinutes, true).unwrap();
+        assert_eq!(rows[&7][0].first, (48600, 0.05));
+        assert_eq!((rows[&7][0].t, rows[&7][0].c, rows[&7][0].mn), (50395, 1.71, 1.55));
+        // Ungrouped: the row is its own first bucket
+        let rows = read_scalar_rows(&row(7, 49195, 0.6, 0.05, None), Tier::TenMinutes, false).unwrap();
+        assert_eq!(rows[&7][0].first, (48600, 0.05));
+        // A raw sample starts where it is
+        let rows = read_scalar_rows(&row(7, 49195, 0.6, 0.6, None), Tier::Raw, false).unwrap();
+        assert_eq!(rows[&7][0].first, (49195, 0.6));
+    }
+
+    #[test]
+    fn a_grouped_row_cut_short_is_an_error() {
+        let mut body = row(7, 50395, 1.71, 1.55, Some((49195, 0.05)));
+        body.extend(row(7, 52195, 1.77, 1.77, None));
+        let e = read_scalar_rows(&body, Tier::TenMinutes, true).unwrap_err().to_string();
+        assert!(e.contains("incomplete"), "{e}");
     }
 }
 

@@ -57,7 +57,8 @@ pub struct Evaluated {
     /// samples = reading their samples, eval = evaluating in memory. The first
     /// two run in parallel per selector, so they add up to more than wall time.
     pub timing: Timing,
-    /// Samples read from ClickHouse
+    /// Samples read from ClickHouse (in the aggregated tiers a counter bucket
+    /// gives two: its start and its end)
     pub samples_read: usize,
 }
 
