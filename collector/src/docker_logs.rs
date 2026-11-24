@@ -11,6 +11,7 @@
 //! line longer than MAX_READ does not stall reading.
 
 use std::collections::{BTreeMap, HashMap};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -20,10 +21,13 @@ use serde_json::{Value, json};
 use crate::logs::{LinePatterns, MAX_READ, build_row, read_from};
 use crate::sink::Sink;
 
-/// Read offset of each container (id → bytes)
+/// Read offset of each container (id → bytes), and the inode of the file it is an offset into
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct State {
     files: BTreeMap<String, u64>,
+    /// Without it (state saved by an older version) a rotation is not noticed once
+    #[serde(default)]
+    inodes: BTreeMap<String, u64>,
 }
 
 pub struct DockerTailer {
@@ -64,6 +68,47 @@ impl DockerTailer {
         }
     }
 
+    /// Reads a container's log file from `pos` up to its end (or until the sink is full), sends its
+    /// lines and returns where it stopped
+    fn read_file(&mut self, id: &str, path: &Path, mut pos: u64, sink: &Sink) -> u64 {
+        loop {
+            let (buf, start) = read_from(path, pos);
+            let (complete, consumed) = match buf.iter().rposition(|&b| b == b'\n') {
+                Some(i) => (&buf[..=i], i as u64 + 1),
+                // A line that does not fit: discard it whole
+                None if buf.len() as u64 >= MAX_READ => (&[][..], buf.len() as u64),
+                None => (&[][..], 0),
+            };
+            let (service, container, image) = self.name(id);
+            for line in String::from_utf8_lossy(complete).lines() {
+                let Ok(e) = serde_json::from_str::<Entry>(line) else { continue };
+                // Chunk of a long line (no "\n"): accumulate until its end
+                if !e.log.ends_with('\n') {
+                    let p = self.partial.entry(id.to_owned()).or_default();
+                    if p.len() < 64 << 10 {
+                        p.push_str(&e.log);
+                    }
+                    continue;
+                }
+                let mut text = self.partial.remove(id).unwrap_or_default();
+                text.push_str(e.log.trim_end_matches(['\n', '\r']));
+                let time = DateTime::parse_from_rfc3339(&e.time)
+                    .map(|t| t.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let resource = json!({ "container.id": id, "container.name": container, "container.image": image });
+                if let Some(row) = build_row(&self.host, &service, &e.stream, time, text, resource, LinePatterns::none()) {
+                    sink.push("logs", row);
+                    self.lines += 1;
+                }
+            }
+            pos = start + consumed;
+            // A full read may have left more behind it: on, unless the sink is full
+            if (buf.len() as u64) < MAX_READ || consumed == 0 || sink.pending_rows("logs") >= crate::logs::HIGH_WATER {
+                return pos;
+            }
+        }
+    }
+
     /// Service name: the Compose label if present, otherwise the container
     /// name without its leading slash
     fn name(&mut self, id: &str) -> (String, String, String) {
@@ -98,43 +143,36 @@ impl DockerTailer {
         self.partial.retain(|id, _| ids.contains(id));
         self.names.retain(|id, _| ids.contains(id));
         for id in ids {
+            // Backpressure, as in the Nomad tailer (crate::logs::HIGH_WATER). Not in the first pass,
+            // which reads nothing and records where each container's log ends
+            if !self.first && sink.pending_rows("logs") >= crate::logs::HIGH_WATER {
+                break;
+            }
             let path = self.dir.join(&id).join(format!("{id}-json.log"));
             let Ok(meta) = std::fs::metadata(&path) else { continue };
-            let pos = match self.state.files.get(&id) {
+            let mut pos = match self.state.files.get(&id) {
                 Some(p) => *p,
                 None if self.first => meta.len(),
                 None => 0,
             };
-            let (buf, start) = read_from(&path, pos);
-            let (complete, consumed) = match buf.iter().rposition(|&b| b == b'\n') {
-                Some(i) => (&buf[..=i], i as u64 + 1),
-                // A line that does not fit: discard it whole
-                None if buf.len() as u64 >= MAX_READ => (&[][..], buf.len() as u64),
-                None => (&[][..], 0),
-            };
-            let (service, container, image) = self.name(&id);
-            for line in String::from_utf8_lossy(complete).lines() {
-                let Ok(e) = serde_json::from_str::<Entry>(line) else { continue };
-                // Chunk of a long line (no "\n"): accumulate until its end
-                if !e.log.ends_with('\n') {
-                    let p = self.partial.entry(id.clone()).or_default();
-                    if p.len() < 64 << 10 {
-                        p.push_str(&e.log);
-                    }
-                    continue;
+            // Rotated since the last pass (Docker renamed it to .1 and opened another): first the
+            // rest of the old one, from where reading stopped. Reading only <id>-json.log lost those
+            // lines at every rotation (and, after a restart, read the new file from an offset that
+            // belonged to the old one)
+            if let Some(&ino) = self.state.inodes.get(&id)
+                && ino != meta.ino()
+            {
+                let old = self.dir.join(&id).join(format!("{id}-json.log.1"));
+                if std::fs::metadata(&old).is_ok_and(|m| m.ino() == ino) {
+                    self.read_file(&id, &old, pos, sink);
+                } else {
+                    tracing::warn!("docker logs: {id} rotated more than once since the last read; the end of the old file is lost");
                 }
-                let mut text = self.partial.remove(&id).unwrap_or_default();
-                text.push_str(e.log.trim_end_matches(['\n', '\r']));
-                let time = DateTime::parse_from_rfc3339(&e.time)
-                    .map(|t| t.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let resource = json!({ "container.id": id, "container.name": container, "container.image": image });
-                if let Some(row) = build_row(&self.host, &service, &e.stream, time, text, resource, LinePatterns::none()) {
-                    sink.push("logs", row);
-                    self.lines += 1;
-                }
+                pos = 0;
             }
-            self.state.files.insert(id, start + consumed);
+            let pos = self.read_file(&id, &path, pos, sink);
+            self.state.files.insert(id.clone(), pos);
+            self.state.inodes.insert(id, meta.ino());
         }
         self.first = false;
     }
@@ -161,6 +199,46 @@ impl DockerTailer {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The lines written between the last read and a rotation are read from the rotated file:
+    /// before, only <id>-json.log was read and they were lost at every rotation
+    #[tokio::test]
+    async fn the_end_of_a_rotated_file_is_read() {
+        let root = std::env::temp_dir().join(format!("atalaya-docker-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let id = "def456";
+        let c = root.join("containers").join(id);
+        std::fs::create_dir_all(&c).unwrap();
+        let log = c.join(format!("{id}-json.log"));
+        std::fs::write(&log, "").unwrap();
+        let sink = Sink::new(
+            "http://127.0.0.1:1/".into(),
+            "u".into(),
+            crate::sink::test_password(),
+            "atalaya".into(),
+            root.join("spool"),
+            1 << 20,
+        )
+        .unwrap();
+        let line = |n: u32| format!("{{\"log\":\"line {n}\\n\",\"stream\":\"stdout\",\"time\":\"2026-10-05T10:00:00Z\"}}\n");
+        let mut t = DockerTailer::new(root.join("containers"), &root, "host-1".into());
+        t.poll(&sink).await;
+        std::fs::write(&log, (1..=3).map(line).collect::<String>()).unwrap();
+        t.poll(&sink).await;
+        assert_eq!(t.lines, 3);
+        // Two more lines, then Docker rotates before the next pass and the new file gets two more
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all((4..=5).map(line).collect::<String>().as_bytes())
+            .unwrap();
+        std::fs::rename(&log, c.join(format!("{id}-json.log.1"))).unwrap();
+        std::fs::write(&log, (6..=7).map(line).collect::<String>()).unwrap();
+        t.poll(&sink).await;
+        assert_eq!(t.lines, 7, "4 and 5 from the rotated file, 6 and 7 from the new one");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[tokio::test]
     async fn reads_new_lines_joins_partials_and_names_compose_services() {

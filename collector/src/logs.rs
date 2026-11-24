@@ -39,6 +39,11 @@ use crate::nomad::Nomad;
 use crate::sink::Sink;
 
 pub(crate) const MAX_READ: u64 = 4 << 20;
+
+/// Log lines waiting in the sink past which the tailers stop reading until a flush takes them.
+/// Reading on (a backlog after a restart: up to ten 10 MiB files per stream) filled memory up to the
+/// sink's cap, which dropped lines whose offsets were then saved as read
+pub(crate) const HIGH_WATER: usize = 100_000;
 const MAX_BODY: usize = 64 << 10;
 /// Log patterns only see the start of a line: enough for a structured line,
 /// and the work per line stays bounded
@@ -133,14 +138,31 @@ impl Tailer {
         }
     }
 
-    fn scan(&self) -> BTreeMap<String, Group> {
+    /// The log files of every allocation, and the allocations whose directory could not be read this
+    /// time. None if the allocations directory itself could not be read: what is not listed is not
+    /// gone, and dropping its offsets would read every log file again from the start
+    fn scan(&self) -> Option<(BTreeMap<String, Group>, HashSet<String>)> {
         let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-        let Ok(allocs) = std::fs::read_dir(&self.alloc_dir) else { return groups };
+        let mut unreadable = HashSet::new();
+        let allocs = match std::fs::read_dir(&self.alloc_dir) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("logs: listing {}: {e}", self.alloc_dir.display());
+                return None;
+            }
+        };
         for a in allocs.flatten() {
             let alloc = a.file_name().to_string_lossy().to_string();
             let dir = a.path().join("alloc/logs");
-            let Some(d) = open_dir(&dir) else { continue };
-            let Ok(files) = std::fs::read_dir(fd_path(&d)) else { continue };
+            if std::fs::symlink_metadata(&dir).is_err() {
+                // Not started yet, or gone: nothing to keep
+                continue;
+            }
+            let files = open_dir(&dir).and_then(|d| std::fs::read_dir(fd_path(&d)).ok());
+            let Some(files) = files else {
+                unreadable.insert(alloc);
+                continue;
+            };
             for f in files.flatten() {
                 if !f.file_type().is_ok_and(|t| t.is_file()) {
                     continue;
@@ -165,12 +187,14 @@ impl Tailer {
         for g in groups.values_mut() {
             g.files.sort();
         }
-        groups
+        Some((groups, unreadable))
     }
 
     /// Reads what is new in every file and sends it to the sink.
     pub async fn poll(&mut self, nomad: &Nomad, sink: &Sink) {
-        let groups = self.scan();
+        let Some((groups, unreadable)) = self.scan() else { return };
+        // An allocation listed but unreadable this time keeps its offsets
+        let known = |k: &String| groups.contains_key(k) || k.split('/').next().is_some_and(|a| unreadable.contains(a));
         // First pass without state: everything that exists starts at the end
         if self.initial.is_none() {
             for (key, g) in &groups {
@@ -182,18 +206,28 @@ impl Tailer {
             self.initial = Some(groups.keys().cloned().collect());
         }
         // Allocations garbage-collected by Nomad: drop them from the state (and their partial lines)
-        self.state.files.retain(|k, _| groups.contains_key(k));
-        self.partial.retain(|k, _| groups.contains_key(k));
-        self.skipping.retain(|k| groups.contains_key(k));
-        self.over_budget.retain(|k| groups.contains_key(k));
+        self.state.files.retain(|k, _| known(k));
+        self.partial.retain(|k, _| known(k));
+        self.skipping.retain(|k| known(k));
+        self.over_budget.retain(|k| known(k));
 
         let mut budget = Budget::new();
         let first = self.passes % groups.len().max(1);
         self.passes = self.passes.wrapping_add(1);
+        let mut full = false;
         for (key, g) in groups.iter().cycle().skip(first).take(groups.len()) {
+            if full {
+                break;
+            }
             let (mut idx, mut pos) = self.state.files.get(key).copied().unwrap_or((g.files[0].0, 0));
             let info = nomad.alloc(&g.alloc).await.unwrap_or_default();
             loop {
+                // Backpressure: with this many lines waiting for the next flush, the rest waits on
+                // disk where it is (see HIGH_WATER)
+                if sink.pending_rows("logs") >= HIGH_WATER {
+                    full = true;
+                    break;
+                }
                 let Some((_, path)) = g.files.iter().find(|(n, _)| *n == idx) else {
                     // The file is gone: move to the next available one
                     match g.files.iter().find(|(n, _)| *n > idx) {
@@ -539,6 +573,81 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn test_sink(root: &std::path::Path) -> Sink {
+        Sink::new(
+            "http://127.0.0.1:1/".into(),
+            "u".into(),
+            crate::sink::test_password(),
+            "atalaya".into(),
+            root.join("spool"),
+            1 << 30,
+        )
+        .unwrap()
+    }
+
+    /// A backlog (an allocation that wrote while the collector was down) is read as the sink takes
+    /// it: before, a pass read it all into memory, past the sink's cap, which dropped lines whose
+    /// offsets were then saved as read
+    #[tokio::test]
+    async fn a_backlog_is_read_as_the_sink_takes_it_and_no_line_is_lost() {
+        let root = std::env::temp_dir().join(format!("atalaya-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("allocs")).unwrap();
+        let sink = test_sink(&root);
+        let nomad = Nomad::new("http://127.0.0.1:1".into(), "n".into(), None, None).unwrap();
+        let mut t = Tailer::new(root.join("allocs"), &root, "host-1".into());
+        t.poll(&nomad, &sink).await; // first pass: nothing yet
+        // A new allocation with 250,000 lines already written
+        let logs = root.join("allocs/abc/alloc/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let n = 250_000;
+        let body: String = (0..n)
+            .map(|i| format!("{i:08} some text that makes a line of about one hundred bytes, like a real one\n"))
+            .collect();
+        std::fs::write(logs.join("web.stdout.0"), body).unwrap();
+        let mut most = 0;
+        for _ in 0..20 {
+            t.poll(&nomad, &sink).await;
+            most = most.max(sink.pending_rows("logs"));
+            // The flush takes what is pending (to the disk spool: ClickHouse is not there)
+            sink.flush().await;
+            if t.lines >= n {
+                break;
+            }
+        }
+        assert_eq!(t.lines, n, "every line was read");
+        assert!(most < HIGH_WATER + 50_000, "at most one read past the high-water mark: {most}");
+        assert_eq!(sink.stats.dropped_rows.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pass that cannot list the allocations keeps every offset: before, it dropped them all, and
+    /// the next pass read every log file again from the start
+    #[tokio::test]
+    async fn a_failed_listing_keeps_the_offsets() {
+        let root = std::env::temp_dir().join(format!("atalaya-listing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let logs = root.join("allocs/abc/alloc/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let file = logs.join("web.stdout.0");
+        std::fs::write(&file, b"").unwrap();
+        let sink = test_sink(&root);
+        let nomad = Nomad::new("http://127.0.0.1:1".into(), "n".into(), None, None).unwrap();
+        let mut t = Tailer::new(root.join("allocs"), &root, "host-1".into());
+        t.poll(&nomad, &sink).await;
+        std::fs::write(&file, b"one\ntwo\n").unwrap();
+        t.poll(&nomad, &sink).await;
+        assert_eq!(t.lines, 2);
+        // The directory is not there for a moment
+        std::fs::rename(root.join("allocs"), root.join("allocs.away")).unwrap();
+        t.poll(&nomad, &sink).await;
+        std::fs::rename(root.join("allocs.away"), root.join("allocs")).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(b"three\n").unwrap();
+        t.poll(&nomad, &sink).await;
+        assert_eq!(t.lines, 3, "only the new line, not the file again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn a_line_longer_than_max_read_does_not_stall_the_tailer() {
         let root = std::env::temp_dir().join(format!("atalaya-logs-{}", std::process::id()));
@@ -682,7 +791,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("host-dir"), root.join("allocs/def/alloc/logs")).unwrap();
 
         let t = Tailer::new(root.join("allocs"), &root, "host-1".into());
-        let groups = t.scan();
+        let (groups, _) = t.scan().unwrap();
         assert_eq!(groups.keys().collect::<Vec<_>>(), ["abc/web/stderr"], "only the regular file");
         // A file swapped for a symlink after the scan is not read either
         assert!(read_from(&logs.join("web.stdout.0"), 0).0.is_empty());
@@ -707,14 +816,14 @@ mod tests {
         // After the scan, the task swaps its logs directory for a link to a
         // directory of the host holding a file with a log's name
         let t = Tailer::new(root.join("allocs"), &root, "host-1".into());
-        let groups = t.scan();
+        let (groups, _) = t.scan().unwrap();
         assert!(groups.contains_key("abc/web/stderr"));
         std::fs::create_dir_all(root.join("host-dir")).unwrap();
         std::fs::write(root.join("host-dir/web.stderr.0"), b"not a log\n").unwrap();
         std::fs::rename(&logs, root.join("allocs/abc/alloc/old-logs")).unwrap();
         std::os::unix::fs::symlink(root.join("host-dir"), &logs).unwrap();
         assert!(read_from(&logs.join("web.stderr.0"), 0).0.is_empty(), "the directory is a symlink now");
-        assert!(t.scan().is_empty(), "and the next scan skips it");
+        assert!(t.scan().unwrap().0.is_empty(), "and the next scan skips it");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

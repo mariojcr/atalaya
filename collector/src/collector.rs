@@ -128,6 +128,8 @@ pub(crate) struct Collector {
     pub(crate) host: Option<Arc<std::sync::Mutex<host::Host>>>,
     pub(crate) registry: Mutex<Registry>,
     pub(crate) stats: Mutex<BTreeMap<String, f64>>,
+    /// The last Nomad targets discovered without error (see `discovered`)
+    pub(crate) last_targets: Mutex<Option<Vec<crate::nomad::Target>>>,
 }
 
 /// Resource of a target discovered in Nomad: the host plus the Nomad service,
@@ -344,8 +346,26 @@ impl Collector {
         self.write("atalaya-collector", resource, s, now, None).await;
     }
 
+    /// The Nomad targets to scrape this round, and whether the list is complete. After a failed
+    /// discovery (a leader election, a timeout, one service that could not be read) the round used
+    /// to scrape none of them, a gap in every discovered target; now it scrapes the last list that
+    /// worked, and since that list may be out of date nothing counts as gone
+    async fn discovered(&self, found: anyhow::Result<Vec<crate::nomad::Target>>) -> (Vec<crate::nomad::Target>, bool) {
+        let mut last = self.last_targets.lock().await;
+        match found {
+            Ok(targets) => {
+                *last = Some(targets.clone());
+                (targets, true)
+            }
+            Err(e) => {
+                let kept = last.clone().unwrap_or_default();
+                tracing::warn!("discovering Nomad services: {e:#}; scraping the {} targets found last time", kept.len());
+                (kept, false)
+            }
+        }
+    }
+
     pub(crate) async fn scrape_all(self: &Arc<Self>) {
-        let now = chrono::Utc::now().timestamp();
         let host: Labels = [("host.name".to_owned(), self.cfg.node.clone())].into();
         let mut jobs = Vec::new();
         for t in &self.cfg.scrape.static_targets {
@@ -354,19 +374,16 @@ impl Collector {
         // Without a full list of targets (discovery failed), none counts as gone
         let mut complete = true;
         if let Some(nomad) = &self.nomad {
-            match nomad.targets().await {
-                Ok(targets) => {
-                    for t in targets {
-                        let res = nomad_resource(&host, &t.service, nomad.alloc(&t.alloc).await);
-                        jobs.push((t.job, t.url, t.token, res));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("discovering Nomad services: {e:#}");
-                    complete = false;
-                }
+            let (targets, full) = self.discovered(nomad.targets().await).await;
+            complete = full;
+            for t in targets {
+                let res = nomad_resource(&host, &t.service, nomad.alloc(&t.alloc).await);
+                jobs.push((t.job, t.url, t.token, res));
             }
         }
+        // The time of the samples is when they are taken: discovery goes service by service and can
+        // take seconds, and stamping them with the start of the round skewed rates
+        let now = chrono::Utc::now().timestamp();
         let targets: HashSet<String> = jobs.iter().map(|(_, url, _, _)| url.clone()).collect();
         let mut handles: Vec<_> = Vec::new();
         if let Some(h) = self.host.clone() {
@@ -664,6 +681,7 @@ mod tests {
             host: None,
             registry: Mutex::new(Registry::new()),
             stats: Mutex::new(BTreeMap::new()),
+            last_targets: Mutex::new(None),
         };
         (c, sink)
     }
@@ -690,6 +708,25 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// A failed discovery scrapes the targets found last time (and nothing counts as gone): before,
+    /// the round scraped none of them
+    #[tokio::test]
+    async fn a_failed_discovery_keeps_the_last_targets() {
+        let (c, _) = collector("discovery");
+        let t = crate::nomad::Target {
+            job: "web".into(),
+            service: "web".into(),
+            url: "http://192.0.2.1/metrics".into(),
+            alloc: "a1".into(),
+            token: None,
+        };
+        let (got, complete) = c.discovered(Ok(vec![t.clone()])).await;
+        assert_eq!((got.len(), complete), (1, true));
+        let (got, complete) = c.discovered(Err(anyhow::anyhow!("leader election"))).await;
+        assert_eq!(got.iter().map(|t| t.url.as_str()).collect::<Vec<_>>(), [t.url.as_str()]);
+        assert!(!complete, "a list that may be out of date marks nothing as gone");
     }
 
     #[tokio::test]

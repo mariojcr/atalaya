@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         },
         registry: Mutex::new(Registry::new()),
         stats: Mutex::new(BTreeMap::new()),
+        last_targets: Mutex::new(None),
         sink: sink.clone(),
         cfg,
     });

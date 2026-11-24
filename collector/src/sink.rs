@@ -37,6 +37,9 @@ const POOL_IDLE: Duration = Duration::from_secs(5);
 /// dropped_rows) rather than exhausting the node's memory.
 const MAX_PENDING_ROWS: usize = 500_000;
 
+/// Spooled batches sent per flush at most (see `retry_spool`)
+const SPOOL_PER_FLUSH: usize = 32;
+
 #[derive(Default)]
 pub struct Stats {
     pub rows_sent: AtomicU64,
@@ -119,6 +122,16 @@ impl Sink {
             done: AtomicU64::new(0),
             stats: Stats::default(),
         })
+    }
+
+    /// Rows of a table waiting in memory for the next flush. The log tailers stop reading past
+    /// `crate::logs::HIGH_WATER` instead of letting the cap below drop lines they then count as read
+    pub fn pending_rows(&self, table: &str) -> usize {
+        TABLES
+            .iter()
+            .position(|t| *t == table)
+            .map(|i| self.pending.lock().unwrap()[i].len())
+            .unwrap_or(0)
     }
 
     pub fn push(&self, table: &str, row: Value) {
@@ -312,8 +325,15 @@ impl Sink {
     }
 
     /// Retries the spool in order. Returns false if something is left unsent.
+    /// Sends the oldest batches of the disk spool, at most SPOOL_PER_FLUSH of them. True when the
+    /// spool is empty afterwards: otherwise this flush's batches go to the spool behind the rest, so
+    /// the order holds, and a long backlog drains a slice per flush. Draining it whole in one flush
+    /// held every later flush back meanwhile (no fresh data on the dashboards, and rows piling up
+    /// in memory until the cap dropped them)
     async fn retry_spool(&self) -> bool {
-        for (path, _) in self.spool_files() {
+        let files = self.spool_files();
+        let all = files.len();
+        for (path, _) in files.into_iter().take(SPOOL_PER_FLUSH) {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
             let Some(table) = name.strip_suffix(".json.gz").and_then(|n| n.split_once('-')).map(|(_, t)| t.to_owned()) else {
                 let _ = std::fs::remove_file(&path);
@@ -340,7 +360,7 @@ impl Sink {
                 }
             }
         }
-        true
+        all <= SPOOL_PER_FLUSH
     }
 
     fn trim_spool(&self) {
@@ -533,6 +553,27 @@ mod tests {
         assert_eq!(sink.stats.send_errors.load(Ordering::Relaxed), 0, "no send failed");
         assert!(spooled(&dir).is_empty(), "nothing went to the spool");
         assert_eq!(accepted.load(Ordering::SeqCst), 2, "each flush opened its own connection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A long spool drains a slice per flush, and what comes meanwhile waits behind it on disk (so
+    /// the order holds and memory does not fill): before, one flush sent the whole spool while every
+    /// later flush waited
+    #[tokio::test]
+    async fn a_long_spool_drains_a_slice_per_flush() {
+        let dir = spool_dir("slices");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = Sink::new(answering(200).await, "u".into(), test_password(), "atalaya".into(), dir.clone(), 1 << 30).unwrap();
+        for i in 0..(SPOOL_PER_FLUSH + 8) {
+            assert!(sink.to_spool("logs", &Sink::gzip(&[format!(r#"{{"Body":"old {i}"}}"#)]).unwrap()));
+        }
+        sink.push("logs", serde_json::json!({ "Body": "new" }));
+        sink.flush().await;
+        let left = spooled(&dir);
+        assert_eq!(left.len(), 9, "the 8 old batches left and the new one behind them");
+        assert!(left.iter().any(|b| b.contains("new")));
+        sink.flush().await;
+        assert!(spooled(&dir).is_empty(), "the next flush finishes it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
