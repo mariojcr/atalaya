@@ -94,11 +94,38 @@ A `slack` channel posts to a Slack [incoming
 webhook](https://api.slack.com/messaging/webhooks): create a Slack app with
 *Incoming Webhooks* on, add a webhook to the channel that should get the alerts,
 and put its URL in the variable that `url_env` names. The webhook decides the
-channel; one Slack channel per Atalaya channel. Each notification is one
-message: its text (what the phone shows) is the title, and the body has a
-coloured bar for the worst firing severity (green when everything resolved),
-with the same lines as the other channels. The URL is a secret: whoever has it
-can post to that channel.
+channel; one Slack channel per Atalaya channel. The URL is a secret: whoever has
+it can post to that channel.
+
+Slack gets one message (a card) per alert, not one per batch:
+
+- **Firing**: the severity and title once, then, in an attachment coloured by
+  severity, the summary; the alert's labels as fields (`instance` reads Host,
+  `job` Service, `mountpoint` Mount point), when it fired as a Slack date (each
+  reader sees it in their time zone, with how long ago) and its value; a text
+  sparkline of the hour before it fired; and links to the alerts page, the
+  rule's `dashboard`, the logs of its service (the `job` label) and its
+  `runbook`.
+- **Resolved**: one line with how long it lasted, when it fired and resolved,
+  and its last value.
+- **Flapping**: an alert that fired and resolved within the same batch gets one
+  line instead of two cards.
+
+Firing cards go first (worst severity first), then flapping and resolved ones.
+A batch sends at most 10 cards, a second apart (the webhook's rate limit); the
+rest are counted in a last line. The sparkline draws the rule's expression
+without its threshold comparison (`disk_used > 85` draws `disk_used`) for the
+series with the alert's labels; if that query fails, the card goes without it.
+Notifications carry no mentions.
+
+A rule can name the dashboard to link from its notifications:
+
+```yaml
+  - id: havo-queued
+    title: havo sandboxes waiting for room
+    expr: sum(nomad_nomad_job_summary_queued{parent_id="havo-sandbox"}) > 0
+    dashboard: havo-sandbox      # dashboards/havo-sandbox.yaml
+```
 
 ## API
 

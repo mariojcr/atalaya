@@ -14,7 +14,7 @@
 //! history.jsonl (one line per transition). Channel secrets come from
 //! environment variables named in the YAML; they are never written here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -189,6 +189,9 @@ pub struct Rule {
     pub summary: Text,
     #[serde(default)]
     pub runbook: Option<Text>,
+    /// Name of the dashboard to link from notifications (dashboards/<name>.yaml)
+    #[serde(default)]
+    pub dashboard: Option<String>,
     #[serde(default)]
     pub notify: Option<Vec<String>>,
 }
@@ -240,6 +243,11 @@ fn validate(cfg: &Config) -> Result<()> {
         }
         if let Some(w) = &r.window {
             crate::query::parse_duration(w).with_context(|| format!("rule {}: window", r.id))?;
+        }
+        if let Some(d) = &r.dashboard
+            && !valid_id(d)
+        {
+            bail!("rule {}: invalid dashboard name '{d}'", r.id);
         }
         for c in r.notify.iter().flatten() {
             if !cfg.channels.contains_key(c) {
@@ -358,6 +366,10 @@ pub struct Transition {
     pub from: String,
     pub to: String,
     pub value: f64,
+    /// When the alert started firing (on a resolution, how long it lasted). None in
+    /// transitions written before this field existed
+    #[serde(default)]
+    pub since: Option<i64>,
 }
 
 /// Human-readable labels: a=1,b=2 (not usable as an identity: {a: "x,b=y"}
@@ -402,6 +414,7 @@ pub fn step(instances: &mut BTreeMap<String, Instance>, rule: &str, matches: &[(
                         from: "inactive".into(),
                         to: "firing".into(),
                         value: *value,
+                        since: Some(now),
                     });
                 }
             }
@@ -418,6 +431,7 @@ pub fn step(instances: &mut BTreeMap<String, Instance>, rule: &str, matches: &[(
                         from: "pending".into(),
                         to: "firing".into(),
                         value: *value,
+                        since: Some(now),
                     });
                 }
             }
@@ -439,6 +453,7 @@ pub fn step(instances: &mut BTreeMap<String, Instance>, rule: &str, matches: &[(
                 from: "firing".into(),
                 to: "resolved".into(),
                 value: i.value,
+                since: Some(i.since),
             });
         }
     }
@@ -752,7 +767,7 @@ impl Alerts {
     /// once the oldest has waited group_wait. A failure leaves them in the
     /// outbox with growing backoff; they only leave once delivered (or after
     /// MAX_ATTEMPTS, with a log entry).
-    pub async fn deliver(&self) {
+    pub async fn deliver(&self, engine: Option<&atalaya::promql::Engine>) {
         let cfg = self.config().await;
         let wait = crate::query::parse_duration(&cfg.defaults.group_wait).unwrap_or(30);
         let t = now();
@@ -771,8 +786,22 @@ impl Alerts {
                 None => Err(None),
                 Some(ch) => {
                     let trs: Vec<&Transition> = ps.iter().map(|p| &p.tr).collect();
-                    let msg = Message::build(&cfg, &trs, "en");
-                    send(&self.http, ch, &msg).await.map_err(|e| Some((ch.kind(), e)))
+                    match ch {
+                        // Slack gets a card per alert, with a sparkline of what made it fire
+                        Channel::Slack { url_env } => {
+                            let sparks = match engine {
+                                Some(e) => slack_sparks(e, &cfg, &trs).await,
+                                None => HashMap::new(),
+                            };
+                            let base = std::env::var("ATALAYA_PUBLIC_URL").ok().filter(|b| !b.is_empty());
+                            let cards = slack_cards(&cfg, &trs, &sparks, base.as_deref());
+                            send_slack(&self.http, url_env, &cards).await.map_err(|e| Some((ch.kind(), e)))
+                        }
+                        _ => {
+                            let msg = Message::build(&cfg, &trs, "en");
+                            send(&self.http, ch, &msg).await.map_err(|e| Some((ch.kind(), e)))
+                        }
+                    }
                 }
             };
             let mut q = self.queue.lock().await;
@@ -971,7 +1000,7 @@ pub async fn run(app: Arc<App>) {
     let a = app.clone();
     tokio::spawn(async move {
         loop {
-            a.alerts.deliver().await;
+            a.alerts.deliver(Some(&a.promql)).await;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
@@ -1109,40 +1138,311 @@ async fn send(http: &reqwest::Client, ch: &Channel, msg: &Message) -> Result<()>
                 .json(&json!({ "status": status, "title": msg.title, "text": msg.text, "alerts": msg.alerts }));
             check(req.send().await.map_err(reqwest::Error::without_url)?).await
         }
+        // deliver() sends Slack its cards (slack_cards); this is only the batch as one card
         Channel::Slack { url_env } => {
-            let url = env_required(url_env)?;
-            let req = http.post(url).json(&slack_payload(msg));
-            check(req.send().await.map_err(reqwest::Error::without_url)?).await
+            let color = match msg.worst {
+                Some(s) => sev_color(s),
+                None => RESOLVED_COLOR,
+            };
+            let card = slack_card(
+                &msg.title,
+                &msg.title,
+                color,
+                vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": slack_esc(&msg.text) } })],
+            );
+            send_slack(http, url_env, &[card]).await
         }
     }
 }
 
-/// Longest text of a Slack section block (its limit is 3000 characters)
-const SLACK_SECTION_MAX: usize = 2900;
+// ── Slack ─────────────────────────────────────────────────────────────────
 
-/// The body of a Slack incoming webhook: `text` is what the phone and the desktop notification show,
-/// and the message itself is one section in an attachment, whose bar takes the colour of the worst
-/// firing severity (green when everything resolved). Slack's mrkdwn reads `&`, `<` and `>` as markup,
-/// so a summary that has them is escaped; a URL in it stays plain text and Slack links it.
-fn slack_payload(msg: &Message) -> Value {
-    let color = match msg.worst {
-        Some(Severity::Critical) => "#e01e5a",
-        Some(Severity::Warning) => "#ecb22e",
-        Some(Severity::Info) => "#36c5f0",
-        None => "#2eb67d",
-    };
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    let mut body = format!("*{}*\n{}", esc(&msg.title), esc(&msg.text));
-    if body.chars().count() > SLACK_SECTION_MAX {
-        body = body.chars().take(SLACK_SECTION_MAX).collect::<String>() + "\n…";
+/// Most cards in one batch: the rest go in a last line that links to the alerts page
+const SLACK_MAX_CARDS: usize = 10;
+/// Bars in a sparkline
+const SPARK_POINTS: usize = 24;
+/// What a sparkline covers before the alert fired, and its step
+const SPARK_RANGE: i64 = 3600;
+const SPARK_STEP: i64 = 150;
+const RESOLVED_COLOR: &str = "#2eb67d";
+const FLAP_COLOR: &str = "#a0a0a0";
+
+fn sev_color(s: Severity) -> &'static str {
+    match s {
+        Severity::Critical => "#e01e5a",
+        Severity::Warning => "#ecb22e",
+        Severity::Info => "#36c5f0",
     }
+}
+
+/// Slack's mrkdwn reads `&`, `<` and `>` as markup
+fn slack_esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// One Slack message: the title once, above an attachment whose bar takes `color`. `text` only
+/// goes to the notification (with blocks, Slack does not show it in the channel)
+fn slack_card(text: &str, title: &str, color: &str, blocks: Vec<Value>) -> Value {
     json!({
-        "text": msg.title,
-        "attachments": [{
-            "color": color,
-            "blocks": [{ "type": "section", "text": { "type": "mrkdwn", "text": body } }],
-        }],
+        "text": text,
+        "blocks": [{ "type": "section", "text": { "type": "mrkdwn", "text": format!("*{}*", slack_esc(title)) } }],
+        "attachments": [{ "color": color, "blocks": blocks }],
     })
+}
+
+/// A time in Slack's own format, which each reader sees in their time zone (`ago` relative to when
+/// they read it); the fallback, for clients that do not render it, is UTC
+fn slack_time(ts: i64, with_ago: bool) -> String {
+    let utc = chrono::DateTime::from_timestamp(ts, 0)
+        .map(|d| d.format("%H:%M UTC").to_string())
+        .unwrap_or_default();
+    let fmt = if with_ago { "{time} · {ago}" } else { "{time}" };
+    format!("<!date^{ts}^{fmt}|{utc}>")
+}
+
+fn human_duration(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} min", s / 60),
+        3600..86400 => match (s / 3600, s % 3600 / 60) {
+            (h, 0) => format!("{h} h"),
+            (h, m) => format!("{h} h {m} min"),
+        },
+        _ => match (s / 86400, s % 86400 / 3600) {
+            (d, 0) => format!("{d} d"),
+            (d, h) => format!("{d} d {h} h"),
+        },
+    }
+}
+
+/// A text sparkline (▁ to █) of up to SPARK_POINTS values, scaled to their own range. None with
+/// fewer than two values
+fn sparkline(values: &[f64]) -> Option<String> {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.len() < 2 {
+        return None;
+    }
+    let n = v.len().min(SPARK_POINTS);
+    let pts: Vec<f64> = (0..n).map(|i| v[i * (v.len() - 1) / (n - 1)]).collect();
+    let (lo, hi) = pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+    Some(
+        pts.iter()
+            .map(|&x| {
+                if hi > lo {
+                    BARS[((x - lo) / (hi - lo) * 7.0).round() as usize]
+                } else {
+                    BARS[3]
+                }
+            })
+            .collect(),
+    )
+}
+
+/// What a sparkline draws for a rule: its expression without the threshold comparison
+/// (`disk_used > 85` → `disk_used`), so the series keeps its values below the threshold too.
+/// Anything else is drawn as it is
+fn spark_expr(expr: &str) -> Option<String> {
+    use promql_parser::parser::{self, Expr};
+    let mut e = parser::parse(expr).ok()?;
+    while let Expr::Paren(p) = e {
+        e = *p.expr;
+    }
+    Some(match e {
+        Expr::Binary(b) if b.op.is_comparison_operator() => match (b.lhs.as_ref(), b.rhs.as_ref()) {
+            (Expr::NumberLiteral(_), other) => other.to_string(),
+            (other, _) => other.to_string(),
+        },
+        other => other.to_string(),
+    })
+}
+
+/// The values behind each firing alert's sparkline: spark_expr over the hour before it fired, for
+/// the series with its labels. At most SLACK_MAX_CARDS queries per batch; one that fails leaves
+/// that card without a sparkline
+async fn slack_sparks(engine: &atalaya::promql::Engine, cfg: &Config, trs: &[&Transition]) -> HashMap<String, Vec<f64>> {
+    let mut out = HashMap::new();
+    for tr in trs.iter().filter(|t| t.to == "firing").take(SLACK_MAX_CARDS) {
+        let Some(rule) = cfg.rules.iter().find(|r| r.id == tr.rule && r.kind == Kind::Metric) else {
+            continue;
+        };
+        let Some(expr) = spark_expr(&rule.expr) else { continue };
+        let Ok(r) = engine.range(&expr, tr.ts - SPARK_RANGE, tr.ts, SPARK_STEP).await else {
+            continue;
+        };
+        if let Output::Matrix(m) = r.output
+            && let Some((_, pts)) = m.into_iter().find(|(l, _)| tr.labels.iter().all(|(k, v)| l.get(k) == Some(v)))
+        {
+            out.insert(instance_key(&tr.rule, &tr.labels), pts.into_iter().map(|p| p.1).collect());
+        }
+    }
+    out
+}
+
+/// How a label reads as a field title
+fn label_title(k: &str) -> &str {
+    match k {
+        "instance" => "Host",
+        "job" => "Service",
+        "mountpoint" => "Mount point",
+        _ => k,
+    }
+}
+
+/// A value for the query string of a link
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The links of a card: the alerts page, the rule's dashboard, the logs of its service (the `job`
+/// label), its runbook, and the rule id
+fn slack_links(base: Option<&str>, rule: &Rule, labels: &Labels) -> String {
+    let mut parts = Vec::new();
+    if let Some(b) = base.map(|b| b.trim_end_matches('/')) {
+        parts.push(format!("<{b}/#/alerts|View alert>"));
+        if let Some(d) = &rule.dashboard {
+            parts.push(format!("<{b}/#/dashboards/{d}|Dashboard>"));
+        }
+        if let Some(svc) = labels.get("job") {
+            parts.push(format!("<{b}/#/logs?q={}|Logs of {}>", url_encode(&format!("service:{svc}")), slack_esc(svc)));
+        }
+    }
+    if let Some(rb) = rule.runbook.as_ref().map(|r| r.get("en"))
+        && (rb.starts_with("https://") || rb.starts_with("http://"))
+    {
+        parts.push(format!("<{rb}|Runbook>"));
+    }
+    parts.push(format!("rule `{}`", slack_esc(&rule.id)));
+    parts.join("  ·  ")
+}
+
+/// An alert's labels in one line: `host-1 · /data`
+fn labels_line(labels: &Labels) -> String {
+    labels.values().map(|v| format!("`{}`", slack_esc(v))).collect::<Vec<_>>().join(" · ")
+}
+
+fn firing_card(rule: &Rule, tr: &Transition, spark: Option<&[f64]>, base: Option<&str>) -> Value {
+    let summary = rule.render_summary("en", &tr.labels, tr.value);
+    let title = format!(
+        "{} {} · {}",
+        sev_icon(rule.severity),
+        sev_name(rule.severity).to_uppercase(),
+        rule.title.get("en")
+    );
+    // Up to 8 labels: a section takes 10 fields, and Since and Value are two
+    let mut fields: Vec<Value> = tr
+        .labels
+        .iter()
+        .take(8)
+        .map(|(k, v)| {
+            let v: String = v.chars().take(200).collect();
+            json!({ "type": "mrkdwn", "text": format!("*{}*\n{}", slack_esc(label_title(k)), slack_esc(&v)) })
+        })
+        .collect();
+    fields.push(json!({ "type": "mrkdwn", "text": format!("*Since*\n{}", slack_time(tr.since.unwrap_or(tr.ts), true)) }));
+    fields.push(json!({ "type": "mrkdwn", "text": format!("*Value*\n`{}`", fmt_value(tr.value)) }));
+    let mut blocks = vec![
+        json!({ "type": "section", "text": { "type": "mrkdwn", "text": slack_esc(&summary) } }),
+        json!({ "type": "section", "fields": fields }),
+    ];
+    if let Some(v) = spark
+        && let Some(line) = sparkline(v)
+    {
+        let first = v.iter().copied().find(|x| x.is_finite()).unwrap_or(f64::NAN);
+        let last = v.iter().copied().rev().find(|x| x.is_finite()).unwrap_or(f64::NAN);
+        blocks.push(json!({ "type": "section", "text": { "type": "mrkdwn",
+            "text": format!("*Last hour*   `{line}`   {} → {}", fmt_value(first), fmt_value(last)) } }));
+    }
+    blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn", "text": slack_links(base, rule, &tr.labels) }] }));
+    slack_card(&format!("{title} — {summary}"), &title, sev_color(rule.severity), blocks)
+}
+
+fn resolved_card(rule: &Rule, tr: &Transition, base: Option<&str>) -> Value {
+    let lasted = tr.since.map(|s| format!(" — after {}", human_duration(tr.ts - s))).unwrap_or_default();
+    let title = format!("✅ RESOLVED · {}{lasted}", rule.title.get("en"));
+    let fired = tr.since.map(|s| format!("Fired {} · ", slack_time(s, false))).unwrap_or_default();
+    let blocks = vec![
+        json!({ "type": "section", "text": { "type": "mrkdwn", "text": labels_line(&tr.labels) } }),
+        json!({ "type": "context", "elements": [{ "type": "mrkdwn",
+            "text": format!("{fired}resolved {} · last value `{}`  ·  {}", slack_time(tr.ts, false), fmt_value(tr.value), slack_links(base, rule, &tr.labels)) }] }),
+    ];
+    slack_card(&title, &title, RESOLVED_COLOR, blocks)
+}
+
+/// Fired and resolved within the same batch: one line instead of two cards
+fn flap_card(rule: &Rule, fired: &Transition, resolved: &Transition, base: Option<&str>) -> Value {
+    let title = format!("⚡ FLAPPING · {}", rule.title.get("en"));
+    let start = fired.since.unwrap_or(fired.ts);
+    let blocks = vec![
+        json!({ "type": "section", "text": { "type": "mrkdwn", "text": format!("{} · {} → {} ({})",
+            labels_line(&resolved.labels), slack_time(start, false), slack_time(resolved.ts, false), human_duration(resolved.ts - start)) } }),
+        json!({ "type": "context", "elements": [{ "type": "mrkdwn",
+            "text": format!("Fired and resolved within the same batch  ·  {}", slack_links(base, rule, &resolved.labels)) }] }),
+    ];
+    slack_card(&title, &title, FLAP_COLOR, blocks)
+}
+
+/// The Slack messages for a batch of transitions: one card per alert, firing ones first (worst
+/// severity first), then flapping ones (fired and resolved in this batch), then resolved ones.
+/// Past SLACK_MAX_CARDS, the rest go in a last line
+fn slack_cards(cfg: &Config, trs: &[&Transition], sparks: &HashMap<String, Vec<f64>>, base: Option<&str>) -> Vec<Value> {
+    // Each alert's transitions in this batch, in order
+    let mut by: Vec<(String, Vec<&Transition>)> = Vec::new();
+    for tr in trs {
+        let key = instance_key(&tr.rule, &tr.labels);
+        match by.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(tr),
+            None => by.push((key, vec![tr])),
+        }
+    }
+    let (mut firing, mut flaps, mut resolved) = (Vec::new(), Vec::new(), Vec::new());
+    for (key, ts) in &by {
+        let (Some(first), Some(last)) = (ts.first(), ts.last()) else { continue };
+        let Some(rule) = cfg.rules.iter().find(|r| r.id == first.rule) else {
+            continue;
+        };
+        if last.to == "firing" {
+            firing.push((rule.severity, firing_card(rule, last, sparks.get(key).map(|v| v.as_slice()), base)));
+        } else if let Some(fired) = ts.iter().find(|t| t.to == "firing") {
+            flaps.push(flap_card(rule, fired, last, base));
+        } else {
+            resolved.push(resolved_card(rule, last, base));
+        }
+    }
+    firing.sort_by_key(|f| std::cmp::Reverse(f.0));
+    let mut cards: Vec<Value> = firing.into_iter().map(|f| f.1).chain(flaps).chain(resolved).collect();
+    if cards.len() > SLACK_MAX_CARDS {
+        let rest = cards.len() - (SLACK_MAX_CARDS - 1);
+        cards.truncate(SLACK_MAX_CARDS - 1);
+        let link = base
+            .map(|b| format!("  ·  <{}/#/alerts|View all in Atalaya>", b.trim_end_matches('/')))
+            .unwrap_or_default();
+        cards.push(json!({
+            "text": format!("…and {rest} more alert changes"),
+            "blocks": [{ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!("…and *{rest}* more alert changes in this batch{link}") }] }],
+        }));
+    }
+    cards
+}
+
+/// Posts the cards in order. A webhook takes about one message a second, so they go a second
+/// apart. A failure retries the whole batch, so a card that went out may be sent again (delivery
+/// is at-least-once)
+async fn send_slack(http: &reqwest::Client, url_env: &str, cards: &[Value]) -> Result<()> {
+    let url = env_required(url_env)?;
+    for (i, card) in cards.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        check(http.post(&url).json(card).send().await.map_err(reqwest::Error::without_url)?).await?;
+    }
+    Ok(())
 }
 
 /// Error with the status code and the start of the body, without the URL (it may contain the token).
@@ -1317,6 +1617,7 @@ rules:
             from: "pending".into(),
             to: "firing".into(),
             value: 91.0,
+            since: None,
         };
         let t2 = Transition {
             ts: 2,
@@ -1325,6 +1626,7 @@ rules:
             from: "inactive".into(),
             to: "firing".into(),
             value: 1.0,
+            since: None,
         };
         let t3 = Transition {
             ts: 3,
@@ -1333,6 +1635,7 @@ rules:
             from: "firing".into(),
             to: "resolved".into(),
             value: 80.0,
+            since: None,
         };
         let m = Message::build(&cfg, &[&t1, &t2, &t3], "en");
         assert_eq!(m.worst, Some(Severity::Critical));
@@ -1343,38 +1646,142 @@ rules:
         assert!(m.text.contains("✅ Disk full (instance=host-2,mountpoint=/)"));
     }
 
-    /// A Slack incoming webhook gets a fallback `text`, the colour of the worst firing severity, and the
-    /// message escaped for mrkdwn and cut below the section limit
+    fn tr(rule: &str, ls: &[(&str, &str)], to: &str, ts: i64, since: Option<i64>, value: f64) -> Transition {
+        Transition {
+            ts,
+            rule: rule.into(),
+            labels: labels(ls),
+            from: String::new(),
+            to: to.into(),
+            value,
+            since,
+        }
+    }
+
+    fn slack_cfg() -> Config {
+        serde_saphyr::from_str(
+            r#"
+channels: { team: { type: slack, url_env: X } }
+rules:
+  - { id: target-down, title: Service not reporting, severity: warning, expr: 'up == 0', summary: "{{job}} on {{instance}} has not answered", dashboard: nomad }
+  - { id: disk-full, title: Disk almost full, severity: critical, expr: 'disk > 85', summary: "{{mountpoint}} <at> {{value}} %" }
+"#,
+        )
+        .unwrap()
+    }
+
+    /// A card per alert: firing ones first, the worst severity first; a firing card has its labels
+    /// as fields, the time it fired as a Slack date, its value, the sparkline and the links; the
+    /// title appears once (the top-level text only goes to the notification)
     #[test]
-    fn slack_payload_colours_escapes_and_cuts() {
-        let msg = Message {
-            title: "atalaya · 1 critical firing".into(),
-            text: "🚨 Disk <full> & more\n   /data at 95 %".into(),
-            worst: Some(Severity::Critical),
-            alerts: vec![],
-        };
-        let p = slack_payload(&msg);
-        assert_eq!(p["text"], "atalaya · 1 critical firing");
-        assert_eq!(p["attachments"][0]["color"], "#e01e5a");
-        let body = p["attachments"][0]["blocks"][0]["text"]["text"].as_str().unwrap();
-        assert!(body.starts_with("*atalaya · 1 critical firing*\n"), "{body}");
-        assert!(body.contains("Disk &lt;full&gt; &amp; more"), "{body}");
-        assert!(!body.contains("<full>"), "{body}");
+    fn slack_cards_one_per_alert_with_fields_sparkline_and_links() {
+        let cfg = slack_cfg();
+        let w = tr("target-down", &[("instance", "gpu-20ch"), ("job", "vllm")], "firing", 1000, Some(1000), 0.0);
+        let c = tr(
+            "disk-full",
+            &[("instance", "data-b"), ("mountpoint", "/data")],
+            "firing",
+            1010,
+            Some(1010),
+            96.0,
+        );
+        let mut sparks = HashMap::new();
+        sparks.insert(instance_key("disk-full", &c.labels), vec![71.0, 80.0, 96.0]);
+        let cards = slack_cards(&cfg, &[&w, &c], &sparks, Some("https://atalaya.example/"));
+        assert_eq!(cards.len(), 2);
+        let crit = &cards[0];
+        assert_eq!(crit["blocks"][0]["text"]["text"], "*🔴 CRITICAL · Disk almost full*");
+        assert_eq!(crit["attachments"][0]["color"], "#e01e5a");
+        let body = crit["attachments"][0]["blocks"].to_string();
+        assert!(body.contains("/data &lt;at&gt; 96 %"), "the summary is escaped: {body}");
+        assert!(body.contains("*Host*\\ndata-b") && body.contains("*Mount point*\\n/data"), "{body}");
+        assert!(body.contains("<!date^1010^{time} · {ago}|"), "{body}");
+        assert!(body.contains("`▁▄█`   71 → 96"), "{body}");
+        assert!(body.contains("<https://atalaya.example/#/alerts|View alert>"), "{body}");
+        let warn = cards[1]["attachments"][0]["blocks"].to_string();
+        assert!(warn.contains("<https://atalaya.example/#/dashboards/nomad|Dashboard>"), "{warn}");
+        assert!(warn.contains("#/logs?q=service%3Avllm|Logs of vllm>"), "{warn}");
+        assert!(!warn.contains("Last hour"), "no sparkline without its values: {warn}");
+        assert!(
+            !cards.iter().any(|c| c.to_string().contains("@here") || c.to_string().contains("<!here")),
+            "no mentions"
+        );
+    }
 
-        let resolved = Message { worst: None, ..msg };
-        assert_eq!(slack_payload(&resolved)["attachments"][0]["color"], "#2eb67d");
+    /// Fired and resolved in the same batch: one flapping card; resolved alone: how long it lasted
+    #[test]
+    fn slack_cards_flapping_and_resolved() {
+        let cfg = slack_cfg();
+        let l = [("instance", "gpu-20ch"), ("job", "vllm")];
+        let f = tr("target-down", &l, "firing", 1000, Some(1000), 0.0);
+        let r = tr("target-down", &l, "resolved", 1240, Some(1000), 0.0);
+        let cards = slack_cards(&cfg, &[&f, &r], &HashMap::new(), None);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["blocks"][0]["text"]["text"], "*⚡ FLAPPING · Service not reporting*");
+        assert!(cards[0].to_string().contains("(4 min)"), "{}", cards[0]);
 
-        let long = Message {
-            title: "t".into(),
-            text: "x".repeat(10_000),
-            worst: Some(Severity::Warning),
-            alerts: vec![],
-        };
-        let p = slack_payload(&long);
-        assert_eq!(p["attachments"][0]["color"], "#ecb22e");
-        let body = p["attachments"][0]["blocks"][0]["text"]["text"].as_str().unwrap();
-        assert!(body.chars().count() <= SLACK_SECTION_MAX + 2, "{}", body.chars().count());
-        assert!(body.ends_with('…'));
+        let r = tr(
+            "disk-full",
+            &[("instance", "data-b"), ("mountpoint", "/data")],
+            "resolved",
+            4300,
+            Some(1000),
+            62.0,
+        );
+        let cards = slack_cards(&cfg, &[&r], &HashMap::new(), None);
+        assert_eq!(cards[0]["blocks"][0]["text"]["text"], "*✅ RESOLVED · Disk almost full — after 55 min*");
+        assert_eq!(cards[0]["attachments"][0]["color"], "#2eb67d");
+        assert!(cards[0].to_string().contains("last value `62`"), "{}", cards[0]);
+    }
+
+    /// Past SLACK_MAX_CARDS, the rest of the batch goes in one last line
+    #[test]
+    fn slack_cards_are_capped() {
+        let cfg = slack_cfg();
+        let hosts: Vec<String> = (0..15).map(|i| format!("h{i}")).collect();
+        let trs: Vec<Transition> = hosts
+            .iter()
+            .map(|h| tr("target-down", &[("instance", h), ("job", "x")], "firing", 1, Some(1), 0.0))
+            .collect();
+        let refs: Vec<&Transition> = trs.iter().collect();
+        let cards = slack_cards(&cfg, &refs, &HashMap::new(), None);
+        assert_eq!(cards.len(), SLACK_MAX_CARDS);
+        assert!(
+            cards.last().unwrap().to_string().contains("*6* more alert changes"),
+            "{}",
+            cards.last().unwrap()
+        );
+    }
+
+    /// The sparkline draws the rule's expression without its threshold, so the values below it show too
+    #[test]
+    fn spark_expr_drops_the_threshold() {
+        assert_eq!(spark_expr("disk > 85").unwrap(), "disk");
+        assert_eq!(spark_expr("85 < disk").unwrap(), "disk");
+        assert_eq!(spark_expr(r#"(up{job="x"} == 0)"#).unwrap(), r#"up{job="x"}"#);
+        assert_eq!(spark_expr("100 * (1 - a / b) > 85").unwrap(), "100 * (1 - a / b)");
+        assert_eq!(spark_expr("absent(up)").unwrap(), "absent(up)");
+        assert!(spark_expr("not promql (").is_none());
+    }
+
+    #[test]
+    fn sparkline_and_durations() {
+        assert_eq!(sparkline(&[0.0, 7.0]).unwrap(), "▁█");
+        assert_eq!(sparkline(&[3.0, 3.0, 3.0]).unwrap(), "▄▄▄");
+        assert!(sparkline(&[1.0]).is_none());
+        assert!(sparkline(&[f64::NAN, 1.0]).is_none());
+        assert_eq!(sparkline(&(0..100).map(f64::from).collect::<Vec<_>>()).unwrap().chars().count(), SPARK_POINTS);
+        assert_eq!(human_duration(45), "45 s");
+        assert_eq!(human_duration(240), "4 min");
+        assert_eq!(human_duration(3600 + 300), "1 h 5 min");
+        assert_eq!(human_duration(2 * 86400), "2 d");
+    }
+
+    /// Transitions queued before `since` existed (outbox.json) still load
+    #[test]
+    fn a_transition_without_since_loads() {
+        let t: Transition = serde_json::from_str(r#"{"ts":1,"rule":"a","labels":{},"from":"pending","to":"firing","value":1}"#).unwrap();
+        assert_eq!(t.since, None);
     }
 
     /// A slack channel names its webhook URL variable, like the webhook channel
@@ -1483,11 +1890,12 @@ rules:
             from: "pending".into(),
             to: "firing".into(),
             value: 1.0,
+            since: None,
         };
         let copy = a.state.lock().await.clone();
         a.finish_cycle(&cfg, copy, vec![tr], now()).await;
         assert_eq!(a.pending().await, 1);
-        a.deliver().await; // fails: the webhook variable is not set
+        a.deliver(None).await; // fails: the webhook variable is not set
         {
             let q = a.queue.lock().await;
             assert_eq!(q.len(), 1);
