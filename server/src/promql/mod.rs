@@ -71,7 +71,20 @@ pub struct Timing {
 
 pub struct Engine {
     pub store: Store,
+    /// Most samples one query may read (ATALAYA_MAX_SAMPLES), like Prometheus' query.max-samples
+    max_samples: u64,
+    /// Samples being read or evaluated right now, across queries: a query reserves its estimate
+    /// before reading, and waits while others hold the budget (max_samples in all, so the memory
+    /// of every query at once stays about that of the largest one allowed)
+    in_flight: std::sync::Arc<tokio::sync::Semaphore>,
+    /// The same budget for alert evaluation, apart: queries from the UI and the API cannot hold
+    /// alerts back by keeping theirs busy
+    alerts_in_flight: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+/// Default for ATALAYA_MAX_SAMPLES. Measured on a release build, a query takes 30 to 100 bytes per
+/// sample read (the ClickHouse answer, the series, a join, the JSON): 5 million is up to ~500 MiB
+const MAX_SAMPLES: u64 = 5_000_000;
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -161,11 +174,40 @@ fn collect<'a>(e: &'a Expr, out: &mut Vec<(&'a VectorSelector, i64)>) -> Result<
 
 impl Engine {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        let max_samples = std::env::var("ATALAYA_MAX_SAMPLES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MAX_SAMPLES);
+        Self::with_max_samples(store, max_samples)
+    }
+
+    pub fn with_max_samples(store: Store, max_samples: u64) -> Self {
+        let max_samples = max_samples.min(u64::from(u32::MAX));
+        Self {
+            store,
+            max_samples,
+            in_flight: std::sync::Arc::new(tokio::sync::Semaphore::new(max_samples as usize)),
+            alerts_in_flight: std::sync::Arc::new(tokio::sync::Semaphore::new(max_samples as usize)),
+        }
     }
 
     /// Range query: steps start, start+step, ..., end
     pub async fn range(&self, query: &str, start: i64, end: i64, step: i64) -> Result<Evaluated> {
+        self.run(query, start, end, step, &self.in_flight).await
+    }
+
+    /// A range query for alerts (rules, sparklines), with a budget of their own
+    pub async fn range_for_alerts(&self, query: &str, start: i64, end: i64, step: i64) -> Result<Evaluated> {
+        self.run(query, start, end, step, &self.alerts_in_flight).await
+    }
+
+    /// An instant query for alert rules, with a budget of their own
+    pub async fn instant_for_alerts(&self, query: &str, time: i64) -> Result<Evaluated> {
+        self.range_for_alerts(query, time, time, 15).await
+    }
+
+    async fn run(&self, query: &str, start: i64, end: i64, step: i64, budget: &std::sync::Arc<tokio::sync::Semaphore>) -> Result<Evaluated> {
         if step <= 0 {
             bail!("step must be positive");
         }
@@ -231,12 +273,33 @@ impl Engine {
             n.to = n.to.max(to);
         }
 
-        let fetches = needs.into_iter().map(|(k, n)| async move {
+        // First the series of each selector, to know how much the query would read before reading
+        // it: a few selectors over thousands of series and days of data took the server past
+        // 18 GiB and the kernel killed it (and in a container, past its memory limit)
+        let selects = needs.into_iter().map(|(k, n)| async move {
             let t = std::time::Instant::now();
             let series = self.store.select(&n.vs.name, &n.vs.matchers, n.from).await?;
-            let series_ms = t.elapsed().as_millis();
+            Ok::<_, anyhow::Error>((k, n.from, n.to, series, t.elapsed().as_millis()))
+        });
+        let selected = futures::future::try_join_all(selects).await?;
+        let estimate: u64 = selected
+            .iter()
+            .map(|(_, from, to, series, _)| store::estimate_samples(series, *from, *to, tier, group))
+            .sum();
+        if estimate > self.max_samples {
+            bail!(
+                "the query would read about {estimate} samples, more than the {} allowed (ATALAYA_MAX_SAMPLES): narrow the selectors, shorten the range or increase the step",
+                self.max_samples
+            );
+        }
+        // Waits while other queries hold the budget (released when this one is done, result included)
+        // (never more than the whole budget, or it would wait forever)
+        let permits = estimate.clamp(1, self.max_samples) as u32;
+        let _permit = budget.clone().acquire_many_owned(permits).await?;
+
+        let fetches = selected.into_iter().map(|(k, from, to, series, series_ms)| async move {
             let t = std::time::Instant::now();
-            let samples = self.store.samples(series, n.from, n.to, tier, group).await?;
+            let samples = self.store.samples(series, from, to, tier, group).await?;
             Ok::<_, anyhow::Error>((k, samples, series_ms, t.elapsed().as_millis()))
         });
         let mut timing = Timing::default();
@@ -248,18 +311,31 @@ impl Engine {
             samples_read += samples.iter().map(|s| s.ts.len()).sum::<usize>();
             data.insert(k, samples);
         }
+        if samples_read as u64 > self.max_samples {
+            bail!(
+                "the query read {samples_read} samples, more than the {} allowed (ATALAYA_MAX_SAMPLES)",
+                self.max_samples
+            );
+        }
 
+        // Evaluating is CPU work (seconds for a large query): on the async runtime it held a worker
+        // thread for all that time, and a few of them at once stalled every request and the alerts
         let t = std::time::Instant::now();
-        let ev = eval::Evaluator {
-            start,
-            end,
-            step,
-            n: ((end - start) / step + 1) as usize,
-            lookback,
-            min_range,
-            data: &data,
-        };
-        let output = ev.run(&expr)?;
+        let n = ((end - start) / step + 1) as usize;
+        let output = tokio::task::spawn_blocking(move || {
+            let ev = eval::Evaluator {
+                start,
+                end,
+                step,
+                n,
+                lookback,
+                min_range,
+                data: &data,
+            };
+            ev.run(&expr)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("evaluation failed: {e}"))??;
         timing.eval_ms = t.elapsed().as_millis();
         Ok(Evaluated {
             output,
@@ -291,5 +367,70 @@ mod tests {
         }
         let err = engine.instant("up", i64::MIN).await.err().expect("refused");
         assert!(err.to_string().contains("invalid range"), "{err}");
+    }
+
+    /// A ClickHouse with one gauge, `x`, with `n` series of one point each. Returns its URL and
+    /// whether it was asked for points
+    async fn fake_clickhouse(n: usize) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use axum::{Router, body::Bytes, routing::post};
+        let read_points = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = read_points.clone();
+        let app = Router::new().fallback(post(move |body: Bytes| {
+            let flag = flag.clone();
+            async move {
+                let sql = String::from_utf8_lossy(&body).into_owned();
+                if sql.contains("metric_descriptors") {
+                    return serde_json::json!({ "data": [{ "m": "x", "dist": 0, "kind": "gauge" }] })
+                        .to_string()
+                        .into_bytes();
+                }
+                if sql.contains(".series") {
+                    let rows: Vec<_> = (0..n)
+                        .map(|i| serde_json::json!({ "id": i + 1, "m": "x", "s": "svc", "r": {}, "l": { "i": i.to_string() }, "b": [] }))
+                        .collect();
+                    return serde_json::json!({ "data": rows }).to_string().into_bytes();
+                }
+                if sql.contains(".points") {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Vec::new()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/"), read_points)
+    }
+
+    /// A query that would read more samples than allowed is refused before reading them: a few such
+    /// queries took the server past 18 GiB until the kernel killed it
+    #[tokio::test]
+    async fn a_query_over_the_sample_budget_is_refused_before_reading() {
+        let (url, read_points) = fake_clickhouse(100).await;
+        let engine = Engine::with_max_samples(Store::new(crate::ch::ClickHouse::new(url, "u".into(), String::new()), "atalaya".into()), 1000);
+        let end = now() - 60;
+        // 100 series × an hour and its lookback at 15 s: ~26,000 samples
+        let err = engine.range("x", end - 3600, end, 15).await.err().expect("refused");
+        assert!(err.to_string().contains("ATALAYA_MAX_SAMPLES"), "{err}");
+        assert!(!read_points.load(std::sync::atomic::Ordering::SeqCst), "it did not read the points");
+        // Within the budget it runs
+        let (url, read_points) = fake_clickhouse(2).await;
+        let engine = Engine::with_max_samples(Store::new(crate::ch::ClickHouse::new(url, "u".into(), String::new()), "atalaya".into()), 1000);
+        engine.range("x", end - 3600, end, 15).await.expect("within the budget");
+        assert!(read_points.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Queries from the UI holding the whole budget wait for it, but alert rules do not: they have
+    /// a budget of their own
+    #[tokio::test]
+    async fn alerts_do_not_wait_for_the_budget_of_other_queries() {
+        let (url, _) = fake_clickhouse(2).await;
+        let engine = Engine::with_max_samples(Store::new(crate::ch::ClickHouse::new(url, "u".into(), String::new()), "atalaya".into()), 1000);
+        let _busy = engine.in_flight.clone().acquire_many_owned(1000).await.unwrap();
+        let t = now() - 60;
+        let wait = std::time::Duration::from_millis(500);
+        assert!(tokio::time::timeout(wait, engine.instant("x", t)).await.is_err(), "a UI query waits");
+        let r = tokio::time::timeout(wait, engine.instant_for_alerts("x", t)).await;
+        assert!(r.is_ok_and(|r| r.is_ok()), "an alert rule does not");
     }
 }

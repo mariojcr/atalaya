@@ -23,6 +23,7 @@
 | `ATALAYA_OIDC_INTERNAL` | the issuer | Where the server reaches the provider, if not at the issuer URL |
 | `ATALAYA_SESSION_KEY` | unset | Secret that signs the session cookie, 32+ characters (needed with sign-in) |
 | `ATALAYA_SESSION_DAYS` | `30` | Session length |
+| `ATALAYA_MAX_SAMPLES` | `5000000` | Most samples a PromQL query may read; also the total of all queries running at once (the rest wait). A query takes 30 to 100 bytes per sample, so 5 million is up to ~500 MiB: raise it with the server's memory. A query over the limit fails with a message saying so |
 | `ATALAYA_NOW_DELAY` | `45` | Seconds panels, alerts and the home page stay behind now: the time for data to arrive. 45 fits the collector's default 30 s `flush_interval`; with 15 s, 30 is enough |
 | `ATALAYA_REFRESH` | `60` | Seconds between automatic refreshes of the pages that are not dashboards (each dashboard has its own `refresh`) |
 
