@@ -120,16 +120,17 @@ impl Collector {
             n,
         }
     }
+    /// The output series with these labels (cloned only when it is new)
     fn slot(&mut self, l: Labels) -> usize {
-        let n = self.n;
-        let out = &mut self.out;
-        *self.idx.entry(l.clone()).or_insert_with(|| {
-            out.push(Series {
-                labels: l,
-                vals: vec![None; n],
-            });
-            out.len() - 1
-        })
+        if let Some(&s) = self.idx.get(&l) {
+            return s;
+        }
+        self.out.push(Series {
+            labels: l.clone(),
+            vals: vec![None; self.n],
+        });
+        self.idx.insert(l, self.out.len() - 1);
+        self.out.len() - 1
     }
     fn set(&mut self, l: Labels, i: usize, v: f64) {
         let s = self.slot(l);
@@ -402,6 +403,24 @@ impl Evaluator<'_> {
     }
 
     /// Applies `f` to the window (t - range, t] of each series at each step
+    /// over_range for a result that grows with the window: an increase, a delta, a sum, a count.
+    /// A window shorter than `min_range` is widened so the sparse samples of a grouped tier still
+    /// fall in it, and the result is then for the widened window: it is scaled back to the window
+    /// asked for. Without that, increase(x[1m]) at a 60 s step on the 1-minute tier was twice the
+    /// real increase, and an hourly increase with a 3 h step three times
+    fn over_range_extensive(&self, ms: &MatrixSelector, keep_name: bool, f: impl Fn(&[i64], &[f64], i64, i64) -> Option<f64>) -> Vec<Series> {
+        let asked = ms.range.as_secs() as i64;
+        let range = asked.max(self.min_range);
+        let mut out = self.over_range(ms, keep_name, f);
+        if asked > 0 && range > asked {
+            let k = asked as f64 / range as f64;
+            for v in out.iter_mut().flat_map(|s| s.vals.iter_mut().flatten()) {
+                *v *= k;
+            }
+        }
+        out
+    }
+
     fn over_range(&self, ms: &MatrixSelector, keep_name: bool, f: impl Fn(&[i64], &[f64], i64, i64) -> Option<f64>) -> Vec<Series> {
         let range = (ms.range.as_secs() as i64).max(self.min_range);
         let times = self.eval_times(&ms.vs);
@@ -604,9 +623,19 @@ impl Evaluator<'_> {
         }
 
         let mut c = Collector::new(self.n);
-        let mut label_cache: HashMap<(usize, usize), Labels> = HashMap::new();
-        // One-to-one: each signature may appear only once per step on the left side
-        let mut seen: HashMap<(usize, &Labels), usize> = HashMap::new();
+        // The output series of each (many, one) pair, resolved once: cloning and hashing its labels
+        // at every step was most of the time and memory of a large join
+        let mut slots: HashMap<(usize, usize), usize> = HashMap::new();
+        // One-to-one: each signature may appear only once per step on the left side. Only the
+        // signatures several left series share can break that, and only those keep a row per step
+        let mut shared: HashMap<&Labels, usize> = HashMap::new();
+        if one_to_one {
+            for sg in &many_sig {
+                *shared.entry(sg).or_default() += 1;
+            }
+            shared.retain(|_, n| *n > 1);
+        }
+        let mut seen: HashMap<&Labels, Vec<Option<usize>>> = HashMap::new();
         for (m, ms) in many.iter().enumerate() {
             let Some(cands) = by_sig.get(&many_sig[m]) else { continue };
             for i in 0..self.n {
@@ -625,7 +654,8 @@ impl Evaluator<'_> {
                     );
                 }
                 if one_to_one
-                    && let Some(prev) = seen.insert((i, &many_sig[m]), m)
+                    && shared.contains_key(&many_sig[m])
+                    && let Some(prev) = seen.entry(&many_sig[m]).or_insert_with(|| vec![None; self.n])[i].replace(m)
                     && prev != m
                 {
                     bail!(
@@ -644,9 +674,8 @@ impl Evaluator<'_> {
                 if return_bool {
                     v = if keep { 1.0 } else { 0.0 };
                 }
-                let labels = label_cache
-                    .entry((m, j))
-                    .or_insert_with(|| {
+                let slot = *slots.entry((m, j)).or_insert_with(|| {
+                    c.slot({
                         let mut out = ms.labels.clone();
                         if drop {
                             out.remove("__name__");
@@ -670,8 +699,8 @@ impl Evaluator<'_> {
                         }
                         out
                     })
-                    .clone();
-                c.set(labels, i, v);
+                });
+                c.out[slot].vals[i] = Some(v);
             }
         }
         Ok(c.finish())
@@ -793,7 +822,12 @@ impl Evaluator<'_> {
                 let ms = self.matrix(c, 0)?;
                 let counter = name != "delta";
                 let is_rate = name == "rate";
-                Val::Vector(self.over_range(ms, false, |ts, vs, from, to| extrapolated(ts, vs, from, to, counter, is_rate)))
+                let f = |ts: &[i64], vs: &[f64], from: i64, to: i64| extrapolated(ts, vs, from, to, counter, is_rate);
+                Val::Vector(if is_rate {
+                    self.over_range(ms, false, f)
+                } else {
+                    self.over_range_extensive(ms, false, f)
+                })
             }
             "irate" | "idelta" => {
                 let ms = self.matrix(c, 0)?;
@@ -804,7 +838,7 @@ impl Evaluator<'_> {
             "changes" | "resets" => {
                 let ms = self.matrix(c, 0)?;
                 let resets = name == "resets";
-                Val::Vector(self.over_range(ms, false, |_, vs, _, _| {
+                Val::Vector(self.over_range_extensive(ms, false, |_, vs, _, _| {
                     Some(vs.windows(2).filter(|w| if resets { w[1] < w[0] } else { w[1] != w[0] }).count() as f64)
                 }))
             }
@@ -822,7 +856,7 @@ impl Evaluator<'_> {
             | "stddev_over_time" | "stdvar_over_time" => {
                 let ms = self.matrix(c, 0)?;
                 let keep = name == "last_over_time";
-                Val::Vector(self.over_range(ms, keep, |_, vs, _, _| {
+                let f = |_: &[i64], vs: &[f64], _: i64, _: i64| {
                     Some(match name {
                         "avg_over_time" => vs.iter().sum::<f64>() / vs.len() as f64,
                         "min_over_time" => vs.iter().copied().fold(f64::INFINITY, f64::min),
@@ -834,7 +868,12 @@ impl Evaluator<'_> {
                         "stddev_over_time" => stdvar(vs).sqrt(),
                         _ => stdvar(vs),
                     })
-                }))
+                };
+                Val::Vector(if matches!(name, "sum_over_time" | "count_over_time") {
+                    self.over_range_extensive(ms, keep, f)
+                } else {
+                    self.over_range(ms, keep, f)
+                })
             }
             "quantile_over_time" => {
                 let q = self.scalar(self.arg(c, 0)?)?;
@@ -1131,6 +1170,44 @@ mod tests {
         assert_eq!(mounts(r#"sort_by_label_desc(used, "mount")"#), ["/d", "/c", "/b", "/a"]);
     }
 
+    /// On a grouped tier a short window is widened to `min_range` (two buckets) so the sparse
+    /// samples still fall in it. What grows with the window comes back scaled to the window asked
+    /// for: increase(x[1m]) at a 60 s step on the 1-minute tier was twice the real increase (and
+    /// twenty times at a 600 s step on the 10-minute tier). A rate is per second already
+    #[test]
+    fn widened_windows_do_not_inflate_increases_sums_or_counts() {
+        // A counter growing 15/s, one sample a minute (the 1-minute tier)
+        let c = || vec![("c_total", vec![counter(labels(&[("__name__", "c_total")]), 0, 200, 60, 900.0)])];
+        let eval = |q: &str| {
+            let expr = promql_parser::parser::parse(q).unwrap();
+            let data: HashMap<String, Vec<Samples>> = c().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            let ev = Evaluator {
+                start: 3600,
+                end: 7200,
+                step: 60,
+                n: 61,
+                lookback: 300,
+                min_range: 120,
+                data: &data,
+            };
+            match ev.run(&expr).unwrap() {
+                Output::Matrix(m) => m[0].1.iter().map(|p| p.1).collect::<Vec<f64>>(),
+                _ => panic!("expected a vector"),
+            }
+        };
+        for (q, want) in [
+            ("increase(c_total[1m])", 900.0),
+            ("delta(c_total[1m])", 900.0),
+            ("rate(c_total[1m])", 15.0),
+            ("count_over_time(c_total[1m])", 1.0),
+        ] {
+            let got = eval(q);
+            assert!(got.iter().all(|v| (v - want).abs() < 1e-6 * want.max(1.0)), "{q}: {:?}", &got[..3]);
+        }
+        // A window that already spans min_range is not touched
+        assert!(eval("increase(c_total[5m])").iter().all(|v| (v - 4500.0).abs() < 1e-6), "increase over 5m");
+    }
+
     fn run(q: &str, data: Vec<(&str, Vec<Samples>)>, start: i64, end: i64, step: i64) -> Out {
         try_run(q, data, start, end, step).unwrap()
     }
@@ -1323,8 +1400,31 @@ mod tests {
         // A single candidate still works, and group_left allows many on the left
         let r = run("a / on(job) b", vec![("a", vec![a.clone()]), ("b", vec![b1.clone()])], 0, 0, 15);
         assert_eq!(r[0].1[0].1, 5.0);
-        let r = run("b / on(job) group_left a", vec![("a", vec![a]), ("b", vec![b1, b2])], 0, 0, 15);
+        let r = run(
+            "b / on(job) group_left a",
+            vec![("a", vec![a.clone()]), ("b", vec![b1.clone(), b2.clone()])],
+            0,
+            0,
+            15,
+        );
         assert_eq!(r.len(), 2);
+        // Two series on the left with the same signature at the same step: also an error
+        let e = try_run("b / on(job) a", vec![("a", vec![a.clone()]), ("b", vec![b1.clone(), b2])], 0, 0, 15).unwrap_err();
+        assert!(e.to_string().contains("left hand-side"), "{e}");
+        // …but not when they never coincide (one ends before the other starts)
+        let late = Samples {
+            labels: labels(&[("__name__", "b"), ("job", "x"), ("i", "3")]),
+            ts: vec![600],
+            vals: vec![4.0],
+            ..Default::default()
+        };
+        let a2 = Samples {
+            ts: vec![0, 600],
+            vals: vec![10.0, 10.0],
+            ..a
+        };
+        let r = try_run("b / on(job) a", vec![("a", vec![a2]), ("b", vec![b1, late])], 0, 600, 600).unwrap();
+        assert_eq!(r.iter().flat_map(|(_, p)| p.iter().map(|x| x.1)).collect::<Vec<_>>(), vec![0.2, 0.4]);
     }
 
     #[test]

@@ -634,7 +634,7 @@ impl Alerts {
         let at = now() - crate::app::now_delay();
         match rule.kind {
             Kind::Metric => {
-                let r = app.promql.instant(&rule.expr, at).await?;
+                let r = app.promql.instant_for_alerts(&rule.expr, at).await?;
                 let mut out = Vec::new();
                 match r.output {
                     Output::Matrix(m) => {
@@ -1268,7 +1268,7 @@ async fn slack_sparks(engine: &atalaya::promql::Engine, cfg: &Config, trs: &[&Tr
             continue;
         };
         let Some(expr) = spark_expr(&rule.expr) else { continue };
-        let Ok(r) = engine.range(&expr, tr.ts - SPARK_RANGE, tr.ts, SPARK_STEP).await else {
+        let Ok(r) = engine.range_for_alerts(&expr, tr.ts - SPARK_RANGE, tr.ts, SPARK_STEP).await else {
             continue;
         };
         if let Output::Matrix(m) = r.output

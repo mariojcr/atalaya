@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use futures::StreamExt;
 use promql_parser::label::{MatchOp, Matcher, Matchers};
 use tokio::sync::Mutex;
 
@@ -27,6 +28,13 @@ pub const RAW_DAYS: i64 = 7;
 pub const ONE_MINUTE_DAYS: i64 = 42;
 /// Maximum series per selector
 const MAX_SERIES: usize = 20_000;
+/// Series ids per sample query: ~45 KiB of URL (see `samples`)
+const IDS_PER_QUERY: usize = 2_000;
+/// Chunks of one selector read at the same time
+const CHUNKS_AT_ONCE: usize = 4;
+
+/// What one chunk of ids brings: scalar rows, distribution rows and staleness markers per id
+type ChunkRows = (HashMap<u64, Vec<ScalarRow>>, HashMap<u64, Vec<DistRow>>, HashMap<u64, Vec<i64>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -550,20 +558,89 @@ impl Store {
         metrics.dedup();
         let has_dist = series.iter().any(|s| s.kind == Kind::Distribution);
         let has_scalar = series.iter().any(|s| s.kind != Kind::Distribution);
+        let res = tier.res();
+        // The ids go in the URL (param_ids), and ClickHouse rejects a form field longer than
+        // 128 KiB: past ~5,700 series a selector failed with a 502 (and reqwest refuses a URL past
+        // 64 KiB before that). Bounded chunks, a few at a time, keep each query and its URL small
+        let mut scalar: HashMap<u64, Vec<ScalarRow>> = HashMap::new();
+        let mut dist: HashMap<u64, Vec<DistRow>> = HashMap::new();
+        let mut stale: HashMap<u64, Vec<i64>> = HashMap::new();
+        {
+            // Collected first: a lazy iterator with a closure inside the stream makes the future
+            // not Send ("implementation of Send is not general enough")
+            let chunks: Vec<_> = ids
+                .chunks(IDS_PER_QUERY)
+                .map(|chunk| self.samples_chunk(chunk, &metrics, from, to, tier, group, has_scalar, has_dist))
+                .collect();
+            let mut parts = futures::stream::iter(chunks).buffer_unordered(CHUNKS_AT_ONCE);
+            while let Some(part) = parts.next().await {
+                let (sc, di, st) = part?;
+                scalar.extend(sc);
+                dist.extend(di);
+                stale.extend(st);
+            }
+        }
+
+        Ok(series
+            .into_iter()
+            .map(|s| {
+                let mut out = Samples {
+                    labels: s.labels,
+                    stale: stale.remove(&s.id).unwrap_or_default(),
+                    ..Default::default()
+                };
+                match s.field {
+                    Field::Value => {
+                        let rows = scalar.get(&s.id).map(Vec::as_slice).unwrap_or_default();
+                        if s.kind == Kind::Counter {
+                            (out.ts, out.vals) = counter_samples(rows, group.max(res));
+                        } else {
+                            out.ts.extend(rows.iter().map(|p| p.t));
+                            out.vals.extend(rows.iter().map(|p| p.g));
+                        }
+                    }
+                    f => {
+                        for (t, c, sum, bk) in dist.get(&s.id).map(Vec::as_slice).unwrap_or_default() {
+                            let v = match f {
+                                Field::Count => Some(*c),
+                                Field::Sum => Some(*sum),
+                                Field::Bucket(i) => bk.get(i).copied(),
+                                Field::Value => None,
+                            };
+                            if let Some(v) = v {
+                                out.ts.push(*t);
+                                out.vals.push(v);
+                            }
+                        }
+                    }
+                }
+                out
+            })
+            .collect())
+    }
+
+    /// The rows of one chunk of series ids: scalar points, distributions and staleness markers
+    #[allow(clippy::too_many_arguments)]
+    async fn samples_chunk(
+        &self,
+        ids: &[u64],
+        metrics: &[&str],
+        from: i64,
+        to: i64,
+        tier: Tier,
+        group: i64,
+        has_scalar: bool,
+        has_dist: bool,
+    ) -> Result<ChunkRows> {
         let db = &self.db;
         let res = tier.res();
         let params: Vec<Param> = vec![
-            ("metrics".into(), crate::ch::array_param(&metrics)),
-            ("ids".into(), serde_json::to_string(&ids)?),
+            ("metrics".into(), crate::ch::array_param(metrics)),
+            ("ids".into(), serde_json::to_string(ids)?),
             ("from".into(), (from - if tier == Tier::Raw { 0 } else { res }).to_string()),
             ("to".into(), to.to_string()),
         ];
         let (scalar_sql, dist_sql) = sample_queries(db, tier, group);
-
-        // id → its rows
-        let mut scalar: HashMap<u64, Vec<ScalarRow>> = HashMap::new();
-        // id → (t, count, sum, buckets)
-        let mut dist: HashMap<u64, Vec<DistRow>> = HashMap::new();
         let settings: &[(&str, &str)] = &[("optimize_aggregation_in_order", "1"), ("max_threads", "8")];
         let stale_sql = format!(
             "SELECT toUInt64(SeriesId), toInt64(toUnixTimestamp(Time)) AS t FROM {db}.stale
@@ -604,9 +681,12 @@ impl Store {
             }
             Err(_) => {}
         }
+        let mut scalar = HashMap::new();
         if let Some(body) = a? {
             scalar = read_scalar_rows(&body, tier, group > res)?;
         }
+        // id → (t, count, sum, buckets)
+        let mut dist: HashMap<u64, Vec<DistRow>> = HashMap::new();
         if let Some(body) = b? {
             let mut r = Cursor::new(&body);
             while let (Some(id), Some(t), Some(c), Some(s), Some(bk)) = (r.u64(), r.i64(), r.u64(), r.f64(), r.u64_array()) {
@@ -618,43 +698,7 @@ impl Store {
             }
             r.finish("distributions")?;
         }
-
-        Ok(series
-            .into_iter()
-            .map(|s| {
-                let mut out = Samples {
-                    labels: s.labels,
-                    stale: stale.remove(&s.id).unwrap_or_default(),
-                    ..Default::default()
-                };
-                match s.field {
-                    Field::Value => {
-                        let rows = scalar.get(&s.id).map(Vec::as_slice).unwrap_or_default();
-                        if s.kind == Kind::Counter {
-                            (out.ts, out.vals) = counter_samples(rows, group.max(res));
-                        } else {
-                            out.ts.extend(rows.iter().map(|p| p.t));
-                            out.vals.extend(rows.iter().map(|p| p.g));
-                        }
-                    }
-                    f => {
-                        for (t, c, sum, bk) in dist.get(&s.id).map(Vec::as_slice).unwrap_or_default() {
-                            let v = match f {
-                                Field::Count => Some(*c),
-                                Field::Sum => Some(*sum),
-                                Field::Bucket(i) => bk.get(i).copied(),
-                                Field::Value => None,
-                            };
-                            if let Some(v) = v {
-                                out.ts.push(*t);
-                                out.vals.push(v);
-                            }
-                        }
-                    }
-                }
-                out
-            })
-            .collect())
+        Ok((scalar, dist, stale))
     }
 
     /// Values of a label among the series matching the selectors
@@ -713,6 +757,25 @@ impl Store {
 /// count, sum, buckets). With `group` above the tier resolution a row is a group
 /// of buckets, and scalar rows add their first bucket: the time of its last
 /// sample and its minimum.
+/// About how many samples reading these series over (from, to] brings: one per scrape on the raw
+/// tier (15 s), one per bucket or group on the others, and twice that for counters (their bucket
+/// minimum at its start)
+pub fn estimate_samples(series: &[SeriesRef], from: i64, to: i64, tier: Tier, group: i64) -> u64 {
+    let span = (to - from).max(0) as u64;
+    let every = group.max(tier.res()).max(1) as u64;
+    let per_series = span / every + 1;
+    series
+        .iter()
+        .map(|s| {
+            if s.kind == Kind::Counter && tier != Tier::Raw {
+                2 * per_series
+            } else {
+                per_series
+            }
+        })
+        .sum()
+}
+
 fn sample_queries(db: &str, tier: Tier, group: i64) -> (String, String) {
     let res = tier.res();
     let sfx = tier.suffix();
@@ -1180,5 +1243,86 @@ mod cursor_tests {
         assert!(Cursor::new(&b).u64_array().is_none());
         // varint that never ends
         assert!(Cursor::new(&[0xff; 20]).varint().is_none());
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    /// A ClickHouse that answers a raw-points query with one row per requested id, an empty body to
+    /// the rest (staleness markers), and rejects a URL longer than 128 KiB as ClickHouse does
+    /// ("HTML Form Exception: Field value too long"). Returns its URL and the longest URL it got
+    async fn fake_clickhouse() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{Router, body::Bytes, extract::RawQuery, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let longest = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = longest.clone();
+        let app = Router::new().fallback(post(move |RawQuery(q): RawQuery, body: Bytes| {
+            let seen = seen.clone();
+            async move {
+                let q = q.unwrap_or_default();
+                seen.fetch_max(q.len(), Ordering::SeqCst);
+                if q.len() > 128 << 10 {
+                    return (StatusCode::BAD_REQUEST, b"HTML Form Exception: Field value too long".to_vec());
+                }
+                let sql = String::from_utf8_lossy(&body);
+                if !sql.contains(".points") {
+                    return (StatusCode::OK, Vec::new());
+                }
+                // param_ids, percent-decoded (the URL is built by reqwest's form serializer)
+                let raw = q.split('&').find_map(|kv| kv.strip_prefix("param_ids=")).unwrap_or("[]");
+                let mut bytes = Vec::new();
+                let mut it = raw.bytes();
+                while let Some(b) = it.next() {
+                    match b {
+                        b'%' => {
+                            let hex: String = it.by_ref().take(2).map(char::from).collect();
+                            bytes.push(u8::from_str_radix(&hex, 16).unwrap());
+                        }
+                        b'+' => bytes.push(b' '),
+                        b => bytes.push(b),
+                    }
+                }
+                let ids: Vec<u64> = serde_json::from_slice(&bytes).unwrap();
+                let mut out = Vec::new();
+                for id in ids {
+                    out.extend(id.to_le_bytes());
+                    out.extend(100i64.to_le_bytes());
+                    for v in [id as f64, id as f64, id as f64] {
+                        out.extend(v.to_le_bytes());
+                    }
+                }
+                (StatusCode::OK, out)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/"), longest)
+    }
+
+    /// A selector over more series than fit in one URL is read in chunks: before, past ~5,700 ids
+    /// the query failed (ClickHouse rejects the param_ids field, reqwest a URL over 64 KiB)
+    #[tokio::test]
+    async fn a_selector_over_many_series_is_read_in_chunks() {
+        let (url, longest) = fake_clickhouse().await;
+        let store = Store::new(ClickHouse::new(url, "u".into(), String::new()), "atalaya".into());
+        let n = 15_000u64;
+        let series: Vec<SeriesRef> = (0..n)
+            .map(|i| SeriesRef {
+                labels: [("cpu".to_owned(), i.to_string())].into(),
+                // Ids as large as real hashes, the worst case for the URL
+                id: u64::MAX - i,
+                metric: "node_cpu_seconds_total".into(),
+                kind: Kind::Gauge,
+                field: Field::Value,
+            })
+            .collect();
+        let out = store.samples(series, 0, 200, Tier::Raw, 0).await.unwrap();
+        assert_eq!(out.len(), n as usize);
+        assert!(out.iter().all(|s| s.vals.len() == 1), "every series got its point");
+        assert_eq!(out[0].vals[0], u64::MAX as f64);
+        assert!(longest.load(std::sync::atomic::Ordering::SeqCst) < 64 << 10, "each URL stays under 64 KiB");
     }
 }

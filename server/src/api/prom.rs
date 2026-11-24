@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap, ser::SerializeSeq};
 use serde_json::{Value, json};
 
 use atalaya::promql::{self, Output};
@@ -105,12 +105,79 @@ fn prom_success(data: Value, extra: Value) -> Response {
     Json(json!({ "status": "success", "data": data, "atalaya": extra })).into_response()
 }
 
-fn matrix_json(m: Vec<(promql::Labels, Vec<(i64, f64)>)>) -> Value {
-    Value::Array(
-        m.into_iter()
-            .map(|(l, pts)| json!({ "metric": l, "values": pts.into_iter().map(|(t, v)| json!([t, promql::fmt_value(v)])).collect::<Vec<_>>() }))
-            .collect(),
-    )
+/// A matrix result as the Prometheus API writes it, serialized straight from the evaluated series.
+/// Building it first as a serde_json::Value cost ~400 bytes per point (an array, a number and a
+/// string each): 1.4 GiB for an answer of 2.8 million points, when the points themselves take 16
+/// bytes each
+struct MatrixJson(Vec<(promql::Labels, Vec<(i64, f64)>)>);
+
+impl Serialize for MatrixJson {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for (labels, points) in &self.0 {
+            seq.serialize_element(&SeriesJson(labels, points))?;
+        }
+        seq.end()
+    }
+}
+
+struct SeriesJson<'a>(&'a promql::Labels, &'a [(i64, f64)]);
+
+impl Serialize for SeriesJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(2))?;
+        m.serialize_entry("metric", self.0)?;
+        m.serialize_entry("values", &PointsJson(self.1))?;
+        m.end()
+    }
+}
+
+struct PointsJson<'a>(&'a [(i64, f64)]);
+
+impl Serialize for PointsJson<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for (t, v) in self.0 {
+            seq.serialize_element(&(t, promql::fmt_value(*v)))?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+struct MatrixData {
+    #[serde(rename = "resultType")]
+    result_type: &'static str,
+    result: MatrixJson,
+}
+
+/// A successful range query: what /api/v1/query_range returns, and each entry of a batch
+#[derive(Serialize)]
+struct RangeSuccess {
+    status: &'static str,
+    data: MatrixData,
+    atalaya: Value,
+}
+
+impl RangeSuccess {
+    fn new(m: Vec<(promql::Labels, Vec<(i64, f64)>)>, extra: Value) -> Self {
+        Self {
+            status: "success",
+            data: MatrixData {
+                result_type: "matrix",
+                result: MatrixJson(m),
+            },
+            atalaya: extra,
+        }
+    }
+}
+
+/// One result of a batch: the range query's answer, or its error
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BatchResult {
+    Ok(RangeSuccess),
+    Err(Value),
 }
 
 async fn prom_query_range(State(app): State<Shared>, RawQuery(q): RawQuery, body: String) -> Result<Response, PromError> {
@@ -126,8 +193,8 @@ async fn prom_query_range(State(app): State<Shared>, RawQuery(q): RawQuery, body
     let r = app.promql.range(p.query()?, start, end, step).await?;
     let extra = json!({ "tier": r.tier.name(), "elapsedMs": t0.elapsed().as_millis(), "timing": r.timing, "samplesRead": r.samples_read });
     Ok(match r.output {
-        Output::Matrix(m) => prom_success(json!({ "resultType": "matrix", "result": matrix_json(m) }), extra),
-        Output::Scalar(s) => prom_success(json!({ "resultType": "matrix", "result": matrix_json(vec![(Default::default(), s)]) }), extra),
+        Output::Matrix(m) => Json(RangeSuccess::new(m, extra)).into_response(),
+        Output::Scalar(s) => Json(RangeSuccess::new(vec![(Default::default(), s)], extra)).into_response(),
         Output::Str(_) => return Err(anyhow::anyhow!("a range query cannot return a string").into()),
     })
 }
@@ -157,19 +224,28 @@ async fn prom_query_range_batch(State(app): State<Shared>, Json(p): Json<BatchPa
             Ok(r) => {
                 let extra = json!({ "tier": r.tier.name(), "elapsedMs": t0.elapsed().as_millis(), "timing": r.timing, "samplesRead": r.samples_read });
                 match r.output {
-                    Output::Matrix(m) => json!({ "status": "success", "data": { "resultType": "matrix", "result": matrix_json(m) }, "atalaya": extra }),
-                    Output::Scalar(s) => json!({ "status": "success", "data": { "resultType": "matrix", "result": matrix_json(vec![(Default::default(), s)]) }, "atalaya": extra }),
-                    Output::Str(_) => json!({ "status": "error", "errorType": "bad_data", "error": "a range query cannot return a string" }),
+                    Output::Matrix(m) => BatchResult::Ok(RangeSuccess::new(m, extra)),
+                    Output::Scalar(s) => BatchResult::Ok(RangeSuccess::new(vec![(Default::default(), s)], extra)),
+                    Output::Str(_) => BatchResult::Err(json!({ "status": "error", "errorType": "bad_data", "error": "a range query cannot return a string" })),
                 }
             }
             Err(e) => {
-                let kind = if e.chain().any(|x| x.is::<atalaya::ch::Unavailable>()) { "unavailable" } else { "bad_data" };
-                json!({ "status": "error", "errorType": kind, "error": format!("{e:#}") })
+                let kind = if e.chain().any(|x| x.is::<atalaya::ch::Unavailable>()) {
+                    "unavailable"
+                } else {
+                    "bad_data"
+                };
+                BatchResult::Err(json!({ "status": "error", "errorType": kind, "error": format!("{e:#}") }))
             }
         }
     });
-    let results: Vec<Value> = futures::future::join_all(runs).await;
-    Ok(Json(json!({ "status": "success", "results": results })).into_response())
+    #[derive(Serialize)]
+    struct Batch {
+        status: &'static str,
+        results: Vec<BatchResult>,
+    }
+    let results = futures::future::join_all(runs).await;
+    Ok(Json(Batch { status: "success", results }).into_response())
 }
 
 async fn prom_query(State(app): State<Shared>, RawQuery(q): RawQuery, body: String) -> Result<Response, PromError> {
@@ -210,4 +286,32 @@ async fn prom_series(State(app): State<Shared>, RawQuery(q): RawQuery, body: Str
     }
     let series = app.promql.store.series(&sels, start).await?;
     Ok(prom_success(json!(series), json!({})))
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+
+    /// The streamed matrix is the same JSON the Value tree produced
+    #[test]
+    fn a_streamed_matrix_is_the_prometheus_json() {
+        let labels: promql::Labels = [("__name__".to_owned(), "up".to_owned()), ("job".to_owned(), "a\"b".to_owned())].into();
+        let m = vec![
+            (labels.clone(), vec![(1, 2.5), (2, f64::NAN), (3, f64::INFINITY)]),
+            (Default::default(), vec![]),
+        ];
+        let extra = json!({ "tier": "raw" });
+        let got = serde_json::to_value(RangeSuccess::new(m, extra.clone())).unwrap();
+        let want = json!({
+            "status": "success",
+            "data": { "resultType": "matrix", "result": [
+                { "metric": labels, "values": [[1, "2.5"], [2, "NaN"], [3, "+Inf"]] },
+                { "metric": {}, "values": [] },
+            ] },
+            "atalaya": extra,
+        });
+        assert_eq!(got, want);
+        let batch = serde_json::to_value(vec![BatchResult::Err(json!({ "status": "error" }))]).unwrap();
+        assert_eq!(batch, json!([{ "status": "error" }]));
+    }
 }
