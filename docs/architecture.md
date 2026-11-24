@@ -32,7 +32,7 @@ flowchart LR
     end
     API -->|"SELECT, RowBinary / JSON"| store
     AL -->|PromQL / logs| store
-    OB -->|"ntfy · Telegram · webhook · log"| N["notifications"]
+    OB -->|"ntfy · Telegram · Slack · webhook · log"| N["notifications"]
     U["browser"] --> API
 ```
 

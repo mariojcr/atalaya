@@ -34,6 +34,9 @@ channels:
   # webhook:
   #   type: webhook
   #   url_env: ATALAYA_WEBHOOK_URL     # receives {status, title, text, alerts[]}
+  # slack:
+  #   type: slack
+  #   url_env: ATALAYA_SLACK_WEBHOOK_URL   # a Slack incoming webhook (https://hooks.slack.com/services/…)
 
 rules:
 

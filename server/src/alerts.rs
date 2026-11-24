@@ -101,6 +101,11 @@ pub enum Channel {
     Webhook {
         url_env: String,
     },
+    /// Slack: an incoming webhook URL (https://hooks.slack.com/services/…), which posts to the
+    /// channel it was created for
+    Slack {
+        url_env: String,
+    },
 }
 
 impl Channel {
@@ -110,6 +115,7 @@ impl Channel {
             Channel::Ntfy { .. } => "ntfy",
             Channel::Telegram { .. } => "telegram",
             Channel::Webhook { .. } => "webhook",
+            Channel::Slack { .. } => "slack",
         }
     }
     /// Environment variables it needs (names are shown, never their values)
@@ -124,7 +130,7 @@ impl Channel {
                 v
             }
             Channel::Telegram { bot_token_env, chat_id_env } => vec![bot_token_env.as_str(), chat_id_env.as_str()],
-            Channel::Webhook { url_env } => vec![url_env.as_str()],
+            Channel::Webhook { url_env } | Channel::Slack { url_env } => vec![url_env.as_str()],
         }
     }
     /// Whether all of its variables are set in the environment
@@ -1103,7 +1109,40 @@ async fn send(http: &reqwest::Client, ch: &Channel, msg: &Message) -> Result<()>
                 .json(&json!({ "status": status, "title": msg.title, "text": msg.text, "alerts": msg.alerts }));
             check(req.send().await.map_err(reqwest::Error::without_url)?).await
         }
+        Channel::Slack { url_env } => {
+            let url = env_required(url_env)?;
+            let req = http.post(url).json(&slack_payload(msg));
+            check(req.send().await.map_err(reqwest::Error::without_url)?).await
+        }
     }
+}
+
+/// Longest text of a Slack section block (its limit is 3000 characters)
+const SLACK_SECTION_MAX: usize = 2900;
+
+/// The body of a Slack incoming webhook: `text` is what the phone and the desktop notification show,
+/// and the message itself is one section in an attachment, whose bar takes the colour of the worst
+/// firing severity (green when everything resolved). Slack's mrkdwn reads `&`, `<` and `>` as markup,
+/// so a summary that has them is escaped; a URL in it stays plain text and Slack links it.
+fn slack_payload(msg: &Message) -> Value {
+    let color = match msg.worst {
+        Some(Severity::Critical) => "#e01e5a",
+        Some(Severity::Warning) => "#ecb22e",
+        Some(Severity::Info) => "#36c5f0",
+        None => "#2eb67d",
+    };
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let mut body = format!("*{}*\n{}", esc(&msg.title), esc(&msg.text));
+    if body.chars().count() > SLACK_SECTION_MAX {
+        body = body.chars().take(SLACK_SECTION_MAX).collect::<String>() + "\n…";
+    }
+    json!({
+        "text": msg.title,
+        "attachments": [{
+            "color": color,
+            "blocks": [{ "type": "section", "text": { "type": "mrkdwn", "text": body } }],
+        }],
+    })
 }
 
 /// Error with the status code and the start of the body, without the URL (it may contain the token).
@@ -1302,6 +1341,49 @@ rules:
         assert!(first.contains("UPS on battery"), "{first}");
         assert!(m.text.contains("/ at 91 %"));
         assert!(m.text.contains("✅ Disk full (instance=host-2,mountpoint=/)"));
+    }
+
+    /// A Slack incoming webhook gets a fallback `text`, the colour of the worst firing severity, and the
+    /// message escaped for mrkdwn and cut below the section limit
+    #[test]
+    fn slack_payload_colours_escapes_and_cuts() {
+        let msg = Message {
+            title: "atalaya · 1 critical firing".into(),
+            text: "🚨 Disk <full> & more\n   /data at 95 %".into(),
+            worst: Some(Severity::Critical),
+            alerts: vec![],
+        };
+        let p = slack_payload(&msg);
+        assert_eq!(p["text"], "atalaya · 1 critical firing");
+        assert_eq!(p["attachments"][0]["color"], "#e01e5a");
+        let body = p["attachments"][0]["blocks"][0]["text"]["text"].as_str().unwrap();
+        assert!(body.starts_with("*atalaya · 1 critical firing*\n"), "{body}");
+        assert!(body.contains("Disk &lt;full&gt; &amp; more"), "{body}");
+        assert!(!body.contains("<full>"), "{body}");
+
+        let resolved = Message { worst: None, ..msg };
+        assert_eq!(slack_payload(&resolved)["attachments"][0]["color"], "#2eb67d");
+
+        let long = Message {
+            title: "t".into(),
+            text: "x".repeat(10_000),
+            worst: Some(Severity::Warning),
+            alerts: vec![],
+        };
+        let p = slack_payload(&long);
+        assert_eq!(p["attachments"][0]["color"], "#ecb22e");
+        let body = p["attachments"][0]["blocks"][0]["text"]["text"].as_str().unwrap();
+        assert!(body.chars().count() <= SLACK_SECTION_MAX + 2, "{}", body.chars().count());
+        assert!(body.ends_with('…'));
+    }
+
+    /// A slack channel names its webhook URL variable, like the webhook channel
+    #[test]
+    fn slack_channel_parses_and_needs_its_url() {
+        let ch: Channel = serde_saphyr::from_str("{ type: slack, url_env: ATALAYA_TEST_SLACK_URL_UNSET }").unwrap();
+        assert_eq!(ch.kind(), "slack");
+        assert_eq!(ch.env_vars(), vec!["ATALAYA_TEST_SLACK_URL_UNSET"]);
+        assert!(!ch.configured());
     }
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -21,6 +21,7 @@ channels:
     token_env: ATALAYA_NTFY_TOKEN   # optional
   # telegram: { type: telegram, bot_token_env: …, chat_id_env: … }
   # hook:     { type: webhook, url_env: … }   POSTs a JSON with the alerts
+  # team:     { type: slack, url_env: ATALAYA_SLACK_WEBHOOK_URL }   a Slack incoming webhook
 
 rules:
   - id: disk-full
@@ -86,6 +87,18 @@ hold them (`url_env`, `token_env`, `bot_token_env`, `chat_id_env`). The alerts
 page shows whether each channel has its variables. `ATALAYA_PUBLIC_URL` adds a
 link to the UI to every notification. Notifications are sent on transitions;
 there are no periodic reminders for alerts that stay firing.
+
+### Slack
+
+A `slack` channel posts to a Slack [incoming
+webhook](https://api.slack.com/messaging/webhooks): create a Slack app with
+*Incoming Webhooks* on, add a webhook to the channel that should get the alerts,
+and put its URL in the variable that `url_env` names. The webhook decides the
+channel; one Slack channel per Atalaya channel. Each notification is one
+message: its text (what the phone shows) is the title, and the body has a
+coloured bar for the worst firing severity (green when everything resolved),
+with the same lines as the other channels. The URL is a secret: whoever has it
+can post to that channel.
 
 ## API
 
