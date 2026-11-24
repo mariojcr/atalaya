@@ -1,6 +1,7 @@
 # Collector
 
-`atalaya-collector <config.yaml>` runs once per host. The ClickHouse password
+`atalaya-collector <config.yaml>` runs once per host. It sends to ClickHouse, to
+VictoriaMetrics and VictoriaLogs, or to both. The ClickHouse password
 comes from the `CLICKHOUSE_PASSWORD` environment variable (unset means empty),
 never from the file. The log level follows `RUST_LOG` (default
 `warn,atalaya_collector=info`).
@@ -11,12 +12,18 @@ never from the file. The log level follows `RUST_LOG` (default
 node: host-1                   # required: the host name (`instance` in PromQL)
 state_dir: /state              # required: log positions and the disk queue
 
-clickhouse:
+clickhouse:                    # ClickHouse, Victoria or both: at least one
   url: http://clickhouse:8123/ # required
   user: collector              # required: INSERT and SELECT on atalaya.* (docs/deployment.md#clickhouse)
   database: atalaya            # default atalaya
   flush_interval: 30s          # how often rows are sent (default 30s)
   max_spool_mb: 1024           # disk queue limit; the oldest batches go first (default 1024)
+
+victoria:                      # VictoriaMetrics and VictoriaLogs (see "Sending to Victoria")
+  metrics_url: http://victoriametrics:8428   # points, to /api/v1/import
+  logs_url: http://victorialogs:9428         # log lines, to /insert/jsonline
+  flush_interval: 15s          # used only without clickhouse (default 15s)
+  max_spool_mb: 1024           # disk queue limit, split between metrics and logs (default 1024)
 
 nomad:                         # optional: service discovery and allocation logs
   addr: http://10.0.0.5:4646   # https://… when the cluster uses TLS
@@ -318,10 +325,35 @@ Expressions are anchored regular expressions, and histograms match by their
 base name. A service without an `allow` entry is not filtered, and `up` and
 `scrape_duration_seconds` are added after the rules.
 
+## Sending to Victoria
+
+With a `victoria` section the collector also writes to VictoriaMetrics and
+VictoriaLogs, alone or next to ClickHouse (both at once, to move from one to the
+other). Each point carries the labels the server's PromQL engine gives its
+series: `job` is the service, `instance` the host, every other resource key a
+label with `_` for `.` (`nomad_group`, `nomad_alloc_index`, `nomad_service`), and
+an exporter label that clashes with `job` or `instance` becomes `exported_job` or
+`exported_instance`. So the same PromQL reads the same series from atalaya or
+from VictoriaMetrics. A distribution becomes `<metric>_bucket{le}`, `_sum` and
+`_count`, with `le` written as the server writes it.
+
+A log line keeps its service as `job` (the same label as the metrics), its host,
+stream and level, and its resource and attribute keys as they are, dotted, the
+way VictoriaLogs flattens JSON (`nomad.job`, `nomad.task`, `http.response.status_code`).
+An attribute named like one of those fields keeps its value as `attr.<key>`. The
+log streams are `job`, `host`, `nomad.group`, `nomad.task` and `stream`.
+
+Staleness markers and metric descriptors are ClickHouse's and are not sent to
+Victoria. With both destinations, `atalaya_collector_victoria_*` counts what goes
+to Victoria (rows sent, send errors, queued and dropped batches, queue size).
+
 ## Delivery
 
 Rows are kept in memory per table and sent, gzip-compressed, every
-`flush_interval`.
+`flush_interval`. Each destination has its own disk queue: ClickHouse in
+`state_dir/spool`, VictoriaMetrics and VictoriaLogs in
+`state_dir/spool-victoria/metrics` and `.../logs`, so one being down does not hold
+the others up.
 
 - **Sending fails:** a network error, a 5xx, a timeout (408), a rate limit (429),
   or ClickHouse refusing the credentials or not knowing the database or table
@@ -337,7 +369,7 @@ Rows are kept in memory per table and sent, gzip-compressed, every
 The guarantees differ by source:
 
 - **Nomad and Docker logs** are at-least-once. A file position is saved only
-  after the lines read up to it are in ClickHouse or in the disk queue. A crash
+  after the lines read up to it are in every destination or in its disk queue. A crash
   re-reads from the last saved position, so a batch may arrive twice.
 - **Metrics, SMART, self metrics and syslog** are best-effort. They stay in
   memory until the next flush, so a crash or a `SIGKILL` loses up to one
@@ -347,5 +379,5 @@ The guarantees differ by source:
 On `SIGTERM` the collector stops reading, finishes the send in flight and sends
 what is pending. Each send times out after 60 s.
 
-The ClickHouse client trusts the standard public certificate authorities, so an
+The HTTP client trusts the standard public certificate authorities, so an
 `https://` URL with a private CA is not supported.

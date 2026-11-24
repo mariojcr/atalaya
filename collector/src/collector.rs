@@ -490,6 +490,35 @@ impl Collector {
         ] {
             self.self_metric(m, &res, v, c, now).await;
         }
+        // Victoria's own, when it is the second destination (with ClickHouse)
+        if let Some(st) = &self.sink.victoria_stats {
+            for (m, v, c) in [
+                ("atalaya_collector_victoria_rows_sent_total", st.rows_sent.load(Ordering::Relaxed) as f64, true),
+                (
+                    "atalaya_collector_victoria_send_errors_total",
+                    st.send_errors.load(Ordering::Relaxed) as f64,
+                    true,
+                ),
+                (
+                    "atalaya_collector_victoria_spooled_batches_total",
+                    st.spooled_batches.load(Ordering::Relaxed) as f64,
+                    true,
+                ),
+                (
+                    "atalaya_collector_victoria_dropped_batches_total",
+                    st.dropped_batches.load(Ordering::Relaxed) as f64,
+                    true,
+                ),
+                ("atalaya_collector_victoria_spool_bytes", st.spool_bytes.load(Ordering::Relaxed) as f64, false),
+                (
+                    "atalaya_collector_victoria_dropped_rows_total",
+                    st.dropped_rows.load(Ordering::Relaxed) as f64,
+                    true,
+                ),
+            ] {
+                self.self_metric(m, &res, v, c, now).await;
+            }
+        }
     }
 }
 

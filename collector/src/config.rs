@@ -35,7 +35,11 @@ pub(crate) fn default_interval() -> String {
 pub(crate) struct Config {
     /// Node name (host.name of everything this collector sends)
     pub(crate) node: String,
-    pub(crate) clickhouse: ClickHouseConfig,
+    /// Where it sends: ClickHouse, Victoria (VictoriaMetrics and VictoriaLogs) or both at once
+    #[serde(default)]
+    pub(crate) clickhouse: Option<ClickHouseConfig>,
+    #[serde(default)]
+    pub(crate) victoria: Option<VictoriaConfig>,
     /// Optional: with Nomad the node's services are discovered and their
     /// allocation logs are tailed; without it, static targets
     /// (scrape.static_targets), host metrics and Docker logs
@@ -61,7 +65,23 @@ impl Config {
     /// when the task that uses it gets there
     pub(crate) fn validate(&self) -> Result<()> {
         parse_duration(&self.scrape.interval).context("scrape.interval")?;
-        parse_duration(&self.clickhouse.flush_interval).context("clickhouse.flush_interval")?;
+        anyhow::ensure!(
+            self.clickhouse.is_some() || self.victoria.is_some(),
+            "nowhere to send: configure clickhouse, victoria or both"
+        );
+        if let Some(c) = &self.clickhouse {
+            parse_duration(&c.flush_interval).context("clickhouse.flush_interval")?;
+            check_url("clickhouse.url", &c.url)?;
+        }
+        if let Some(v) = &self.victoria {
+            parse_duration(&v.flush_interval).context("victoria.flush_interval")?;
+            anyhow::ensure!(v.metrics_url.is_some() || v.logs_url.is_some(), "victoria needs metrics_url, logs_url or both");
+            for (name, url) in [("victoria.metrics_url", &v.metrics_url), ("victoria.logs_url", &v.logs_url)] {
+                if let Some(u) = url {
+                    check_url(name, u)?;
+                }
+            }
+        }
         parse_duration(&self.host.smart.interval).context("host.smart.interval")?;
         anyhow::ensure!(!self.node.trim().is_empty(), "node is empty");
         if let Some(s) = &self.syslog {
@@ -71,6 +91,45 @@ impl Config {
         }
         Ok(())
     }
+
+    /// How often buffered rows are sent: ClickHouse's interval when it is configured (it decides
+    /// how many parts are created), else Victoria's
+    pub(crate) fn flush_interval(&self) -> &str {
+        match (&self.clickhouse, &self.victoria) {
+            (Some(c), _) => &c.flush_interval,
+            (None, Some(v)) => &v.flush_interval,
+            (None, None) => "15s",
+        }
+    }
+}
+
+/// A Nomad template that resolves a URL with nomadService can render it empty ("http:///") while
+/// the allocation starts: better to exit and let Nomad restart the collector when the template
+/// re-renders than to spool batches that can never be sent
+fn check_url(name: &str, url: &str) -> Result<()> {
+    let u = reqwest::Url::parse(url).with_context(|| format!("invalid {name}: {url}"))?;
+    if u.host_str().is_none_or(str::is_empty) {
+        anyhow::bail!("{name} has no host ({url}): is its Nomad service not resolved yet?");
+    }
+    Ok(())
+}
+
+/// VictoriaMetrics (points, to /api/v1/import) and VictoriaLogs (log lines, to /insert/jsonline),
+/// with its own disk spool (state_dir/spool-victoria)
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VictoriaConfig {
+    /// VictoriaMetrics' base URL (http://host:8428)
+    #[serde(default)]
+    pub(crate) metrics_url: Option<String>,
+    /// VictoriaLogs' base URL (http://host:9428)
+    #[serde(default)]
+    pub(crate) logs_url: Option<String>,
+    #[serde(default = "default_spool")]
+    pub(crate) max_spool_mb: u64,
+    /// Used when there is no ClickHouse: Victoria takes small batches well
+    #[serde(default = "default_interval")]
+    pub(crate) flush_interval: String,
 }
 
 #[derive(Deserialize)]
@@ -314,5 +373,35 @@ mod tests {
         let cfg: Config = serde_saphyr::from_str("node: h\nstate_dir: /s\nclickhouse: { url: 'http://c:8123/', user: u }\n").unwrap();
         cfg.validate().unwrap();
         assert_eq!(parse_duration(&cfg.scrape.interval).unwrap(), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn victoria_alone_or_with_clickhouse_is_valid_and_nothing_is_an_error() {
+        let base = "node: h\nstate_dir: /s\n";
+        let ok = [
+            "victoria: { metrics_url: 'http://vm:8428', logs_url: 'http://vl:9428' }\n",
+            "victoria: { logs_url: 'http://vl:9428' }\n",
+            "clickhouse: { url: 'http://c:8123/', user: u }\nvictoria: { metrics_url: 'http://vm:8428' }\n",
+        ];
+        for y in ok {
+            let cfg: Config = serde_saphyr::from_str(&format!("{base}{y}")).unwrap();
+            cfg.validate().unwrap_or_else(|e| panic!("{y}: {e:#}"));
+        }
+        let only_v: Config = serde_saphyr::from_str(&format!("{base}{}", ok[0])).unwrap();
+        assert_eq!(only_v.flush_interval(), "15s", "Victoria's own interval without ClickHouse");
+        let both: Config = serde_saphyr::from_str(&format!(
+            "{base}clickhouse: {{ url: 'http://c:8123/', user: u, flush_interval: 30s }}\nvictoria: {{ metrics_url: 'http://vm:8428' }}\n"
+        ))
+        .unwrap();
+        assert_eq!(both.flush_interval(), "30s", "ClickHouse's when it is there");
+        for (y, msg) in [
+            ("", "nowhere to send"),
+            ("victoria: {}\n", "metrics_url, logs_url or both"),
+            ("victoria: { metrics_url: 'http:///' }\n", "victoria.metrics_url"),
+        ] {
+            let cfg: Config = serde_saphyr::from_str(&format!("{base}{y}")).unwrap();
+            let e = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(e.contains(msg), "{y}: {e}");
+        }
     }
 }
