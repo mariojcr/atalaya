@@ -4,8 +4,9 @@
 //! atalaya-collector: one per node. Scrapes the Prometheus endpoints of what
 //! runs on its node (discovered through Nomad) plus the static ones from the
 //! config, applies the metric rules, tails the allocation logs and writes it
-//! all to ClickHouse in atalaya's format: each series is registered once and
-//! after that only points are sent.
+//! all to ClickHouse in atalaya's format (each series is registered once and
+//! after that only points are sent), to VictoriaMetrics and VictoriaLogs, or to
+//! both at once.
 //!
 //! Usage: atalaya-collector <config.yaml>   (password in CLICKHOUSE_PASSWORD)
 
@@ -47,28 +48,30 @@ async fn main() -> Result<()> {
     let cfg: Config = serde_saphyr::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?)?;
     cfg.validate()?;
     std::fs::create_dir_all(&cfg.state_dir)?;
-    let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
     let interval = parse_duration(&cfg.scrape.interval)?;
-    // A Nomad template that resolves the URL with nomadService can render it
-    // empty ("http:///") while the allocation starts: better to exit and let
-    // Nomad restart us when the template re-renders than to spool batches that
-    // can never be sent
-    let url = reqwest::Url::parse(&cfg.clickhouse.url).with_context(|| format!("invalid clickhouse.url: {}", cfg.clickhouse.url))?;
-    if url.host_str().is_none_or(str::is_empty) {
-        anyhow::bail!(
-            "clickhouse.url has no host ({}): is the clickhouse-http service not resolved yet?",
-            cfg.clickhouse.url
-        );
-    }
-
-    let sink = Arc::new(Sink::new(
-        cfg.clickhouse.url.clone(),
-        cfg.clickhouse.user.clone(),
-        password,
-        cfg.clickhouse.database.clone(),
-        cfg.state_dir.join("spool"),
-        cfg.clickhouse.max_spool_mb << 20,
-    )?);
+    // ClickHouse, Victoria or both (validate checked there is at least one and that the URLs have
+    // a host), each with its own disk spool
+    let victoria_spool = cfg.state_dir.join("spool-victoria");
+    let sink = match (&cfg.clickhouse, &cfg.victoria) {
+        (Some(ch), v) => {
+            let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+            let s = Sink::new(
+                ch.url.clone(),
+                ch.user.clone(),
+                password,
+                ch.database.clone(),
+                cfg.state_dir.join("spool"),
+                ch.max_spool_mb << 20,
+            )?;
+            match v {
+                Some(v) => s.and_victoria(v.metrics_url.clone(), v.logs_url.clone(), victoria_spool, v.max_spool_mb << 20)?,
+                None => s,
+            }
+        }
+        (None, Some(v)) => Sink::victoria(v.metrics_url.clone(), v.logs_url.clone(), victoria_spool, v.max_spool_mb << 20)?,
+        (None, None) => unreachable!("validate requires a destination"),
+    };
+    let sink = Arc::new(sink);
     let ca = cfg.nomad.as_ref().and_then(|n| n.ca_file.as_deref()).map(nomad::ca_cert).transpose()?;
     let token = match cfg.nomad.as_ref().and_then(|n| n.token_file.as_deref()) {
         Some(p) => Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?),
@@ -212,7 +215,7 @@ async fn main() -> Result<()> {
         }));
     }
     // Sending: an in-flight send is never cancelled halfway
-    let flush_every = parse_duration(&collector.cfg.clickhouse.flush_interval)?;
+    let flush_every = parse_duration(collector.cfg.flush_interval())?;
     let flusher = {
         let s = sink.clone();
         let mut stop = stop_rx.clone();
