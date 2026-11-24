@@ -22,6 +22,16 @@ pub const TABLES: &[&str] = &["metric_descriptors", "series", "points", "dist_po
 /// The table of staleness markers (best effort)
 const STALE: &str = "stale";
 
+/// How long a connection to ClickHouse may sit idle in the pool and still be
+/// reused. It must be well under the server's keep-alive (`keep_alive_timeout`,
+/// 30 s by default): with the default 30 s flush, the connections of one flush
+/// were idle almost exactly as long as the server keeps them, and reusing one
+/// just as the server closed it failed the send ("connection closed before
+/// message completed") and sent the batch to the spool. The farther ClickHouse
+/// is, the wider that window: from another region it was ~4 % of the batches.
+/// A flush still reuses its own connections (the spool, then the tables).
+const POOL_IDLE: Duration = Duration::from_secs(5);
+
 /// Cap on in-memory rows per table between two sends. Normally there are a few
 /// thousand; if sending gets stuck, the oldest are dropped (counted in
 /// dropped_rows) rather than exhausting the node's memory.
@@ -78,9 +88,24 @@ impl std::fmt::Display for SendError {
 
 impl Sink {
     pub fn new(url: String, user: String, password: String, database: String, spool: PathBuf, max_spool_bytes: u64) -> Result<Self> {
+        Self::with_pool_idle(url, user, password, database, spool, max_spool_bytes, POOL_IDLE)
+    }
+
+    fn with_pool_idle(
+        url: String,
+        user: String,
+        password: String,
+        database: String,
+        spool: PathBuf,
+        max_spool_bytes: u64,
+        pool_idle: Duration,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&spool).with_context(|| format!("creating {}", spool.display()))?;
         Ok(Self {
-            http: reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .pool_idle_timeout(pool_idle)
+                .build()?,
             url,
             user,
             password,
@@ -437,6 +462,78 @@ mod tests {
             }
         });
         format!("http://{addr}/")
+    }
+
+    /// A ClickHouse that keeps each connection open after answering, and closes
+    /// it when the next request arrives on it, without answering: what a client
+    /// sees when it reuses a connection just as the server's keep-alive ends.
+    /// Returns its URL and how many connections it has accepted.
+    async fn closing_reused_connections() -> (String, std::sync::Arc<AtomicU64>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(AtomicU64::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    for answer in [true, false] {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 8192];
+                        loop {
+                            let Ok(n) = s.read(&mut chunk).await else { return };
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                                let len = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                if buf.len() >= end + 4 + len {
+                                    break;
+                                }
+                            }
+                        }
+                        if !answer {
+                            return;
+                        }
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/"), accepted)
+    }
+
+    #[tokio::test]
+    async fn a_connection_idle_past_the_pool_window_is_not_reused() {
+        let dir = spool_dir("idle");
+        let (url, accepted) = closing_reused_connections().await;
+        let sink = Sink::with_pool_idle(
+            url,
+            "u".into(),
+            test_password(),
+            "atalaya".into(),
+            dir.clone(),
+            1 << 20,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        for body in ["a", "b"] {
+            sink.push("logs", json!({ "Body": body }));
+            sink.flush().await;
+            // Longer than the pool keeps an idle connection, as between two flushes
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert_eq!(sink.stats.send_errors.load(Ordering::Relaxed), 0, "no send failed");
+        assert!(spooled(&dir).is_empty(), "nothing went to the spool");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2, "each flush opened its own connection");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
