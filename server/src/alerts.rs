@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -235,6 +236,9 @@ fn validate(cfg: &Config) -> Result<()> {
         }
         match r.kind {
             Kind::Metric if r.expr.trim().is_empty() => bail!("rule {}: missing expr", r.id),
+            // A typo would otherwise pass as a valid file and fail on every evaluation, with its
+            // firing alerts frozen; invalid, the previous rules stay
+            Kind::Metric => atalaya::promql::check(&r.expr).with_context(|| format!("rule {}: expr", r.id))?,
             Kind::Logs if r.filters.is_empty() || r.threshold.is_none() => bail!("rule {}: a logs rule needs filters and threshold", r.id),
             _ => {}
         }
@@ -305,6 +309,43 @@ pub enum Phase {
     Firing,
 }
 
+/// An alert's value in the state, history and outbox files. serde_json writes an infinite or NaN
+/// f64 as `null` and then refuses to read it back, so one rule returning ±Inf (a division by zero,
+/// histogram_quantile) made the next start lose every alert and silence. Non-finite values are
+/// written as Prometheus writes them ("+Inf", "-Inf", "NaN"), and a `null` from older files reads
+/// as NaN.
+mod alert_value {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        match *v {
+            v if v.is_finite() => s.serialize_f64(v),
+            v if v.is_nan() => s.serialize_str("NaN"),
+            v if v > 0.0 => s.serialize_str("+Inf"),
+            _ => s.serialize_str("-Inf"),
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(f64),
+        Text(String),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Ok(match Option::<Raw>::deserialize(d)? {
+            Some(Raw::Number(v)) => v,
+            Some(Raw::Text(t)) => match t.as_str() {
+                "+Inf" | "Inf" => f64::INFINITY,
+                "-Inf" => f64::NEG_INFINITY,
+                _ => f64::NAN,
+            },
+            None => f64::NAN,
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Instance {
     pub rule: String,
@@ -312,6 +353,7 @@ pub struct Instance {
     pub phase: Phase,
     /// When it entered the current phase
     pub since: i64,
+    #[serde(with = "alert_value")]
     pub value: f64,
     pub last_seen: i64,
 }
@@ -365,6 +407,7 @@ pub struct Transition {
     pub labels: Labels,
     pub from: String,
     pub to: String,
+    #[serde(with = "alert_value")]
     pub value: f64,
     /// When the alert started firing (on a resolution, how long it lasted). None in
     /// transitions written before this field existed
@@ -474,6 +517,29 @@ pub struct Alerts {
     http: reqwest::Client,
     /// Last completed evaluation (for /readyz)
     last_tick: std::sync::atomic::AtomicI64,
+    /// Whether a valid alerts.yaml has been read since the start. Until then nothing is evaluated
+    /// or delivered: with no rules, the first cycle would drop every stored instance (and later
+    /// notify them again as new) and the outbox of every channel
+    cfg_loaded: std::sync::atomic::AtomicBool,
+}
+
+/// Reads one of the alert files (state, outbox). One that exists but does not parse is moved aside
+/// (`<name>.corrupt-<time>`) and logged as an error: it holds what is firing, the silences and the
+/// notifications not yet delivered, and the next save would overwrite it
+fn read_or_set_aside<T: serde::de::DeserializeOwned + Default>(dir: &Path, name: &str) -> T {
+    let path = dir.join(name);
+    let Ok(text) = std::fs::read_to_string(&path) else { return T::default() };
+    match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            let aside = dir.join(format!("{name}.corrupt-{}", now()));
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => tracing::error!("alerts/{name}: {e}; moved aside to {}, starting empty", aside.display()),
+                Err(re) => tracing::error!("alerts/{name}: {e}; could not move it aside ({re}), starting empty"),
+            }
+            T::default()
+        }
+    }
 }
 
 /// A notification waiting to be delivered to a channel. At-least-once delivery:
@@ -506,13 +572,18 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// The message of a caught panic (`panic!` with a literal or with format arguments)
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "(no message)".into())
+}
+
 impl Alerts {
     pub fn new(path: PathBuf, data_dir: &Path) -> Self {
         let dir = data_dir.join("alerts");
-        let mut state: State = std::fs::read_to_string(dir.join("state.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).map_err(|e| tracing::warn!("alerts/state.json: {e}")).ok())
-            .unwrap_or_default();
+        let mut state: State = read_or_set_aside(&dir, "state.json");
         // Recompute keys with the current format (older files used a=1,b=2) so
         // a firing alert keeps its identity across upgrades
         state.instances = std::mem::take(&mut state.instances)
@@ -522,14 +593,12 @@ impl Alerts {
         let (cfg, cfg_error) = match load_config(&path) {
             Ok(c) => (c, None),
             Err(e) => {
-                tracing::warn!("alerts: {e:#}");
+                tracing::error!("alerts: {e:#}; nothing is evaluated or delivered until the file is valid");
                 (Config::default(), Some(format!("{e:#}")))
             }
         };
-        let outbox: Vec<Pending> = std::fs::read_to_string(dir.join("outbox.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).map_err(|e| tracing::warn!("alerts/outbox.json: {e}")).ok())
-            .unwrap_or_default();
+        let cfg_loaded = std::sync::atomic::AtomicBool::new(cfg_error.is_none());
+        let outbox: Vec<Pending> = read_or_set_aside(&dir, "outbox.json");
         Self {
             path,
             dir,
@@ -539,7 +608,12 @@ impl Alerts {
             queue: Mutex::new(outbox),
             http: reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap_or_default(),
             last_tick: std::sync::atomic::AtomicI64::new(0),
+            cfg_loaded,
         }
+    }
+
+    fn cfg_loaded(&self) -> bool {
+        self.cfg_loaded.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn config(&self) -> Arc<Config> {
@@ -552,6 +626,7 @@ impl Alerts {
             Ok(c) => {
                 *self.cfg.lock().await = Arc::new(c);
                 *self.cfg_error.lock().await = None;
+                self.cfg_loaded.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -660,7 +735,7 @@ impl Alerts {
                     Output::Str(_) => bail!("the expression returns a string"),
                 }
                 // Two series with the same identity (after trimming labels): keep the larger
-                out.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)));
+                out.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
                 out.dedup_by(|a, b| a.0 == b.0);
                 Ok(out)
             }
@@ -685,6 +760,10 @@ impl Alerts {
     /// One cycle: reload config, evaluate, update state and queue notifications
     pub async fn tick(&self, app: &App) {
         self.reload().await;
+        if !self.cfg_loaded() {
+            // The state stays as it was (see cfg_loaded), and /readyz says so
+            return;
+        }
         let cfg = self.config().await;
         let t = now();
         let mut transitions = Vec::new();
@@ -697,7 +776,13 @@ impl Alerts {
         for rule in &cfg.rules {
             let status = state.rules.entry(rule.id.clone()).or_default();
             status.last_eval = t;
-            match self.evaluate(app, rule).await {
+            // A panic while evaluating a rule (in the PromQL engine, say) is that rule's error: it
+            // must not stop the others, nor the loop, which nothing would restart
+            let evaluated = std::panic::AssertUnwindSafe(self.evaluate(app, rule))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|p| Err(anyhow::anyhow!("evaluation panicked: {}", panic_message(&*p))));
+            match evaluated {
                 Ok(matches) => {
                     status.error = None;
                     status.matches = matches.len();
@@ -768,6 +853,10 @@ impl Alerts {
     /// outbox with growing backoff; they only leave once delivered (or after
     /// MAX_ATTEMPTS, with a log entry).
     pub async fn deliver(&self, engine: Option<&atalaya::promql::Engine>) {
+        if !self.cfg_loaded() {
+            // Without a valid config every channel would look gone and its outbox be dropped
+            return;
+        }
         let cfg = self.config().await;
         let wait = crate::query::parse_duration(&cfg.defaults.group_wait).unwrap_or(30);
         let t = now();
@@ -782,50 +871,63 @@ impl Alerts {
         };
         for (name, ps) in ready {
             let ids: Vec<u64> = ps.iter().map(|p| p.id).collect();
-            let result = match cfg.channels.get(&name) {
-                None => Err(None),
+            // What went through (or can never go through) and, if the rest did not, why
+            let (done, failed): (Vec<u64>, Option<(&str, anyhow::Error)>) = match cfg.channels.get(&name) {
+                None => {
+                    tracing::warn!("alerts: channel {name} no longer exists; dropping {} notifications", ids.len());
+                    (ids.clone(), None)
+                }
                 Some(ch) => {
                     let trs: Vec<&Transition> = ps.iter().map(|p| &p.tr).collect();
                     match ch {
-                        // Slack gets a card per alert, with a sparkline of what made it fire
-                        Channel::Slack { url_env } => {
-                            let sparks = match engine {
-                                Some(e) => slack_sparks(e, &cfg, &trs).await,
-                                None => HashMap::new(),
-                            };
-                            let base = std::env::var("ATALAYA_PUBLIC_URL").ok().filter(|b| !b.is_empty());
-                            let cards = slack_cards(&cfg, &trs, &sparks, base.as_deref());
-                            send_slack(&self.http, url_env, &cards).await.map_err(|e| Some((ch.kind(), e)))
-                        }
+                        // Slack gets a card per alert, with a sparkline of what made it fire. Only
+                        // the cards that did not go through are retried: a failure halfway used to
+                        // post the ones before it again on every retry
+                        Channel::Slack { url_env } => match env_required(url_env) {
+                            Err(e) => (vec![], Some((ch.kind(), e))),
+                            Ok(url) => {
+                                let sparks = match engine {
+                                    Some(e) => slack_sparks(e, &cfg, &trs).await,
+                                    None => HashMap::new(),
+                                };
+                                let base = std::env::var("ATALAYA_PUBLIC_URL").ok().filter(|b| !b.is_empty());
+                                let cards = slack_cards_for(&cfg, &trs, &sparks, base.as_deref());
+                                let card_values: Vec<&Value> = cards.iter().map(|c| &c.0).collect();
+                                let out = send_slack(&self.http, &url, &card_values).await;
+                                for r in &out.rejected {
+                                    tracing::error!("alerts: channel {name}: Slack rejected a card, dropped: {r}");
+                                }
+                                let done = cards[..out.done].iter().flat_map(|c| c.1.iter().map(|&i| ps[i].id)).collect();
+                                (done, out.error.map(|e| (ch.kind(), e)))
+                            }
+                        },
                         _ => {
                             let msg = Message::build(&cfg, &trs, "en");
-                            send(&self.http, ch, &msg).await.map_err(|e| Some((ch.kind(), e)))
+                            match send(&self.http, ch, &msg).await {
+                                Ok(()) => (ids.clone(), None),
+                                Err(e) => (vec![], Some((ch.kind(), e))),
+                            }
                         }
                     }
                 }
             };
             let mut q = self.queue.lock().await;
-            match result {
-                Ok(()) => q.retain(|p| !ids.contains(&p.id)),
-                Err(None) => {
-                    tracing::warn!("alerts: channel {name} no longer exists; dropping {} notifications", ids.len());
-                    q.retain(|p| !ids.contains(&p.id));
+            q.retain(|p| !done.contains(&p.id));
+            if let Some((kind, e)) = failed {
+                let rest: Vec<u64> = ids.iter().copied().filter(|id| !done.contains(id)).collect();
+                for p in q.iter_mut().filter(|p| rest.contains(&p.id)) {
+                    p.attempts += 1;
+                    p.next_try = t + backoff(p.attempts);
                 }
-                Err(Some((kind, e))) => {
-                    for p in q.iter_mut().filter(|p| ids.contains(&p.id)) {
-                        p.attempts += 1;
-                        p.next_try = t + backoff(p.attempts);
-                    }
-                    let attempts = q.iter().filter(|p| ids.contains(&p.id)).map(|p| p.attempts).max().unwrap_or(0);
-                    tracing::warn!("alerts: channel {name} ({kind}), attempt {attempts}: {e:#}");
-                    let before = q.len();
-                    q.retain(|p| p.attempts < MAX_ATTEMPTS);
-                    if q.len() != before {
-                        tracing::error!(
-                            "alerts: channel {name}: dropped {} notifications after {MAX_ATTEMPTS} attempts",
-                            before - q.len()
-                        );
-                    }
+                let attempts = q.iter().filter(|p| rest.contains(&p.id)).map(|p| p.attempts).max().unwrap_or(0);
+                tracing::warn!("alerts: channel {name} ({kind}), attempt {attempts}: {e:#}");
+                let before = q.len();
+                q.retain(|p| p.attempts < MAX_ATTEMPTS);
+                if q.len() != before {
+                    tracing::error!(
+                        "alerts: channel {name}: dropped {} notifications after {MAX_ATTEMPTS} attempts",
+                        before - q.len()
+                    );
                 }
             }
             self.persist_outbox(&q);
@@ -1000,12 +1102,18 @@ pub async fn run(app: Arc<App>) {
     let a = app.clone();
     tokio::spawn(async move {
         loop {
-            a.alerts.deliver(Some(&a.promql)).await;
+            // Delivery builds Slack sparklines with the PromQL engine: a panic there must not end
+            // the loop, which nothing would restart
+            if let Err(p) = std::panic::AssertUnwindSafe(a.alerts.deliver(Some(&a.promql))).catch_unwind().await {
+                tracing::error!("alerts: delivery panicked: {}", panic_message(&*p));
+            }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
     loop {
-        app.alerts.tick(&app).await;
+        if let Err(p) = std::panic::AssertUnwindSafe(app.alerts.tick(&app)).catch_unwind().await {
+            tracing::error!("alerts: evaluation cycle panicked: {}", panic_message(&*p));
+        }
         let every = crate::query::parse_duration(&app.alerts.config().await.defaults.every)
             .unwrap_or(30)
             .clamp(10, 3600);
@@ -1150,7 +1258,12 @@ async fn send(http: &reqwest::Client, ch: &Channel, msg: &Message) -> Result<()>
                 color,
                 vec![json!({ "type": "section", "text": { "type": "mrkdwn", "text": slack_esc(&msg.text) } })],
             );
-            send_slack(http, url_env, &[card]).await
+            let out = send_slack(http, &env_required(url_env)?, &[&card]).await;
+            match (out.error, out.rejected.into_iter().next()) {
+                (Some(e), _) => Err(e),
+                (None, Some(r)) => Err(anyhow::anyhow!("Slack rejected the card: {r}")),
+                (None, None) => Ok(()),
+            }
         }
     }
 }
@@ -1322,9 +1435,16 @@ fn slack_links(base: Option<&str>, rule: &Rule, labels: &Labels) -> String {
     parts.join("  ·  ")
 }
 
-/// An alert's labels in one line: `host-1 · /data`
+/// An alert's labels in one line: `host-1 · /data` (empty for an alert without labels: a logs rule,
+/// `sum(…) > 0`)
 fn labels_line(labels: &Labels) -> String {
     labels.values().map(|v| format!("`{}`", slack_esc(v))).collect::<Vec<_>>().join(" · ")
+}
+
+/// A section with this text, or none: Slack rejects the whole message (400 invalid_blocks) when a
+/// section's text is empty
+fn text_section(text: String) -> Option<Value> {
+    (!text.trim().is_empty()).then(|| json!({ "type": "section", "text": { "type": "mrkdwn", "text": text } }))
 }
 
 fn firing_card(rule: &Rule, tr: &Transition, spark: Option<&[f64]>, base: Option<&str>) -> Value {
@@ -1347,10 +1467,8 @@ fn firing_card(rule: &Rule, tr: &Transition, spark: Option<&[f64]>, base: Option
         .collect();
     fields.push(json!({ "type": "mrkdwn", "text": format!("*Since*\n{}", slack_time(tr.since.unwrap_or(tr.ts), true)) }));
     fields.push(json!({ "type": "mrkdwn", "text": format!("*Value*\n`{}`", fmt_value(tr.value)) }));
-    let mut blocks = vec![
-        json!({ "type": "section", "text": { "type": "mrkdwn", "text": slack_esc(&summary) } }),
-        json!({ "type": "section", "fields": fields }),
-    ];
+    let mut blocks: Vec<Value> = text_section(slack_esc(&summary)).into_iter().collect();
+    blocks.push(json!({ "type": "section", "fields": fields }));
     if let Some(v) = spark
         && let Some(line) = sparkline(v)
     {
@@ -1367,11 +1485,9 @@ fn resolved_card(rule: &Rule, tr: &Transition, base: Option<&str>) -> Value {
     let lasted = tr.since.map(|s| format!(" — after {}", human_duration(tr.ts - s))).unwrap_or_default();
     let title = format!("✅ RESOLVED · {}{lasted}", rule.title.get("en"));
     let fired = tr.since.map(|s| format!("Fired {} · ", slack_time(s, false))).unwrap_or_default();
-    let blocks = vec![
-        json!({ "type": "section", "text": { "type": "mrkdwn", "text": labels_line(&tr.labels) } }),
-        json!({ "type": "context", "elements": [{ "type": "mrkdwn",
-            "text": format!("{fired}resolved {} · last value `{}`  ·  {}", slack_time(tr.ts, false), fmt_value(tr.value), slack_links(base, rule, &tr.labels)) }] }),
-    ];
+    let mut blocks: Vec<Value> = text_section(labels_line(&tr.labels)).into_iter().collect();
+    blocks.push(json!({ "type": "context", "elements": [{ "type": "mrkdwn",
+        "text": format!("{fired}resolved {} · last value `{}`  ·  {}", slack_time(tr.ts, false), fmt_value(tr.value), slack_links(base, rule, &tr.labels)) }] }));
     slack_card(&title, &title, RESOLVED_COLOR, blocks)
 }
 
@@ -1379,9 +1495,15 @@ fn resolved_card(rule: &Rule, tr: &Transition, base: Option<&str>) -> Value {
 fn flap_card(rule: &Rule, fired: &Transition, resolved: &Transition, base: Option<&str>) -> Value {
     let title = format!("⚡ FLAPPING · {}", rule.title.get("en"));
     let start = fired.since.unwrap_or(fired.ts);
+    let when = format!(
+        "{} → {} ({})",
+        slack_time(start, false),
+        slack_time(resolved.ts, false),
+        human_duration(resolved.ts - start)
+    );
+    let labels = labels_line(&resolved.labels);
     let blocks = vec![
-        json!({ "type": "section", "text": { "type": "mrkdwn", "text": format!("{} · {} → {} ({})",
-            labels_line(&resolved.labels), slack_time(start, false), slack_time(resolved.ts, false), human_duration(resolved.ts - start)) } }),
+        json!({ "type": "section", "text": { "type": "mrkdwn", "text": if labels.is_empty() { when } else { format!("{labels} · {when}") } } }),
         json!({ "type": "context", "elements": [{ "type": "mrkdwn",
             "text": format!("Fired and resolved within the same batch  ·  {}", slack_links(base, rule, &resolved.labels)) }] }),
     ];
@@ -1391,58 +1513,99 @@ fn flap_card(rule: &Rule, fired: &Transition, resolved: &Transition, base: Optio
 /// The Slack messages for a batch of transitions: one card per alert, firing ones first (worst
 /// severity first), then flapping ones (fired and resolved in this batch), then resolved ones.
 /// Past SLACK_MAX_CARDS, the rest go in a last line
+#[cfg(test)]
 fn slack_cards(cfg: &Config, trs: &[&Transition], sparks: &HashMap<String, Vec<f64>>, base: Option<&str>) -> Vec<Value> {
+    slack_cards_for(cfg, trs, sparks, base).into_iter().map(|c| c.0).collect()
+}
+
+/// slack_cards, each card with the positions in `trs` of the transitions it carries (so delivery
+/// knows which notifications a card that went through settles)
+fn slack_cards_for(cfg: &Config, trs: &[&Transition], sparks: &HashMap<String, Vec<f64>>, base: Option<&str>) -> Vec<(Value, Vec<usize>)> {
     // Each alert's transitions in this batch, in order
-    let mut by: Vec<(String, Vec<&Transition>)> = Vec::new();
-    for tr in trs {
+    let mut by: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, tr) in trs.iter().enumerate() {
         let key = instance_key(&tr.rule, &tr.labels);
         match by.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, v)) => v.push(tr),
-            None => by.push((key, vec![tr])),
+            Some((_, v)) => v.push(i),
+            None => by.push((key, vec![i])),
         }
     }
     let (mut firing, mut flaps, mut resolved) = (Vec::new(), Vec::new(), Vec::new());
-    for (key, ts) in &by {
+    for (key, idx) in by {
+        let ts: Vec<&Transition> = idx.iter().map(|&i| trs[i]).collect();
         let (Some(first), Some(last)) = (ts.first(), ts.last()) else { continue };
         let Some(rule) = cfg.rules.iter().find(|r| r.id == first.rule) else {
             continue;
         };
         if last.to == "firing" {
-            firing.push((rule.severity, firing_card(rule, last, sparks.get(key).map(|v| v.as_slice()), base)));
+            firing.push((rule.severity, (firing_card(rule, last, sparks.get(&key).map(|v| v.as_slice()), base), idx)));
         } else if let Some(fired) = ts.iter().find(|t| t.to == "firing") {
-            flaps.push(flap_card(rule, fired, last, base));
+            flaps.push((flap_card(rule, fired, last, base), idx));
         } else {
-            resolved.push(resolved_card(rule, last, base));
+            resolved.push((resolved_card(rule, last, base), idx));
         }
     }
     firing.sort_by_key(|f| std::cmp::Reverse(f.0));
-    let mut cards: Vec<Value> = firing.into_iter().map(|f| f.1).chain(flaps).chain(resolved).collect();
+    let mut cards: Vec<(Value, Vec<usize>)> = firing.into_iter().map(|f| f.1).chain(flaps).chain(resolved).collect();
     if cards.len() > SLACK_MAX_CARDS {
         let rest = cards.len() - (SLACK_MAX_CARDS - 1);
-        cards.truncate(SLACK_MAX_CARDS - 1);
+        let rest_idx: Vec<usize> = cards.drain(SLACK_MAX_CARDS - 1..).flat_map(|c| c.1).collect();
         let link = base
             .map(|b| format!("  ·  <{}/#/alerts|View all in Atalaya>", b.trim_end_matches('/')))
             .unwrap_or_default();
-        cards.push(json!({
-            "text": format!("…and {rest} more alert changes"),
-            "blocks": [{ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!("…and *{rest}* more alert changes in this batch{link}") }] }],
-        }));
+        cards.push((
+            json!({
+                "text": format!("…and {rest} more alert changes"),
+                "blocks": [{ "type": "context", "elements": [{ "type": "mrkdwn", "text": format!("…and *{rest}* more alert changes in this batch{link}") }] }],
+            }),
+            rest_idx,
+        ));
     }
     cards
 }
 
+/// What posting a batch of cards did
+struct SlackOutcome {
+    /// How many of the cards, from the first, are settled: posted, or rejected for good
+    done: usize,
+    /// Why the card at `done` did not go through, if it did not (a timeout, a 5xx, a 429, a
+    /// revoked webhook…): it and the ones after it are retried
+    error: Option<anyhow::Error>,
+    /// Cards Slack rejected for their content (400: invalid_blocks, invalid_payload…). The same
+    /// card is rejected on every retry, so it is not retried
+    rejected: Vec<String>,
+}
+
 /// Posts the cards in order. A webhook takes about one message a second, so they go a second
-/// apart. A failure retries the whole batch, so a card that went out may be sent again (delivery
-/// is at-least-once)
-async fn send_slack(http: &reqwest::Client, url_env: &str, cards: &[Value]) -> Result<()> {
-    let url = env_required(url_env)?;
+/// apart. Stops at the first failure worth retrying, so the cards before it are not posted again
+async fn send_slack(http: &reqwest::Client, url: &str, cards: &[&Value]) -> SlackOutcome {
+    let mut out = SlackOutcome {
+        done: 0,
+        error: None,
+        rejected: Vec::new(),
+    };
     for (i, card) in cards.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        check(http.post(&url).json(card).send().await.map_err(reqwest::Error::without_url)?).await?;
+        let sent = match http.post(url).json(card).send().await {
+            Ok(resp) => check(resp).await,
+            Err(e) => Err(anyhow::Error::from(e.without_url())),
+        };
+        match sent {
+            Ok(()) => {}
+            Err(e) if e.downcast_ref::<HttpError>().is_some_and(|h| h.status == 400) => {
+                let text = card["text"].as_str().unwrap_or_default().chars().take(120).collect::<String>();
+                out.rejected.push(format!("{e:#} (card: {text})"));
+            }
+            Err(e) => {
+                out.error = Some(e);
+                return out;
+            }
+        }
+        out.done = i + 1;
     }
-    Ok(())
+    out
 }
 
 /// Error with the status code and the start of the body, without the URL (it may contain the token).
@@ -1453,8 +1616,26 @@ async fn check(resp: reqwest::Response) -> Result<()> {
         return Ok(());
     }
     let body = resp.text().await.unwrap_or_default();
-    bail!("response {}: {}", status.as_u16(), body.chars().take(200).collect::<String>())
+    Err(HttpError {
+        status: status.as_u16(),
+        body: body.chars().take(200).collect(),
+    }
+    .into())
 }
+
+#[derive(Debug)]
+struct HttpError {
+    status: u16,
+    body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "response {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
@@ -1904,6 +2085,302 @@ rules:
         }
         let b = Alerts::new(yaml, &dir);
         assert_eq!(b.pending().await, 1, "the outbox is restored on startup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn firing(rule: &str, ls: &[(&str, &str)], value: f64) -> Instance {
+        Instance {
+            rule: rule.into(),
+            labels: labels(ls),
+            phase: Phase::Firing,
+            since: 1,
+            value,
+            last_seen: 1,
+        }
+    }
+
+    /// The App the evaluation loop gets, with a ClickHouse that nobody answers
+    fn test_app(yaml: &Path, data: &Path) -> App {
+        let ch = atalaya::ch::ClickHouse::new("http://127.0.0.1:1/".into(), "u".into(), String::new());
+        App {
+            promql: atalaya::promql::Engine::new(atalaya::promql::store::Store::new(ch.clone(), "atalaya".into())),
+            ch,
+            db: "atalaya".into(),
+            dashboards: data.join("dashboards"),
+            overview: data.join("overview.yaml"),
+            timeline: data.join("timeline.yaml"),
+            data: data.to_owned(),
+            alerts: Alerts::new(yaml.to_owned(), data),
+            overview_cache: Default::default(),
+        }
+    }
+
+    /// ±Inf (a division by zero) and NaN go to the files and come back: serde_json wrote them as
+    /// null and could not read them, so the next start lost every alert and silence
+    #[tokio::test]
+    async fn non_finite_values_survive_a_restart() {
+        let dir = temp_dir("inf");
+        let a = Alerts::new(dir.join("alerts.yaml"), &dir);
+        let silence = a.add_silence(Some("x".into()), Labels::new(), now() + 3600, "keep me".into()).await.unwrap();
+        let mut st = a.state.lock().await.clone();
+        for (rule, v) in [("inf", f64::INFINITY), ("neg", f64::NEG_INFINITY), ("nan", f64::NAN), ("one", 1.5)] {
+            let i = firing(rule, &[], v);
+            st.instances.insert(instance_key(rule, &i.labels), i);
+        }
+        let tr = Transition {
+            ts: now(),
+            rule: "inf".into(),
+            labels: Labels::new(),
+            from: "inactive".into(),
+            to: "firing".into(),
+            value: f64::INFINITY,
+            since: Some(now()),
+        };
+        a.append_history(std::slice::from_ref(&tr));
+        a.finish_cycle(&Config::default(), st, vec![], now()).await;
+
+        let b = Alerts::new(dir.join("alerts.yaml"), &dir);
+        let st = b.state.lock().await;
+        let value = |r: &str| st.instances[&instance_key(r, &Labels::new())].value;
+        assert_eq!(value("inf"), f64::INFINITY);
+        assert_eq!(value("neg"), f64::NEG_INFINITY);
+        assert!(value("nan").is_nan());
+        assert_eq!(value("one"), 1.5);
+        assert_eq!(st.silences.iter().map(|s| &s.id).collect::<Vec<_>>(), vec![&silence.id]);
+        drop(st);
+        let h = b.history(0, i64::MAX);
+        assert_eq!(h.len(), 1, "the transition is in the history");
+        assert_eq!(h[0].value, f64::INFINITY);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Files written before (with null) still load: the value reads as NaN
+    #[test]
+    fn a_null_value_from_an_older_file_loads() {
+        let i: Instance = serde_json::from_str(r#"{"rule":"r","labels":{},"phase":"firing","since":1,"value":null,"last_seen":1}"#).unwrap();
+        assert!(i.value.is_nan());
+    }
+
+    /// A state file that does not parse is kept aside, not overwritten by the next save
+    #[tokio::test]
+    async fn a_state_file_that_does_not_parse_is_set_aside() {
+        let dir = temp_dir("corrupt");
+        std::fs::create_dir_all(dir.join("alerts")).unwrap();
+        std::fs::write(dir.join("alerts/state.json"), "{ not json").unwrap();
+        let a = Alerts::new(dir.join("alerts.yaml"), &dir);
+        assert!(a.state.lock().await.instances.is_empty());
+        let aside: Vec<String> = std::fs::read_dir(dir.join("alerts"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("state.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("alerts").join(&aside[0])).unwrap(), "{ not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Started with an invalid alerts.yaml, the server neither drops what was firing nor the
+    /// outbox: with no rules, the first cycle used to remove every instance (notifying them again
+    /// once the file was fixed) and delivery dropped every queued notification
+    #[tokio::test]
+    async fn an_invalid_rules_file_at_startup_keeps_the_state_and_the_outbox() {
+        let dir = temp_dir("badyaml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml = dir.join("alerts.yaml");
+        let good = r#"
+defaults: { group_wait: 0s, notify: [hook] }
+channels: { hook: { type: webhook, url_env: ATALAYA_TEST_HOOK_NOT_SET } }
+rules:
+  - { id: a, title: Disk full, severity: warning, expr: x, summary: "full" }
+"#;
+        std::fs::write(&yaml, good).unwrap();
+        {
+            let a = Alerts::new(yaml.clone(), &dir);
+            let mut st = a.state.lock().await.clone();
+            let i = firing("a", &[("instance", "host-1")], 1.0);
+            st.instances.insert(instance_key("a", &i.labels), i);
+            let tr = Transition {
+                ts: 1,
+                rule: "a".into(),
+                labels: labels(&[("instance", "host-1")]),
+                from: "pending".into(),
+                to: "firing".into(),
+                value: 1.0,
+                since: None,
+            };
+            let cfg = a.config().await;
+            a.finish_cycle(&cfg, st, vec![tr], now()).await;
+        }
+        // A typo in the file, and a restart
+        std::fs::write(&yaml, "rules: [ {").unwrap();
+        let app = test_app(&yaml, &dir);
+        app.alerts.tick(&app).await;
+        app.alerts.deliver(None).await;
+        assert_eq!(app.alerts.state.lock().await.instances.len(), 1, "what was firing is still there");
+        assert_eq!(app.alerts.pending().await, 1, "the notification waits for its channel");
+        assert_eq!(app.alerts.last_tick(), None, "/readyz says no cycle ran");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An expression that does not parse makes the file invalid (the previous rules stay) instead
+    /// of failing on every evaluation; one the parser panics on too
+    #[test]
+    fn a_rule_with_an_invalid_expression_makes_the_file_invalid() {
+        let dir = temp_dir("badexpr");
+        std::fs::create_dir_all(&dir).unwrap();
+        for expr in ["rate(x[5m]", "rate(x[1e30])", "sum by (instance) (rate(x[$__rate_interval])) > 0"] {
+            let yaml = dir.join("alerts.yaml");
+            std::fs::write(
+                &yaml,
+                format!("channels: {{ default: {{ type: log }} }}\nrules:\n  - {{ id: a, title: t, expr: '{expr}' }}\n"),
+            )
+            .unwrap();
+            let r = load_config(&yaml);
+            if expr.contains("__rate_interval") {
+                assert!(r.is_ok(), "{expr}: {:?}", r.err());
+            } else {
+                assert!(r.is_err(), "{expr} loads");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rules in production style (aggregations, absent(), logs rules) have no labels: none of
+    /// their cards may carry an empty section, which Slack rejects with 400 invalid_blocks
+    #[test]
+    fn cards_of_alerts_without_labels_have_no_empty_section() {
+        let cfg = slack_cfg();
+        let fire = tr("disk-full", &[], "firing", 1000, Some(1000), 1.0);
+        let res = tr("disk-full", &[], "resolved", 2000, Some(1000), 0.0);
+        for cards in [
+            slack_cards(&cfg, &[&res], &HashMap::new(), None),
+            slack_cards(&cfg, &[&fire, &res], &HashMap::new(), None),
+        ] {
+            for card in &cards {
+                assert!(empty_section(card).is_none(), "empty section in {card}");
+            }
+        }
+    }
+
+    /// The first section whose text is empty, as Slack's validation finds it
+    fn empty_section(v: &Value) -> Option<&Value> {
+        match v {
+            Value::Object(m) => {
+                if m.get("type").and_then(Value::as_str) == Some("section")
+                    && m.get("text").is_some_and(|t| t["text"].as_str().is_some_and(|s| s.trim().is_empty()))
+                {
+                    return Some(v);
+                }
+                m.values().find_map(empty_section)
+            }
+            Value::Array(a) => a.iter().find_map(empty_section),
+            _ => None,
+        }
+    }
+
+    /// A Slack webhook: 400 for a card with an empty section (as Slack), 500 once for a card whose
+    /// text says FLAKY, 200 for the rest. Returns its URL and the texts of the cards it accepted
+    type Accepted = Arc<std::sync::Mutex<Vec<String>>>;
+
+    async fn fake_slack() -> (String, Accepted) {
+        use axum::{Json, Router, extract::State as St, http::StatusCode, routing::post};
+        let accepted: Accepted = Arc::default();
+        let flaked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/hook",
+                post(
+                    |St((acc, flaked)): St<(Accepted, Arc<std::sync::atomic::AtomicBool>)>, Json(card): Json<Value>| async move {
+                        let text = card["text"].as_str().unwrap_or_default().to_owned();
+                        if empty_section(&card).is_some() {
+                            return (StatusCode::BAD_REQUEST, "invalid_blocks");
+                        }
+                        if text.contains("FLAKY") && !flaked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "oops");
+                        }
+                        acc.lock().unwrap().push(text);
+                        (StatusCode::OK, "ok")
+                    },
+                ),
+            )
+            .with_state((accepted.clone(), flaked));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/hook"), accepted)
+    }
+
+    /// A card Slack rejects is dropped (it would be rejected again), and a failure worth retrying
+    /// retries only the cards from it on: the ones before are not posted twice
+    #[tokio::test]
+    async fn slack_retries_only_the_cards_that_did_not_go_through() {
+        let (url, accepted) = fake_slack().await;
+        let http = reqwest::Client::new();
+        let card = |t: &str| json!({ "text": t, "blocks": [{ "type": "section", "text": { "type": "mrkdwn", "text": t } }] });
+        let bad = json!({ "text": "bad", "blocks": [{ "type": "section", "text": { "type": "mrkdwn", "text": "" } }] });
+        let cards = [card("one"), bad, card("two"), card("FLAKY three"), card("four")];
+        let refs: Vec<&Value> = cards.iter().collect();
+        let out = send_slack(&http, &url, &refs).await;
+        assert_eq!(out.done, 3, "one, the rejected card and two are settled");
+        assert_eq!(out.rejected.len(), 1);
+        assert!(out.error.is_some(), "FLAKY three failed with a 500");
+        let out = send_slack(&http, &url, &refs[out.done..]).await;
+        assert_eq!((out.done, out.error.is_none()), (2, true));
+        assert_eq!(*accepted.lock().unwrap(), ["one", "two", "FLAKY three", "four"], "each card posted once");
+    }
+
+    /// End to end through the outbox: a resolved alert without labels reaches Slack, and a card that
+    /// went through is not posted again when a later one fails
+    #[tokio::test]
+    async fn slack_delivery_settles_each_card_on_its_own() {
+        let (url, accepted) = fake_slack().await;
+        let var = "ATALAYA_TEST_SLACK_DELIVERY_URL";
+        // SAFETY: a variable only this test reads, set before anything reads it
+        unsafe { std::env::set_var(var, &url) };
+        let dir = temp_dir("slackdelivery");
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml = dir.join("alerts.yaml");
+        std::fs::write(
+            &yaml,
+            format!(
+                r#"
+defaults: {{ group_wait: 0s, notify: [slack] }}
+channels: {{ slack: {{ type: slack, url_env: {var} }} }}
+rules:
+  - {{ id: quiet, title: Queue, severity: warning, expr: x, summary: "queued" }}
+  - {{ id: ok, title: Disk, severity: critical, expr: y, summary: "full" }}
+  - {{ id: flaky, title: FLAKY memory, severity: warning, expr: z, summary: "high" }}
+"#
+            ),
+        )
+        .unwrap();
+        let a = Alerts::new(yaml, &dir);
+        let cfg = a.config().await;
+        let st = a.state.lock().await.clone();
+        // Cards in order: ok (critical), FLAKY (warning, fails once with a 500), quiet resolved
+        let trs = vec![
+            tr("quiet", &[], "resolved", now(), Some(now() - 600), 0.0),
+            tr("ok", &[("instance", "host-1")], "firing", now(), Some(now()), 99.0),
+            tr("flaky", &[("instance", "host-1")], "firing", now(), Some(now()), 97.0),
+        ];
+        a.finish_cycle(&cfg, st, trs, now()).await;
+        a.deliver(None).await;
+        assert_eq!(a.pending().await, 2, "ok went through; FLAKY and what follows wait");
+        for p in a.queue.lock().await.iter_mut() {
+            p.next_try = 0;
+        }
+        a.deliver(None).await;
+        assert_eq!(a.pending().await, 0, "{:?}", accepted.lock().unwrap());
+        let texts = accepted.lock().unwrap().clone();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(texts.iter().filter(|t| t.contains("Disk")).count(), 1, "ok was not posted again");
+        assert_eq!(texts.iter().filter(|t| t.contains("FLAKY")).count(), 1);
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("RESOLVED")).count(),
+            1,
+            "the resolved card without labels went through, once"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
