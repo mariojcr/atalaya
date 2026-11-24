@@ -94,6 +94,21 @@ fn now() -> i64 {
 }
 
 /// Expands the Grafana macros that depend on the step and the tier
+/// Checks that a query parses and that the engine supports it, without running it (for alert rules,
+/// when their file is loaded). The parser panics on some input (`rate(x[1e30])`): that is an error too
+pub fn check(query: &str) -> Result<()> {
+    let expr = parse(&expand_macros(query, 60, 60, 3600))?;
+    collect(&expr, &mut Vec::new())
+}
+
+/// The parser panics on some input (`rate(x[1e30])` overflows a Duration): that is a bad query, not
+/// a reason to take down the request or the alert loop
+fn parse(text: &str) -> Result<Expr> {
+    std::panic::catch_unwind(|| parser::parse(text))
+        .map_err(|_| anyhow::anyhow!("invalid expression (the PromQL parser panicked on it)"))?
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn expand_macros(q: &str, step: i64, res: i64, range: i64) -> String {
     let rate = (4 * res).max(step + res);
     q.replace("${__rate_interval}", &format!("{rate}s"))
@@ -231,7 +246,7 @@ impl Engine {
         let mut expr;
         loop {
             let text = expand_macros(query, step, tier.res(), range);
-            expr = parser::parse(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+            expr = parse(&text)?;
             let mut sels = Vec::new();
             collect(&expr, &mut sels)?;
             let oldest = sels

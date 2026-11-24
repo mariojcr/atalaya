@@ -238,12 +238,45 @@ fn quantile(q: f64, vals: &mut [f64]) -> f64 {
     if q > 1.0 {
         return f64::INFINITY;
     }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // NaN first, as Prometheus sorts them (sort.Float64s)
+    vals.sort_by(|a, b| nan_first(*a, *b));
     let rank = q * (vals.len() - 1) as f64;
     let lo = rank.floor() as usize;
     let hi = (lo + 1).min(vals.len() - 1);
     let w = rank - lo as f64;
     vals[lo] * (1.0 - w) + vals[hi] * w
+}
+
+/// A total order on f64 with NaN before every number. A comparator that is not a total order (as
+/// `partial_cmp(..).unwrap_or(..)` with NaN) makes `sort_by` panic since Rust 1.81, and a panic in an
+/// alert rule ended the evaluation loop
+fn nan_first(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.total_cmp(&b),
+    }
+}
+
+/// Ascending with NaN after every number
+fn nan_last(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => a.total_cmp(&b),
+    }
+}
+
+/// Descending with NaN after every number
+fn nan_last_desc(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.total_cmp(&a),
+    }
 }
 
 fn stdvar(vals: &[f64]) -> f64 {
@@ -261,7 +294,7 @@ fn bucket_quantile(q: f64, buckets: &mut [(f64, f64)]) -> f64 {
     if q > 1.0 {
         return f64::INFINITY;
     }
-    buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
     if buckets.len() < 2 || buckets.last().map(|b| b.0) != Some(f64::INFINITY) {
         return f64::NAN;
     }
@@ -484,8 +517,10 @@ impl Evaluator<'_> {
                     let kk = ki.max(0.0) as usize;
                     let mut vals: Vec<(usize, f64)> = members.iter().filter_map(|&m| input[m].vals[i].map(|v| (m, v))).collect();
                     match op {
-                        "topk" => vals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less)),
-                        "bottomk" => vals.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Less)),
+                        // NaN last in both, as in Prometheus: only taken when k is larger than the
+                        // number of other values
+                        "topk" => vals.sort_by(|a, b| nan_last_desc(a.1, b.1)),
+                        "bottomk" => vals.sort_by(|a, b| nan_last(a.1, b.1)),
                         _ => {}
                     }
                     for &(m, v) in vals.iter().take(kk) {
@@ -1206,6 +1241,36 @@ mod tests {
         }
         // A window that already spans min_range is not touched
         assert!(eval("increase(c_total[5m])").iter().all(|v| (v - 4500.0).abs() < 1e-6), "increase over 5m");
+    }
+
+    /// topk, bottomk and quantile over values with NaN (0/0 in a ratio): sort_by panicked on the
+    /// comparators, which are not a total order with NaN, and a panic in an alert rule ended the
+    /// evaluation loop. NaN goes last, as in Prometheus
+    #[test]
+    fn rankings_and_quantiles_over_nan_do_not_panic() {
+        let used = |i: usize| Samples {
+            labels: labels(&[("__name__", "used"), ("mount", &format!("/m{i:03}"))]),
+            ts: vec![0],
+            vals: vec![if i.is_multiple_of(7) { f64::NAN } else { (i * 37 % 101) as f64 }],
+            ..Default::default()
+        };
+        let data = || vec![("used", (0..100).map(used).collect::<Vec<_>>())];
+        let finite: Vec<f64> = {
+            let mut v: Vec<f64> = (0..100).filter(|i: &usize| !i.is_multiple_of(7)).map(|i| (i * 37 % 101) as f64).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            v
+        };
+        let picked = |q: &str| {
+            let mut v: Vec<f64> = run_ordered(q, data()).into_iter().map(|(_, v)| v).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            v
+        };
+        assert_eq!(picked("topk(3, used)"), finite[finite.len() - 3..]);
+        assert_eq!(picked("bottomk(3, used)"), finite[..3]);
+        let all = picked("topk(100, used)");
+        assert_eq!((all.len(), all.iter().filter(|v| v.is_nan()).count()), (100, 15), "NaN only fill what k leaves");
+        let q = run_ordered("quantile(0.9, used)", data());
+        assert_eq!(q.len(), 1);
     }
 
     fn run(q: &str, data: Vec<(&str, Vec<Samples>)>, start: i64, end: i64, step: i64) -> Out {
