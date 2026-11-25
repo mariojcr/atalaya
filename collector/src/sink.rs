@@ -46,14 +46,9 @@ pub const LOG_STREAM_FIELDS: &str = "job,host,nomad.group,nomad.task,stream";
 /// Fields of a log line that its resource or attributes cannot overwrite
 const LOG_CORE: &[&str] = &["_time", "_msg", "_stream", "job", "host", "stream", "level"];
 
-/// How long a connection may sit idle in the pool and still be reused. It must
-/// be well under the server's keep-alive (ClickHouse's `keep_alive_timeout`, 30 s
-/// by default): with the default 30 s flush, the connections of one flush were
-/// idle almost exactly as long as the server keeps them, and reusing one just as
-/// the server closed it failed the send ("connection closed before message
-/// completed") and sent the batch to the spool. The farther the server is, the
-/// wider that window: from another region it was ~4 % of the batches. A flush
-/// still reuses its own connections (the spool, then the tables).
+/// How long a connection may sit idle in the pool and still be reused: well under the server's
+/// keep-alive (ClickHouse's `keep_alive_timeout`, 30 s by default), or reusing one just as the
+/// server closes it fails the send
 const POOL_IDLE: Duration = Duration::from_secs(5);
 
 /// Cap on in-memory rows per table between two sends. Normally there are a few
@@ -79,7 +74,6 @@ pub struct Stats {
     pub dropped_rows: AtomicU64,
 }
 
-/// Where a pipe sends its batches
 enum Backend {
     ClickHouse {
         url: String,
@@ -90,7 +84,6 @@ enum Backend {
     Victoria {
         metrics_url: Option<String>,
         logs_url: Option<String>,
-        /// Basic auth (user, password) for both
         auth: Option<(String, String)>,
     },
 }
@@ -155,7 +148,6 @@ impl Pipe {
         }
     }
 
-    /// Whether this destination takes the table's rows
     fn has(&self, table: &str) -> bool {
         self.tables.contains(&table)
     }
@@ -241,7 +233,6 @@ impl Pipe {
         };
         // What was waiting on disk goes first, to keep the order
         let spool_ok = self.retry_spool().await;
-        // Tables in parallel
         let sends = batches.into_iter().enumerate().filter(|(_, l)| !l.is_empty()).map(|(i, lines)| async move {
             let table = self.tables[i];
             let n = lines.len() as u64;
@@ -293,7 +284,6 @@ impl Pipe {
         false
     }
 
-    /// Writes a batch to the disk spool; false if it could not be written
     fn to_spool(&self, table: &str, body: &[u8]) -> bool {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -331,9 +321,7 @@ impl Pipe {
 
     /// Sends the oldest batches of the disk spool, at most SPOOL_PER_FLUSH of them. True when the
     /// spool is empty afterwards: otherwise this flush's batches go to the spool behind the rest, so
-    /// the order holds, and a long backlog drains a slice per flush. Draining it whole in one flush
-    /// held every later flush back meanwhile (no fresh data on the dashboards, and rows piling up
-    /// in memory until the cap dropped them)
+    /// the order holds, and a long backlog drains a slice per flush
     async fn retry_spool(&self) -> bool {
         let files = self.spool_files();
         let all = files.len();
@@ -384,7 +372,6 @@ impl Pipe {
     }
 }
 
-/// Flushes a pipe if there is one: true when it saved everything it took
 async fn flush_pipe(p: Option<&Pipe>) -> bool {
     match p {
         Some(p) => p.flush().await,
@@ -463,7 +450,6 @@ fn rfc3339(t: &str) -> String {
     format!("{}Z", t.replacen(' ', "T", 1))
 }
 
-/// A VictoriaMetrics import line: one sample of one series
 fn import_line(labels: &Map<String, Value>, name: &str, extra: Option<(&str, String)>, value: f64, time: i64) -> String {
     let mut metric = labels.clone();
     metric.insert("__name__".into(), name.into());
@@ -473,7 +459,6 @@ fn import_line(labels: &Map<String, Value>, name: &str, extra: Option<(&str, Str
     json!({"metric": metric, "values": [value], "timestamps": [time * 1000]}).to_string()
 }
 
-/// A VictoriaLogs line from a row of the logs table
 fn log_line(row: &Value) -> String {
     let mut o = Map::new();
     o.insert("_time".into(), rfc3339(row["Time"].as_str().unwrap_or_default()).into());
@@ -578,7 +563,6 @@ impl Victoria {
         }
     }
 
-    /// Forgets the series nothing was written to for SERIES_IDLE
     fn prune(&self) {
         let now = Instant::now();
         self.series.lock().unwrap().retain(|_, s| now.duration_since(s.seen) < SERIES_IDLE);
@@ -776,7 +760,6 @@ impl Sink {
         self.done.load(Ordering::SeqCst) >= mark
     }
 
-    /// Sends what is pending to every destination; whatever fails goes to its disk spool.
     pub async fn flush(&self) {
         // The round is numbered before any destination takes its rows: a row pushed after the
         // number was read (its mark is the next round) may still go in this one, never the reverse
@@ -798,7 +781,6 @@ impl Sink {
         }
     }
 
-    /// The staleness markers waiting to be sent
     #[cfg(test)]
     pub(crate) fn stale_rows(&self) -> Vec<Value> {
         self.stale.lock().unwrap().iter().map(|l| serde_json::from_str(l).unwrap()).collect()
@@ -829,7 +811,6 @@ impl Sink {
         gzip(lines)
     }
 
-    /// Writes a batch to ClickHouse's disk spool
     #[cfg(test)]
     fn to_spool(&self, table: &str, body: &[u8]) -> bool {
         self.clickhouse.as_ref().expect("ClickHouse").to_spool(table, body)
@@ -889,7 +870,6 @@ mod tests {
         dir
     }
 
-    /// The batches in the spool, decompressed
     fn spooled(dir: &std::path::Path) -> Vec<String> {
         use std::io::Read;
         let mut out = Vec::new();
@@ -1012,9 +992,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A long spool drains a slice per flush, and what comes meanwhile waits behind it on disk (so
-    /// the order holds and memory does not fill): before, one flush sent the whole spool while every
-    /// later flush waited
     #[tokio::test]
     async fn a_long_spool_drains_a_slice_per_flush() {
         let dir = spool_dir("slices");
@@ -1188,7 +1165,6 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
-    /// The JSON lines sent to a path, parsed
     fn sent_to(seen: &Mutex<Vec<(String, String)>>, path: &str) -> Vec<Value> {
         seen.lock()
             .unwrap()
@@ -1370,8 +1346,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With ClickHouse and Victoria, the log tailers may only move past a row once both have it:
-    /// ClickHouse taking it is not enough while Victoria's copy is neither sent nor on disk
     #[tokio::test]
     async fn with_two_destinations_a_row_is_durable_only_once_both_have_it() {
         let ch_dir = spool_dir("both-ch");
@@ -1402,8 +1376,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&v_dir);
     }
 
-    /// A spooled batch for a Victoria destination that is no longer configured can never be sent:
-    /// it is moved aside instead of blocking the spool for ever
     #[tokio::test]
     async fn a_spooled_batch_for_a_destination_no_longer_configured_is_set_aside() {
         let dir = spool_dir("gone");
@@ -1424,8 +1396,6 @@ mod victoria_outage_tests {
     use super::tests as tests_support;
     use super::*;
 
-    /// VictoriaLogs down does not hold VictoriaMetrics up: before, both went through one spool and a
-    /// failing log batch at its head kept the points waiting on disk behind it
     #[tokio::test]
     async fn victorialogs_down_does_not_hold_up_victoriametrics() {
         let dir = std::env::temp_dir().join(format!("atalaya-sink-vl-down-{}", std::process::id()));

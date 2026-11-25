@@ -23,7 +23,6 @@ fn path(dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{id}.json")))
 }
 
-/// Lists id, title, update time and cell count of every notebook
 pub fn list(dir: &Path) -> Result<Value> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -55,7 +54,6 @@ pub fn get(dir: &Path, id: &str) -> Result<Option<Value>> {
     }
 }
 
-/// Cell types the UI renders
 const CELL_TYPES: &[&str] = &["text", "note", "promql", "logs"];
 const MAX_CELLS: usize = 500;
 
@@ -86,7 +84,6 @@ pub fn validate(body: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Saves the notebook (stamps `updated`); atomic write via rename
 pub fn save(dir: &Path, id: &str, mut body: Value) -> Result<Value> {
     let p = path(dir, id)?;
     if !body.is_object() {

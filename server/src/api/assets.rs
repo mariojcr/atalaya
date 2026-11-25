@@ -42,7 +42,6 @@ const STATIC: &[(&str, &str, &[u8])] = &[
         include_bytes!("../../static/uPlot.iife.min.js"),
     ),
     ("uPlot.min.css", "text/css; charset=utf-8", include_bytes!("../../static/uPlot.min.css")),
-    // The brand mark (the header's watchtower) on the accent colour
     ("favicon.svg", "image/svg+xml", include_bytes!("../../static/favicon.svg")),
     ("favicon.ico", "image/x-icon", include_bytes!("../../static/favicon.ico")),
     ("icon-192.png", "image/png", include_bytes!("../../static/icon-192.png")),

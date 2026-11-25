@@ -19,7 +19,6 @@ use serde_json::Value;
 
 use crate::prom::{Kind, Labels, Scrape};
 
-/// A host disk as seen in sysfs
 #[derive(Debug, PartialEq)]
 pub struct Disk {
     /// Name used in labels (sda, nvme0)
@@ -121,7 +120,6 @@ fn ata_raw(raw: &Value) -> Option<f64> {
     raw["value"].as_f64()
 }
 
-/// Turns one disk's smartctl output into metrics
 pub fn parse(device: &str, rotational: Option<bool>, v: &Value, o: &mut Scrape) {
     let standby = v["smartctl"]["messages"].as_array().is_some_and(|m| {
         m.iter()

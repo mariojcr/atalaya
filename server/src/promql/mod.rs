@@ -94,9 +94,7 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Expands the Grafana macros that depend on the step and the tier
-/// Checks that a query parses and that the engine supports it, without running it (for alert rules,
-/// when their file is loaded). The parser panics on some input (`rate(x[1e30])`): that is an error too
+/// Checks that a query parses and that the engine supports it, without running it (for alert rules)
 pub fn check(query: &str) -> Result<()> {
     let expr = parse(&expand_macros(query, 60, 60, 3600))?;
     collect(&expr, &mut Vec::new())
@@ -147,7 +145,6 @@ fn at_secs(at: &Option<AtModifier>, start: i64, end: i64) -> Option<i64> {
     }
 }
 
-/// Key of a selector in the data map
 pub(crate) fn sel_key(vs: &VectorSelector) -> String {
     vs.to_string()
 }
@@ -159,7 +156,6 @@ struct Need<'a> {
     to: i64,
 }
 
-/// Walks the expression collecting selectors and their range windows
 fn collect<'a>(e: &'a Expr, out: &mut Vec<(&'a VectorSelector, i64)>) -> Result<()> {
     match e {
         Expr::VectorSelector(vs) => out.push((vs, 0)),
@@ -344,9 +340,7 @@ impl Engine {
             n.to = n.to.max(to);
         }
 
-        // First the series of each selector, to know how much the query would read before reading
-        // it: a few selectors over thousands of series and days of data took the server past
-        // 18 GiB and the kernel killed it (and in a container, past its memory limit)
+        // First the series of each selector, to know how much the query would read before reading it
         let selects = needs.into_iter().map(|(k, n)| async move {
             let t = std::time::Instant::now();
             let series = self.store.select(&n.vs.name, &n.vs.matchers, n.from).await?;
@@ -389,8 +383,7 @@ impl Engine {
             );
         }
 
-        // Evaluating is CPU work (seconds for a large query): on the async runtime it held a worker
-        // thread for all that time, and a few of them at once stalled every request and the alerts
+        // Evaluating is CPU work (seconds for a large query): off the async runtime
         let t = std::time::Instant::now();
         let n = ((end - start) / step + 1) as usize;
         let output = tokio::task::spawn_blocking(move || {
@@ -416,7 +409,6 @@ impl Engine {
         })
     }
 
-    /// Instant query at `time`
     pub async fn instant(&self, query: &str, time: i64) -> Result<Evaluated> {
         self.range(query, time, time, 15).await
     }
@@ -473,8 +465,6 @@ mod tests {
         (format!("http://{addr}/"), read_points)
     }
 
-    /// A query that would read more samples than allowed is refused before reading them: a few such
-    /// queries took the server past 18 GiB until the kernel killed it
     #[tokio::test]
     async fn a_query_over_the_sample_budget_is_refused_before_reading() {
         let (url, read_points) = fake_clickhouse(100).await;
@@ -491,8 +481,6 @@ mod tests {
         assert!(read_points.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// Queries from the UI holding the whole budget wait for it, but alert rules do not: they have
-    /// a budget of their own
     #[tokio::test]
     async fn alerts_do_not_wait_for_the_budget_of_other_queries() {
         let (url, _) = fake_clickhouse(2).await;

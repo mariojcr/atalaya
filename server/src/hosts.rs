@@ -58,7 +58,6 @@ impl AllowedHosts {
     }
 }
 
-/// The name of a host, without its port or trailing dot, in lowercase
 fn name(host: &str) -> String {
     let host = match host.rsplit_once(':') {
         Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,

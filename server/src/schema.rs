@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! ClickHouse schema: `atalaya-server schema` prints it and `--apply` applies it.
-
 use atalaya::ch::ClickHouse;
 
 use crate::app::{env, ident};
@@ -34,7 +32,6 @@ fn replicated(schema: &str) -> String {
         + "\n"
 }
 
-/// Schema statements, without comments
 fn schema_statements(schema: &str) -> Vec<String> {
     schema
         .split(";\n")

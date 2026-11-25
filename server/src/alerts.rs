@@ -30,13 +30,10 @@ use crate::overview::Text;
 use atalaya::ch::Param;
 use atalaya::promql::Output;
 
-/// How far behind "now" evaluation runs (same delay as the panels)
 /// Maximum number of history lines returned (the most recent ones)
 const MAX_HISTORY: usize = 5000;
 
 pub type Labels = BTreeMap<String, String>;
-
-// ── Configuration ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default, Clone)]
 pub struct Config {
@@ -134,7 +131,6 @@ impl Channel {
             Channel::Webhook { url_env } | Channel::Slack { url_env } => vec![url_env.as_str()],
         }
     }
-    /// Whether all of its variables are set in the environment
     pub fn configured(&self) -> bool {
         self.env_vars().iter().all(|v| std::env::var(v).map(|s| !s.is_empty()).unwrap_or(false))
     }
@@ -272,13 +268,11 @@ impl Rule {
     pub fn channels<'a>(&'a self, d: &'a Defaults) -> &'a [String] {
         self.notify.as_deref().unwrap_or(&d.notify)
     }
-    /// The summary with labels and value substituted
     pub fn render_summary(&self, lang: &str, labels: &Labels, value: f64) -> String {
         render(self.summary.get(lang), labels, value)
     }
 }
 
-/// Replaces {{value}} and {{label}} in a text
 pub fn render(text: &str, labels: &Labels, value: f64) -> String {
     let mut out = text.replace("{{value}}", &fmt_value(value));
     for (k, v) in labels {
@@ -300,8 +294,6 @@ pub fn fmt_value(v: f64) -> String {
     }
 }
 
-// ── State ─────────────────────────────────────────────────────────────────
-
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -310,10 +302,8 @@ pub enum Phase {
 }
 
 /// An alert's value in the state, history and outbox files. serde_json writes an infinite or NaN
-/// f64 as `null` and then refuses to read it back, so one rule returning ±Inf (a division by zero,
-/// histogram_quantile) made the next start lose every alert and silence. Non-finite values are
-/// written as Prometheus writes them ("+Inf", "-Inf", "NaN"), and a `null` from older files reads
-/// as NaN.
+/// f64 as `null` and then refuses to read it back, so they are written as Prometheus writes them
+/// ("+Inf", "-Inf", "NaN"), and a `null` from older files reads as NaN.
 mod alert_value {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -502,8 +492,6 @@ pub fn step(instances: &mut BTreeMap<String, Instance>, rule: &str, matches: &[(
     }
     out
 }
-
-// ── Service ────────────────────────────────────────────────────────────
 
 pub struct Alerts {
     path: PathBuf,
@@ -704,7 +692,6 @@ impl Alerts {
         out
     }
 
-    /// Evaluates a rule: the alerts that match right now
     pub async fn evaluate(&self, app: &App, rule: &Rule) -> Result<Vec<(Labels, f64)>> {
         let at = now() - crate::app::now_delay();
         match rule.kind {
@@ -779,7 +766,6 @@ impl Alerts {
         let mut state = self.state.lock().await.clone();
         state.silences.retain(|s| s.until > t);
         let known: std::collections::HashSet<&str> = cfg.rules.iter().map(|r| r.id.as_str()).collect();
-        // Drop instances and status of rules that no longer exist
         state.instances.retain(|_, i| known.contains(i.rule.as_str()));
         state.rules.retain(|k, _| known.contains(k.as_str()));
         for rule in &cfg.rules {
@@ -890,8 +876,7 @@ impl Alerts {
                     let trs: Vec<&Transition> = ps.iter().map(|p| &p.tr).collect();
                     match ch {
                         // Slack gets a card per alert, with a sparkline of what made it fire. Only
-                        // the cards that did not go through are retried: a failure halfway used to
-                        // post the ones before it again on every retry
+                        // the cards that did not go through are retried
                         Channel::Slack { url_env } => match env_required(url_env) {
                             Err(e) => (vec![], Some((ch.kind(), e))),
                             Ok(url) => {
@@ -947,8 +932,6 @@ impl Alerts {
     pub async fn pending(&self) -> usize {
         self.queue.lock().await.len()
     }
-
-    // ── API ────────────────────────────────────────────────────────────────
 
     pub async fn snapshot(&self, lang: &str) -> Value {
         let cfg = self.config().await;
@@ -1028,7 +1011,6 @@ impl Alerts {
         v
     }
 
-    /// Events for the timeline
     pub async fn events(&self, start: i64, end: i64, lang: &str) -> Vec<Value> {
         self.history_json(start, end, lang)
             .await
@@ -1129,8 +1111,6 @@ pub async fn run(app: Arc<App>) {
         tokio::time::sleep(Duration::from_secs(every as u64)).await;
     }
 }
-
-// ── Notifications ─────────────────────────────────────────────────────────────────
 
 pub struct Message {
     pub title: String,
@@ -1277,11 +1257,8 @@ async fn send(http: &reqwest::Client, ch: &Channel, msg: &Message) -> Result<()>
     }
 }
 
-// ── Slack ─────────────────────────────────────────────────────────────────
-
 /// Most cards in one batch: the rest go in a last line that links to the alerts page
 const SLACK_MAX_CARDS: usize = 10;
-/// Bars in a sparkline
 const SPARK_POINTS: usize = 24;
 /// What a sparkline covers before the alert fired, and its step
 const SPARK_RANGE: i64 = 3600;
@@ -1402,7 +1379,6 @@ async fn slack_sparks(engine: &atalaya::promql::Backend, cfg: &Config, trs: &[&T
     out
 }
 
-/// How a label reads as a field title
 fn label_title(k: &str) -> &str {
     match k {
         "instance" => "Host",
@@ -1412,7 +1388,6 @@ fn label_title(k: &str) -> &str {
     }
 }
 
-/// A value for the query string of a link
 fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -1573,7 +1548,6 @@ fn slack_cards_for(cfg: &Config, trs: &[&Transition], sparks: &HashMap<String, V
     cards
 }
 
-/// What posting a batch of cards did
 struct SlackOutcome {
     /// How many of the cards, from the first, are settled: posted, or rejected for good
     done: usize,
@@ -1645,8 +1619,6 @@ impl std::fmt::Display for HttpError {
 }
 
 impl std::error::Error for HttpError {}
-
-// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1725,8 +1697,7 @@ mod tests {
 
     #[test]
     fn a_rule_without_summary_loads_and_shows_its_value() {
-        // The logs example in docs/alerts.md has no summary: with it required, the
-        // whole file was rejected
+        // The logs example in docs/alerts.md has no summary
         let cfg: Config = serde_saphyr::from_str(
             "rules:\n  - id: app-errors\n    title: Errors in my-app\n    kind: logs\n    filters: ['service:my-app']\n    threshold: 20\n",
         )
@@ -1924,7 +1895,6 @@ rules:
         assert!(cards[0].to_string().contains("last value `62`"), "{}", cards[0]);
     }
 
-    /// Past SLACK_MAX_CARDS, the rest of the batch goes in one last line
     #[test]
     fn slack_cards_are_capped() {
         let cfg = slack_cfg();
@@ -1943,7 +1913,6 @@ rules:
         );
     }
 
-    /// The sparkline draws the rule's expression without its threshold, so the values below it show too
     #[test]
     fn spark_expr_drops_the_threshold() {
         assert_eq!(spark_expr("disk > 85").unwrap(), "disk");
@@ -1967,14 +1936,12 @@ rules:
         assert_eq!(human_duration(2 * 86400), "2 d");
     }
 
-    /// Transitions queued before `since` existed (outbox.json) still load
     #[test]
     fn a_transition_without_since_loads() {
         let t: Transition = serde_json::from_str(r#"{"ts":1,"rule":"a","labels":{},"from":"pending","to":"firing","value":1}"#).unwrap();
         assert_eq!(t.since, None);
     }
 
-    /// A slack channel names its webhook URL variable, like the webhook channel
     #[test]
     fn slack_channel_parses_and_needs_its_url() {
         let ch: Channel = serde_saphyr::from_str("{ type: slack, url_env: ATALAYA_TEST_SLACK_URL_UNSET }").unwrap();
@@ -1989,7 +1956,6 @@ rules:
         d
     }
 
-    /// The rules in the Compose example load and validate
     #[test]
     fn compose_example_alerts_are_valid() {
         let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/data/alerts.yaml"));
@@ -2029,7 +1995,6 @@ rules:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A silence created or deleted during evaluation survives the end of the cycle
     #[tokio::test]
     async fn silences_changed_during_evaluation_survive() {
         let dir = temp_dir("silences");
@@ -2055,7 +2020,6 @@ rules:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An undeliverable notification stays in the outbox with backoff and survives a restart
     #[tokio::test]
     async fn undelivered_notifications_stay_queued_across_restarts() {
         let dir = temp_dir("outbox");
@@ -2128,8 +2092,6 @@ rules:
         }
     }
 
-    /// ±Inf (a division by zero) and NaN go to the files and come back: serde_json wrote them as
-    /// null and could not read them, so the next start lost every alert and silence
     #[tokio::test]
     async fn non_finite_values_survive_a_restart() {
         let dir = temp_dir("inf");
@@ -2167,14 +2129,12 @@ rules:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Files written before (with null) still load: the value reads as NaN
     #[test]
     fn a_null_value_from_an_older_file_loads() {
         let i: Instance = serde_json::from_str(r#"{"rule":"r","labels":{},"phase":"firing","since":1,"value":null,"last_seen":1}"#).unwrap();
         assert!(i.value.is_nan());
     }
 
-    /// A state file that does not parse is kept aside, not overwritten by the next save
     #[tokio::test]
     async fn a_state_file_that_does_not_parse_is_set_aside() {
         let dir = temp_dir("corrupt");
@@ -2193,9 +2153,6 @@ rules:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Started with an invalid alerts.yaml, the server neither drops what was firing nor the
-    /// outbox: with no rules, the first cycle used to remove every instance (notifying them again
-    /// once the file was fixed) and delivery dropped every queued notification
     #[tokio::test]
     async fn an_invalid_rules_file_at_startup_keeps_the_state_and_the_outbox() {
         let dir = temp_dir("badyaml");
@@ -2236,8 +2193,6 @@ rules:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An expression that does not parse makes the file invalid (the previous rules stay) instead
-    /// of failing on every evaluation; one the parser panics on too
     #[test]
     fn a_rule_with_an_invalid_expression_makes_the_file_invalid() {
         let dir = temp_dir("badexpr");
@@ -2259,8 +2214,6 @@ rules:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The rules in production style (aggregations, absent(), logs rules) have no labels: none of
-    /// their cards may carry an empty section, which Slack rejects with 400 invalid_blocks
     #[test]
     fn cards_of_alerts_without_labels_have_no_empty_section() {
         let cfg = slack_cfg();
@@ -2324,8 +2277,6 @@ rules:
         (format!("http://{addr}/hook"), accepted)
     }
 
-    /// A card Slack rejects is dropped (it would be rejected again), and a failure worth retrying
-    /// retries only the cards from it on: the ones before are not posted twice
     #[tokio::test]
     async fn slack_retries_only_the_cards_that_did_not_go_through() {
         let (url, accepted) = fake_slack().await;

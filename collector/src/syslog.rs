@@ -41,7 +41,6 @@ const MAX_LINE: usize = 64 << 10;
 const IDLE: Duration = Duration::from_secs(15 * 60);
 /// TCP connections open at once; more are refused until one closes
 const MAX_CONNECTIONS: usize = 256;
-/// TCP connections open at once from one address
 const MAX_PER_PEER: usize = 16;
 
 /// Open TCP connections per sender: an IPv4 address, or the /64 of an IPv6 one
@@ -105,7 +104,6 @@ fn default_service() -> String {
     "syslog".into()
 }
 
-/// One parsed message, before it becomes a row
 #[derive(Debug, Default, PartialEq)]
 struct Message {
     host: String,
@@ -115,7 +113,6 @@ struct Message {
     attributes: Map<String, Value>,
 }
 
-/// Starts the UDP and TCP listeners; counts received lines in `lines`
 pub(crate) async fn run(cfg: SyslogConfig, sink: Arc<Sink>, lines: Arc<AtomicU64>) -> anyhow::Result<()> {
     let udp = UdpSocket::bind(&cfg.listen).await?;
     let tcp = TcpListener::bind(&cfg.listen).await?;
@@ -534,8 +531,7 @@ mod tests {
 
     #[test]
     fn a_multibyte_character_where_the_timestamp_ends_does_not_panic() {
-        // 'é' takes bytes 14 and 15 of what looks like an RFC 3164 header: one such
-        // datagram used to panic and stop the UDP receiver for good
+        // 'é' takes bytes 14 and 15 of what looks like an RFC 3164 header
         let m = parse("<13>Oct 14 12:00:0é host app: hello");
         assert_eq!(m.body, "Oct 14 12:00:0é host app: hello");
         assert_eq!(m.host, "");

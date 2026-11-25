@@ -18,7 +18,6 @@ use serde_json::{Value, json};
 use crate::app::App;
 use atalaya::promql::{Labels, Output};
 
-/// Points per sparkline
 const SPARK_POINTS: i64 = 48;
 /// Window for errors per minute and for considering a service alive
 const RECENT: i64 = 300;
@@ -284,7 +283,6 @@ async fn build(app: &App, range_secs: i64, lang: &str) -> Result<Value> {
     let start = end - range_secs;
     let step = (range_secs / SPARK_POINTS).max(60);
 
-    // ── PromQL, all at once ─────────────────────────────────────────────────
     // The job name goes quoted into the selector: strip quotes and backslashes,
     // which would break the query
     let node_job: String = cfg.node_job.chars().filter(|c| !matches!(c, '"' | '\\')).collect();
@@ -311,7 +309,6 @@ async fn build(app: &App, range_secs: i64, lang: &str) -> Result<Value> {
         range(app, "sum by (exported_job, instance) (nomad_client_allocs_cpu_total_percent)", start, end, step),
     );
 
-    // ── ClickHouse: series, errors and last log per host and per service ───
     let db = &app.db;
     let params = vec![
         ("from".into(), (end - RECENT).to_string()),
@@ -385,7 +382,6 @@ async fn build(app: &App, range_secs: i64, lang: &str) -> Result<Value> {
         last_svc.insert(sk(r), r);
     }
 
-    // ── Hosts ───────────────────────────────────────────────────────────────
     let cores = by(&cores, "instance");
     let load1 = by(&load1, "instance");
     let mem_total = by(&mem_total, "instance");
@@ -414,7 +410,6 @@ async fn build(app: &App, range_secs: i64, lang: &str) -> Result<Value> {
         }));
     }
 
-    // ── Services: those with `up` plus the configured ones ─────────────────
     let key = |l: &Labels, job: &str| format!("{}@{}", l.get(job).cloned().unwrap_or_default(), l.get("instance").cloned().unwrap_or_default());
     let svc_cpu: HashMap<String, f64> = svc_cpu.iter().map(|(l, v)| (key(l, "exported_job"), *v)).collect();
     let svc_mem: HashMap<String, f64> = svc_mem.iter().map(|(l, v)| (key(l, "exported_job"), *v)).collect();
@@ -442,7 +437,6 @@ async fn build(app: &App, range_secs: i64, lang: &str) -> Result<Value> {
         }
     }
 
-    // Configured sparklines and status lines, in parallel
     let mut futs = Vec::new();
     for (job, host) in entries.keys() {
         let c = cfg.services.get(job).cloned().unwrap_or_default();

@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! YAML dashboards.
-
 use std::collections::BTreeMap;
 
 use axum::{
@@ -41,7 +39,6 @@ async fn list_dashboards(State(app): State<Shared>) -> ApiResult<Value> {
     Ok(Json(json!({ "dashboards": out })))
 }
 
-/// A dashboard's file: its name is the file stem, letters, digits, - and _
 fn dashboard_path(dir: &std::path::Path, name: &str) -> anyhow::Result<std::path::PathBuf> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         anyhow::bail!("invalid dashboard name");

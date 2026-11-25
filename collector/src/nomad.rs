@@ -42,7 +42,6 @@ pub struct AllocInfo {
     pub namespace: String,
     /// Allocation index (job.group[N]): tells replicas apart without changing on every deployment
     pub index: String,
-    /// Where the allocation answers
     pub reach: Reach,
     /// The patterns each task's plain-text log lines are parsed with
     pub log_regex: Arc<HashMap<String, Vec<Arc<Regex>>>>,
@@ -143,7 +142,6 @@ struct Allocation {
     job: Option<JobSpec>,
 }
 
-/// The job the allocation runs: only its meta
 #[derive(Deserialize)]
 struct JobSpec {
     /// Set on a dispatched or periodic job's children
@@ -248,14 +246,11 @@ impl Allocation {
         Reach { own, ports }
     }
 
-    /// Its job, or the parent of a dispatched or periodic one
     fn parent(&self) -> &str {
         let parent = self.job.as_ref().map_or("", |j| j.parent.as_str());
         if parent.is_empty() { &self.job_id } else { parent }
     }
 
-    /// Whose share of pattern slots and time the allocation uses: its job, or
-    /// the parent of a dispatched or periodic one (each child has its own ID)
     fn owner(&self) -> String {
         format!("{}/{}", self.namespace, self.parent())
     }
@@ -409,7 +404,6 @@ fn remember(allocs: &mut Cache, id: &str, info: AllocInfo, until: Option<Instant
 }
 
 impl Nomad {
-    /// With the cluster's CA (an https addr) and an ACL token, if any
     pub fn new(addr: String, node_id: String, ca: Option<reqwest::Certificate>, token: Option<&str>) -> Result<Self> {
         let mut b = reqwest::Client::builder().timeout(Duration::from_secs(10));
         if let Some(ca) = ca {
@@ -433,7 +427,6 @@ impl Nomad {
         })
     }
 
-    /// The directory of the tokens that `metrics_token=` tags name
     pub fn with_scrape_tokens(mut self, dir: Option<PathBuf>) -> Self {
         self.tokens = dir;
         self
@@ -549,7 +542,6 @@ impl Nomad {
     }
 }
 
-/// A PEM CA certificate from a file
 pub fn ca_cert(path: &std::path::Path) -> Result<reqwest::Certificate> {
     let pem = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(reqwest::Certificate::from_pem(&pem)?)

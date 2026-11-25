@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Alerts: rules and their state, history, tests and silences.
-
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -32,7 +30,6 @@ struct LangParams {
     lang: Option<String>,
 }
 
-/// Rules with their state, firing instances, channels and silences
 async fn alerts_list(State(app): State<Shared>, Query(p): Query<LangParams>) -> ApiResult<Value> {
     Ok(Json(app.alerts.snapshot(lang_of(&p.lang)).await))
 }
@@ -46,7 +43,6 @@ struct HistoryParams {
     lang: Option<String>,
 }
 
-/// Transitions (firing / resolved) within the range
 async fn alerts_history(State(app): State<Shared>, Query(p): Query<HistoryParams>) -> ApiResult<Value> {
     let end = p.end.unwrap_or_else(unix_now);
     let start = match p.start {

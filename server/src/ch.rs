@@ -69,7 +69,6 @@ impl ClickHouse {
         }
     }
 
-    /// Runs a statement without a result (DDL, INSERT ... SELECT).
     pub async fn exec(&self, sql: &str) -> Result<()> {
         let resp = self
             .http
@@ -107,7 +106,6 @@ impl ClickHouse {
         Ok(resp.bytes().await.map_err(down)?.to_vec())
     }
 
-    /// Like `bytes`, as text
     pub async fn text(&self, sql: &str, params: &[Param], settings: &[(&str, &str)]) -> Result<String> {
         let mut query: Vec<(String, String)> = vec![("max_execution_time".into(), "60".into())];
         query.extend(settings.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
@@ -130,7 +128,6 @@ impl ClickHouse {
         Ok(body)
     }
 
-    /// Runs a query and returns its rows as JSON objects.
     pub async fn rows(&self, sql: &str, params: &[Param]) -> Result<Vec<Value>> {
         let mut query: Vec<(String, String)> = vec![
             ("default_format".into(), "JSON".into()),

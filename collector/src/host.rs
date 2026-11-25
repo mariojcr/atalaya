@@ -388,7 +388,6 @@ mod tests {
         w(&z.join("name"), "package-0\n");
         w(&z.join("max_energy_range_uj"), "1000000000\n");
         w(&z.join("energy_uj"), "999000000\n");
-        // GPU
         let g = sys.join("devices/pci/0000:c4:00.0");
         w(&g.join("gpu_busy_percent"), "25\n");
         w(&g.join("mem_info_gtt_used"), "1024\n");
@@ -397,7 +396,6 @@ mod tests {
         fs::create_dir_all(sys.join("class/drm/card1")).unwrap();
         symlink(&g, sys.join("class/drm/card1/device")).unwrap();
         fs::create_dir_all(sys.join("class/drm/card1-eDP-1")).unwrap();
-        // EDAC
         w(&sys.join("devices/system/edac/mc/mc0/ce_count"), "2\n");
         w(&sys.join("devices/system/edac/mc/mc0/ue_count"), "0\n");
 

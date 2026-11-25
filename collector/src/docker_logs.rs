@@ -68,8 +68,6 @@ impl DockerTailer {
         }
     }
 
-    /// Reads a container's log file from `pos` up to its end (or until the sink is full), sends its
-    /// lines and returns where it stopped
     fn read_file(&mut self, id: &str, path: &Path, mut pos: u64, sink: &Sink) -> u64 {
         loop {
             let (buf, start) = read_from(path, pos);
@@ -82,7 +80,6 @@ impl DockerTailer {
             let (service, container, image) = self.name(id);
             for line in String::from_utf8_lossy(complete).lines() {
                 let Ok(e) = serde_json::from_str::<Entry>(line) else { continue };
-                // Chunk of a long line (no "\n"): accumulate until its end
                 if !e.log.ends_with('\n') {
                     let p = self.partial.entry(id.to_owned()).or_default();
                     if p.len() < 64 << 10 {
@@ -109,8 +106,6 @@ impl DockerTailer {
         }
     }
 
-    /// Service name: the Compose label if present, otherwise the container
-    /// name without its leading slash
     fn name(&mut self, id: &str) -> (String, String, String) {
         if let Some(n) = self.names.get(id) {
             return n.clone();
@@ -138,7 +133,6 @@ impl DockerTailer {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         ids.sort();
-        // Removed containers: drop them from the state
         self.state.files.retain(|id, _| ids.contains(id));
         self.partial.retain(|id, _| ids.contains(id));
         self.names.retain(|id, _| ids.contains(id));
@@ -155,10 +149,7 @@ impl DockerTailer {
                 None if self.first => meta.len(),
                 None => 0,
             };
-            // Rotated since the last pass (Docker renamed it to .1 and opened another): first the
-            // rest of the old one, from where reading stopped. Reading only <id>-json.log lost those
-            // lines at every rotation (and, after a restart, read the new file from an offset that
-            // belonged to the old one)
+            // Rotated since the last pass (Docker renamed it to .1): first the rest of the old one
             if let Some(&ino) = self.state.inodes.get(&id)
                 && ino != meta.ino()
             {
@@ -200,8 +191,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// The lines written between the last read and a rotation are read from the rotated file:
-    /// before, only <id>-json.log was read and they were lost at every rotation
     #[tokio::test]
     async fn the_end_of_a_rotated_file_is_read() {
         let root = std::env::temp_dir().join(format!("atalaya-docker-rotate-{}", std::process::id()));

@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Collector configuration (the YAML file given as argument).
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -35,7 +33,6 @@ pub(crate) fn default_interval() -> String {
 pub(crate) struct Config {
     /// Node name (host.name of everything this collector sends)
     pub(crate) node: String,
-    /// Where it sends: ClickHouse, Victoria (VictoriaMetrics and VictoriaLogs) or both at once
     #[serde(default)]
     pub(crate) clickhouse: Option<ClickHouseConfig>,
     #[serde(default)]
@@ -53,7 +50,6 @@ pub(crate) struct Config {
     pub(crate) logs: LogsConfig,
     #[serde(default)]
     pub(crate) host: HostConfig,
-    /// Optional syslog receiver (network devices sending their logs)
     #[serde(default)]
     pub(crate) syslog: Option<crate::syslog::SyslogConfig>,
     /// Log offsets and the disk spool
@@ -361,7 +357,6 @@ pub(crate) fn default_alloc_dir() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// The Compose example's collector.yaml (no Nomad) loads and validates
     #[test]
     fn example_config_is_valid() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/compose/collector.yaml");
@@ -383,7 +378,6 @@ mod tests {
 
     #[test]
     fn a_misspelt_key_is_an_error_that_names_it() {
-        // Ignored, it silently left the setting at its default
         for (yaml, key) in [
             (
                 "node: h\nstate_dir: /s\nclickhouse: { url: 'http://c:8123/', user: u, flush_intervl: 10s }\n",
@@ -420,7 +414,6 @@ mod tests {
             "victoria: { metrics_url: 'http://vm:8428', logs_url: 'http://vl:9428' }\n",
             "victoria: { logs_url: 'http://vl:9428' }\n",
             "clickhouse: { url: 'http://c:8123/', user: u }\nvictoria: { metrics_url: 'http://vm:8428' }\n",
-            // Metrics only to VictoriaMetrics, logs only to ClickHouse
             "clickhouse: { url: 'http://c:8123/', user: u, metrics: false }\nvictoria: { metrics_url: 'http://vm:8428' }\n",
         ];
         for y in ok {
