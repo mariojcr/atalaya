@@ -21,7 +21,10 @@ pub struct App {
     pub timeline: PathBuf,
     /// Data written by the server (notebooks, saved searches, alert state): a volume in production
     pub data: PathBuf,
-    pub promql: promql::Engine,
+    /// PromQL: atalaya's engine over ClickHouse, or VictoriaMetrics (ATALAYA_VICTORIA_METRICS_URL)
+    pub promql: promql::Backend,
+    /// Logs on VictoriaLogs (ATALAYA_VICTORIA_LOGS_URL) instead of ClickHouse's logs table
+    pub vlogs: Option<crate::vlogs::VictoriaLogs>,
     /// Alert rules, their state and notifications
     pub alerts: alerts::Alerts,
     /// The home page is the same for everyone: cached for 10 s per range

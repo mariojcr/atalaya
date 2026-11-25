@@ -15,6 +15,7 @@
 
 mod eval;
 pub mod store;
+pub mod victoria;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -185,6 +186,61 @@ fn collect<'a>(e: &'a Expr, out: &mut Vec<(&'a VectorSelector, i64)>) -> Result<
         Expr::Extension(_) => bail!("unsupported expression"),
     }
     Ok(())
+}
+
+/// Where PromQL runs: atalaya's engine over ClickHouse, or VictoriaMetrics. Both answer with the same
+/// series and labels, so the API, the home page and the alert rules do not tell them apart.
+pub enum Backend {
+    /// Boxed: the engine's semaphores and store are far larger than a VictoriaMetrics client
+    Native(Box<Engine>),
+    Victoria(victoria::VictoriaMetrics),
+}
+
+impl Backend {
+    pub async fn range(&self, query: &str, start: i64, end: i64, step: i64) -> Result<Evaluated> {
+        match self {
+            Self::Native(e) => e.range(query, start, end, step).await,
+            Self::Victoria(v) => v.range(query, start, end, step).await,
+        }
+    }
+
+    pub async fn instant(&self, query: &str, time: i64) -> Result<Evaluated> {
+        match self {
+            Self::Native(e) => e.instant(query, time).await,
+            Self::Victoria(v) => v.instant(query, time).await,
+        }
+    }
+
+    /// For alerts: the engine keeps a separate budget; VictoriaMetrics has its own limits
+    pub async fn range_for_alerts(&self, query: &str, start: i64, end: i64, step: i64) -> Result<Evaluated> {
+        match self {
+            Self::Native(e) => e.range_for_alerts(query, start, end, step).await,
+            Self::Victoria(v) => v.range(query, start, end, step).await,
+        }
+    }
+
+    pub async fn instant_for_alerts(&self, query: &str, time: i64) -> Result<Evaluated> {
+        match self {
+            Self::Native(e) => e.instant_for_alerts(query, time).await,
+            Self::Victoria(v) => v.instant(query, time).await,
+        }
+    }
+
+    /// Values of a label in the series matching the `match[]` selectors (as written, and parsed for
+    /// the engine) since `from`
+    pub async fn label_values(&self, label: &str, raw: &[&str], parsed: &[(Option<String>, promql_parser::label::Matchers)], from: i64) -> Result<Vec<String>> {
+        match self {
+            Self::Native(e) => e.store.label_values(label, parsed, from).await,
+            Self::Victoria(v) => v.label_values(label, raw, from).await,
+        }
+    }
+
+    pub async fn series(&self, raw: &[&str], parsed: &[(Option<String>, promql_parser::label::Matchers)], from: i64) -> Result<Vec<Labels>> {
+        match self {
+            Self::Native(e) => e.store.series(parsed, from).await,
+            Self::Victoria(v) => v.series(raw, from).await,
+        }
+    }
 }
 
 impl Engine {

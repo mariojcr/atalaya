@@ -24,6 +24,8 @@
 | `ATALAYA_SESSION_KEY` | unset | Secret that signs the session cookie, 32+ characters (needed with sign-in) |
 | `ATALAYA_SESSION_DAYS` | `30` | Session length |
 | `ATALAYA_MAX_SAMPLES` | `5000000` | Most samples a PromQL query may read; also the total of all queries running at once (the rest wait). A query takes 30 to 100 bytes per sample, so 5 million is up to ~500 MiB: raise it with the server's memory. A query over the limit fails with a message saying so |
+| `ATALAYA_VICTORIA_METRICS_URL` | | VictoriaMetrics (`http://host:8428`): PromQL runs there instead of on atalaya's engine over ClickHouse, for the dashboards, the home page, the alert rules and the metrics explorer. The collector's `victoria` section writes each series with the labels the engine gives it, so the same queries read the same series. `ATALAYA_MAX_SAMPLES` does not apply: VictoriaMetrics has its own limits |
+| `ATALAYA_VICTORIA_LOGS_URL` | | VictoriaLogs (`http://host:9428`): the log explorer, the dashboards' log panels, the home page and log alert rules read there instead of ClickHouse's logs table. The explorer's filters become LogsQL with the same meaning. With both URLs set, ClickHouse is not used at all |
 | `ATALAYA_NOW_DELAY` | `45` | Seconds panels, alerts and the home page stay behind now: the time for data to arrive. 45 fits the collector's default 30 s `flush_interval`; with 15 s, 30 is enough |
 | `ATALAYA_REFRESH` | `60` | Seconds between automatic refreshes of the pages that are not dashboards (each dashboard has its own `refresh`) |
 

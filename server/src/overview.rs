@@ -220,6 +220,53 @@ fn log_json(r: &Value) -> Value {
     json!({ "time": r["ts"].as_f64().map(|x| (x / 1000.0).floor() as i64), "service": r["service"], "level": r["level"], "body": r["body"] })
 }
 
+/// The same three rows as the ClickHouse queries, from Victoria: series per host and service seen in
+/// the last two hours (VictoriaMetrics), ERROR and FATAL lines in the recent window and the last line
+/// of the day of each service and host (VictoriaLogs)
+async fn victoria_rows(
+    app: &App,
+    vl: &crate::vlogs::VictoriaLogs,
+    ignore: &[String],
+    end: i64,
+) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>, HashMap<Labels, f64>)> {
+    use crate::vlogs::{millis, num, quote, time_range};
+    let ignored = if ignore.is_empty() {
+        String::new()
+    } else {
+        format!("!\"nomad.task\":in({})", ignore.iter().map(|t| quote(t)).collect::<Vec<_>>().join(","))
+    };
+    let (series, errs, last, points_rate) = tokio::join!(
+        instant(app, "count by (instance, job) (last_over_time({job!=\"\"}[2h]))", end),
+        vl.query(format!(
+            "{} level:in(\"ERROR\",\"FATAL\") | stats by (host, job) count() as n",
+            time_range(end - RECENT, end)
+        )),
+        vl.query(format!(
+            "{} {ignored} | sort by (_time desc) partition by (host, job) limit 1",
+            time_range(end - 86400, end)
+        )),
+        instant(app, "sum(rate(atalaya_collector_points_total[5m]))", end),
+    );
+    let series_rows = series
+        .into_iter()
+        .map(|(l, n)| json!({ "host": l.get("instance").cloned().unwrap_or_default(), "service": l.get("job").cloned().unwrap_or_default(), "n": n as u64 }))
+        .collect();
+    let err_rows = errs
+        .context("errors")?
+        .iter()
+        .map(|r| json!({ "host": r["host"], "service": r["job"], "n": num(&r["n"]) }))
+        .collect();
+    let last_rows = last
+        .context("last log")?
+        .iter()
+        .map(|r| {
+            let body: String = r["_msg"].as_str().unwrap_or_default().chars().take(300).collect();
+            json!({ "host": r["host"], "service": r["job"], "ts": millis(&r["_time"]), "level": r["level"], "body": body })
+        })
+        .collect();
+    Ok((series_rows, err_rows, last_rows, points_rate))
+}
+
 pub async fn overview(app: &App, range_secs: i64, lang: &str) -> Result<Value> {
     ERRORS
         .scope(Default::default(), async {
@@ -290,15 +337,22 @@ async fn build(app: &App, range_secs: i64, lang: &str) -> Result<Value> {
            AND NOT has({{ignore:Array(String)}}, Resource['nomad.task'])
          ORDER BY Time DESC LIMIT 1 BY host, service"
     );
-    let (series_rows, err_rows, last_rows, points_rate) = tokio::join!(
-        app.ch.rows(&sql_series, &params),
-        app.ch.rows(&sql_err, &params),
-        app.ch.rows(&sql_last, &params),
-        instant(app, "sum(rate(atalaya_collector_points_total[5m]))", end),
-    );
-    let series_rows = series_rows.context("series")?;
-    let err_rows = err_rows.context("errors")?;
-    let last_rows = last_rows.context("last log")?;
+    let (series_rows, err_rows, last_rows, points_rate) = if let Some(vl) = &app.vlogs {
+        victoria_rows(app, vl, &cfg.ignore_tasks, end).await?
+    } else {
+        let (series_rows, err_rows, last_rows, points_rate) = tokio::join!(
+            app.ch.rows(&sql_series, &params),
+            app.ch.rows(&sql_err, &params),
+            app.ch.rows(&sql_last, &params),
+            instant(app, "sum(rate(atalaya_collector_points_total[5m]))", end),
+        );
+        (
+            series_rows.context("series")?,
+            err_rows.context("errors")?,
+            last_rows.context("last log")?,
+            points_rate,
+        )
+    };
 
     // Per host and per service@host (node-exporter and nomad run on every host)
     let sk = |r: &Value| format!("{}@{}", r["service"].as_str().unwrap_or_default(), r["host"].as_str().unwrap_or_default());

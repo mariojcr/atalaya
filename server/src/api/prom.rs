@@ -28,6 +28,11 @@ pub(super) fn routes() -> Router<Shared> {
         .route("/api/v1/series", get(prom_series).post(prom_series))
 }
 
+/// The storage (ClickHouse or VictoriaMetrics) did not answer: 502, not a bad query
+pub(super) fn unavailable(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.is::<atalaya::ch::Unavailable>() || e.is::<atalaya::promql::victoria::Unavailable>() || e.is::<crate::vlogs::Unavailable>()
+}
+
 /// Error in Prometheus format (Grafana shows it as is)
 struct PromError(anyhow::Error);
 
@@ -35,7 +40,7 @@ impl IntoResponse for PromError {
     fn into_response(self) -> Response {
         // Like Prometheus: bad_data (400) for the query, unavailable when
         // ClickHouse fails (502 rather than 503: the storage is another service)
-        let down = self.0.chain().any(|e| e.is::<atalaya::ch::Unavailable>());
+        let down = self.0.chain().any(unavailable);
         let (status, kind) = if down {
             (StatusCode::BAD_GATEWAY, "unavailable")
         } else {
@@ -230,11 +235,7 @@ async fn prom_query_range_batch(State(app): State<Shared>, Json(p): Json<BatchPa
                 }
             }
             Err(e) => {
-                let kind = if e.chain().any(|x| x.is::<atalaya::ch::Unavailable>()) {
-                    "unavailable"
-                } else {
-                    "bad_data"
-                };
+                let kind = if e.chain().any(unavailable) { "unavailable" } else { "bad_data" };
                 BatchResult::Err(json!({ "status": "error", "errorType": kind, "error": format!("{e:#}") }))
             }
         }
@@ -273,7 +274,7 @@ async fn prom_query(State(app): State<Shared>, RawQuery(q): RawQuery, body: Stri
 async fn prom_label_values(State(app): State<Shared>, Path(name): Path<String>, RawQuery(q): RawQuery) -> Result<Response, PromError> {
     let p = PromParams::new(q, "");
     let start = p.time("start", unix_now() - 3600)?;
-    let vals = app.promql.store.label_values(&name, &p.selectors()?, start).await?;
+    let vals = app.promql.label_values(&name, &p.all("match[]"), &p.selectors()?, start).await?;
     Ok(prom_success(json!(vals), json!({})))
 }
 
@@ -284,7 +285,7 @@ async fn prom_series(State(app): State<Shared>, RawQuery(q): RawQuery, body: Str
     if sels.is_empty() {
         return Err(anyhow::anyhow!("missing match[]").into());
     }
-    let series = app.promql.store.series(&sels, start).await?;
+    let series = app.promql.series(&p.all("match[]"), &sels, start).await?;
     Ok(prom_success(json!(series), json!({})))
 }
 
