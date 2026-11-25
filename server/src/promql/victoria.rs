@@ -95,7 +95,8 @@ impl VictoriaMetrics {
     /// Seconds between samples of data from `t`: the scrape interval, or the downsampling interval
     /// its age falls in
     fn resolution(&self, t: i64, now: i64) -> i64 {
-        let age = now - t;
+        // A time from the request: saturating, so an absurd one cannot overflow
+        let age = now.saturating_sub(t);
         self.downsampling
             .iter()
             .filter(|(from, _)| age > *from)
@@ -290,6 +291,11 @@ mod tests {
         assert_eq!(vm.resolution(now - 3600, now), RES);
         assert_eq!(vm.resolution(now - 20 * 86400, now), 60);
         assert_eq!(vm.resolution(now - 60 * 86400, now), 600);
+        assert_eq!(
+            vm.resolution(i64::MIN, now),
+            600,
+            "the oldest possible time: the coarsest interval, no overflow"
+        );
         // 6 h from 60 days ago at a 1-minute step: a window of 4 samples of 10 minutes, as the
         // engine does on its 10-minute tier (with 15 s it was 1 minute: most steps came out empty)
         let res = vm.resolution(now - 60 * 86400, now);
