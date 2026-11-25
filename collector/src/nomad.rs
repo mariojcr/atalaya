@@ -495,6 +495,17 @@ impl Nomad {
         }
     }
 
+    /// What `alloc` answers for `id` without asking Nomad
+    #[cfg(test)]
+    pub(crate) fn seed_alloc(&self, id: &str, job: &str) {
+        let info = AllocInfo {
+            job: job.into(),
+            parent: job.into(),
+            ..Default::default()
+        };
+        remember(&mut self.allocs.lock().unwrap(), id, info, None, Instant::now());
+    }
+
     pub async fn alloc(&self, id: &str) -> Option<AllocInfo> {
         self.alloc_at(id, Instant::now()).await
     }

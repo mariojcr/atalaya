@@ -255,6 +255,10 @@ pub(crate) struct LogsConfig {
     /// /var/lib/docker/containers mounted read-only
     #[serde(default)]
     pub(crate) docker_dir: Option<PathBuf>,
+    /// Nomad jobs whose allocation logs are never read: their lines can carry what the logs' readers
+    /// must not see (VictoriaMetrics logs the URI of a failed admin call, with its authKey)
+    #[serde(default)]
+    pub(crate) skip_jobs: Vec<String>,
 }
 impl Default for LogsConfig {
     fn default() -> Self {
@@ -262,6 +266,7 @@ impl Default for LogsConfig {
             enabled: true,
             alloc_dir: default_alloc_dir(),
             docker_dir: None,
+            skip_jobs: Vec::new(),
         }
     }
 }

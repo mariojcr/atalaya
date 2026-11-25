@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
             let mut alloc = c
                 .nomad
                 .is_some()
-                .then(|| logs::Tailer::new(c.cfg.logs.alloc_dir.clone(), &c.cfg.state_dir, node.clone()));
+                .then(|| logs::Tailer::new(c.cfg.logs.alloc_dir.clone(), &c.cfg.state_dir, node.clone()).skipping_jobs(c.cfg.logs.skip_jobs.clone()));
             let mut docker = c
                 .cfg
                 .logs

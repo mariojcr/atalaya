@@ -48,6 +48,8 @@ logs:
   enabled: true                # default true
   alloc_dir: /var/lib/nomad/alloc          # Nomad allocation logs (only with `nomad`)
   docker_dir: /var/lib/docker/containers   # Docker json-file logs (optional)
+  skip_jobs: [victoria-metrics]            # Nomad jobs whose logs are never read (optional); any
+                                           # `authKey=` value in the lines that are read is redacted
 
 host:
   enabled: true                # default true: hardware metrics from sysfs
