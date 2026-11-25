@@ -5,7 +5,7 @@
 //! label filter, alignment period, per-series aligner and cross-series reducer
 //! grouped by labels.
 //!
-//! Storage (schema/atalaya.sql): `series` stores each series' identity once;
+//! Storage (schema/metrics.sql): `series` stores each series' identity once;
 //! `points` holds raw points (series, time, value) for 7 days; `points_1m` and
 //! `points_10m` hold, per bucket, min, max, sum, count and a DDSketch for
 //! percentiles. Materialized views write all three tiers on every insert, so

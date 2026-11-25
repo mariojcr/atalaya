@@ -42,7 +42,9 @@ keep the previous ones and show the error on the alerts page.
 
 `atalaya-server schema` prints the schema for `ATALAYA_DB`; `atalaya-server schema --apply`
 applies it (idempotent) with `CLICKHOUSE_USER`, which then needs permission to
-create databases and tables.
+create databases and tables. With `ATALAYA_VICTORIA_METRICS_URL` set the schema is
+only the database and the `logs` table: the metric tables are left out (see
+[deployment](deployment.md#metrics-on-victoriametrics)).
 
 ## Sign-in
 

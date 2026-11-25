@@ -37,7 +37,9 @@
 //!                             is not used at all
 //!
 //! `atalaya-server schema` prints the schema; `atalaya-server schema --apply` applies it
-//! (idempotent) as CLICKHOUSE_USER, which must be allowed to create tables.
+//! (idempotent) as CLICKHOUSE_USER, which must be allowed to create tables. With
+//! ATALAYA_VICTORIA_METRICS_URL set it is only the database and the logs table: the metric
+//! tables are left out, since the server reads metrics from VictoriaMetrics.
 
 mod alerts;
 mod api;
