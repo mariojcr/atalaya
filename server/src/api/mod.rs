@@ -28,7 +28,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // ClickHouse down or failing: 502 (not the request's fault); anything
         // else is invalid input
-        let status = if self.0.chain().any(|e| e.is::<atalaya::ch::Unavailable>()) {
+        let status = if self.0.chain().any(prom::unavailable) {
             StatusCode::BAD_GATEWAY
         } else {
             StatusCode::BAD_REQUEST
@@ -83,16 +83,28 @@ pub fn router(app: Shared) -> Router {
 /// body says only ok or down: why ClickHouse failed (its address, version or
 /// "authentication failed") goes to the log.
 async fn readyz(axum::extract::State(app): axum::extract::State<Shared>) -> Response {
-    let ch = app.ch.text("SELECT 1", &[], &[]).await;
-    if let Err(e) = &ch {
-        tracing::warn!("readyz: {e:#}");
-    }
+    // What this server reads: ClickHouse, unless both metrics and logs are on Victoria
+    let victoria = matches!(app.promql, atalaya::promql::Backend::Victoria(_));
+    let (name, ok) = if let (true, Some(vl)) = (victoria, &app.vlogs) {
+        let m = app.promql.instant("vector(1)", super::app::unix_now()).await;
+        let l = vl.count("_time:1m").await;
+        for e in [m.as_ref().err(), l.as_ref().err()].into_iter().flatten() {
+            tracing::warn!("readyz: {e:#}");
+        }
+        ("victoria", m.is_ok() && l.is_ok())
+    } else {
+        let ch = app.ch.text("SELECT 1", &[], &[]).await;
+        if let Err(e) = &ch {
+            tracing::warn!("readyz: {e:#}");
+        }
+        ("clickhouse", ch.is_ok())
+    };
     let last_eval = app.alerts.last_tick();
     let age = last_eval.map(|t| super::app::unix_now() - t);
     let body = json!({
-        "clickhouse": if ch.is_ok() { "ok" } else { "down" },
+        name: if ok { "ok" } else { "down" },
         "alerts_last_eval": last_eval, "alerts_age_s": age,
     });
-    let status = if ch.is_ok() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, Json(body)).into_response()
 }

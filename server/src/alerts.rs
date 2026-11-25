@@ -741,6 +741,15 @@ impl Alerts {
             }
             Kind::Logs => {
                 let window = rule.window_secs();
+                if let Some(vl) = &app.vlogs {
+                    let filter = format!("{} {}", crate::vlogs::time_range(at - window, at), crate::vlogs::filters(&rule.filters)?);
+                    let n = vl.count(&filter).await? as f64;
+                    return Ok(if n >= rule.threshold.unwrap_or(f64::INFINITY) {
+                        vec![(Labels::new(), n)]
+                    } else {
+                        vec![]
+                    });
+                }
                 let mut params: Vec<Param> = vec![("start".into(), (at - window).to_string()), ("end".into(), at.to_string())];
                 let mut conds =
                     vec!["Time >= fromUnixTimestamp64Milli({start:Int64} * 1000) AND Time < fromUnixTimestamp64Milli({end:Int64} * 1000)".to_owned()];
@@ -852,7 +861,7 @@ impl Alerts {
     /// once the oldest has waited group_wait. A failure leaves them in the
     /// outbox with growing backoff; they only leave once delivered (or after
     /// MAX_ATTEMPTS, with a log entry).
-    pub async fn deliver(&self, engine: Option<&atalaya::promql::Engine>) {
+    pub async fn deliver(&self, engine: Option<&atalaya::promql::Backend>) {
         if !self.cfg_loaded() {
             // Without a valid config every channel would look gone and its outbox be dropped
             return;
@@ -1374,7 +1383,7 @@ fn spark_expr(expr: &str) -> Option<String> {
 /// The values behind each firing alert's sparkline: spark_expr over the hour before it fired, for
 /// the series with its labels. At most SLACK_MAX_CARDS queries per batch; one that fails leaves
 /// that card without a sparkline
-async fn slack_sparks(engine: &atalaya::promql::Engine, cfg: &Config, trs: &[&Transition]) -> HashMap<String, Vec<f64>> {
+async fn slack_sparks(engine: &atalaya::promql::Backend, cfg: &Config, trs: &[&Transition]) -> HashMap<String, Vec<f64>> {
     let mut out = HashMap::new();
     for tr in trs.iter().filter(|t| t.to == "firing").take(SLACK_MAX_CARDS) {
         let Some(rule) = cfg.rules.iter().find(|r| r.id == tr.rule && r.kind == Kind::Metric) else {
@@ -2103,7 +2112,11 @@ rules:
     fn test_app(yaml: &Path, data: &Path) -> App {
         let ch = atalaya::ch::ClickHouse::new("http://127.0.0.1:1/".into(), "u".into(), String::new());
         App {
-            promql: atalaya::promql::Engine::new(atalaya::promql::store::Store::new(ch.clone(), "atalaya".into())),
+            promql: atalaya::promql::Backend::Native(Box::new(atalaya::promql::Engine::new(atalaya::promql::store::Store::new(
+                ch.clone(),
+                "atalaya".into(),
+            )))),
+            vlogs: None,
             ch,
             db: "atalaya".into(),
             dashboards: data.join("dashboards"),

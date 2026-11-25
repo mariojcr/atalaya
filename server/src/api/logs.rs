@@ -20,7 +20,7 @@ use atalaya::ch::Param;
 
 use super::{ApiError, ApiResult, unix_now};
 use crate::app::Shared;
-use crate::{logsearch, notebooks, query};
+use crate::{logsearch, notebooks, query, vlogs};
 
 pub(super) fn routes() -> Router<Shared> {
     Router::new()
@@ -88,6 +88,9 @@ fn log_range(start: Option<i64>, end: Option<i64>, range: Option<&str>) -> anyho
 
 async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
     let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
+    if let Some(vl) = &app.vlogs {
+        return Ok(Json(vl_logs(vl, &p, &rq, start, end).await?));
+    }
     let mut params: Vec<Param> = vec![("start".into(), start.to_string()), ("end".into(), end.to_string())];
     let mut conds = vec!["Time >= fromUnixTimestamp64Milli({start:Int64} * 1000) AND Time < fromUnixTimestamp64Milli({end:Int64} * 1000)".to_owned()];
     if !p.service.is_empty() {
@@ -182,6 +185,14 @@ async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq
 /// frequent values (the Discover-style fields panel)
 async fn log_fields(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
     let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
+    if let Some(vl) = &app.vlogs {
+        let filter = join(&[
+            vlogs::time_range(start, end),
+            vlogs::params_filter(&p.service, "", "", &p.q),
+            vlogs::filters(&log_filters(&rq))?,
+        ]);
+        return Ok(Json(json!({ "start": start, "end": end, "fields": vl_fields(vl, &filter).await? })));
+    }
     let mut params: Vec<Param> = vec![("start".into(), start.to_string()), ("end".into(), end.to_string())];
     let mut conds = vec!["Time >= fromUnixTimestamp64Milli({start:Int64} * 1000) AND Time < fromUnixTimestamp64Milli({end:Int64} * 1000)".to_owned()];
     if !p.service.is_empty() {
@@ -244,6 +255,11 @@ async fn log_counts(State(app): State<Shared>, Query(p): Query<CountsParams>, Ra
         params.push(("step".into(), step.to_string()));
     }
     let top = p.top.unwrap_or(10).clamp(1, 100);
+    if let Some(vl) = &app.vlogs {
+        let filter = join(&[vlogs::time_range(start, end), vlogs::filters(&filters)?]);
+        let rows = vl_count_rows(vl, &filter, &by, top, p.step).await?;
+        return Ok(Json(json!({ "series": count_series(&by, &rows, start, end, p.step) })));
+    }
     let table = format!("{}.logs", app.db);
     let sql = logsearch::counts_sql(&table, &conds.join(" AND "), &keys, top, p.step.is_some());
     let rows = app.ch.rows(&sql, &params).await?;
@@ -301,6 +317,25 @@ struct ValuesParams {
 /// and filters (query bar autocompletion and dashboard variables)
 async fn log_values(State(app): State<Shared>, Query(p): Query<ValuesParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
     let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
+    if let Some(vl) = &app.vlogs {
+        let limit = p.limit.unwrap_or(10).clamp(1, 1000);
+        let fl = vlogs::quote(&vlogs::field_name(&p.field)?);
+        let pf = if p.prefix.is_empty() {
+            format!("{fl}:*")
+        } else {
+            format!("{fl}:~{}", vlogs::quote(&format!("(?i)^{}", regex_literal(&p.prefix))))
+        };
+        let filter = join(&[vlogs::time_range(start, end), vlogs::filters(&log_filters(&rq))?, pf]);
+        let rows = vl
+            .query(format!("{filter} | stats by ({fl}) count() as n | sort by (n desc, {fl}) | limit {limit}"))
+            .await?;
+        let name = vlogs::field_name(&p.field)?;
+        let values: Vec<Value> = rows
+            .iter()
+            .map(|r| json!({ "value": r[name.as_str()], "n": vlogs::num(&r["n"]) as u64 }))
+            .collect();
+        return Ok(Json(json!({ "field": p.field, "values": values })));
+    }
     let mut params: Vec<Param> = vec![
         ("start".into(), start.to_string()),
         ("end".into(), end.to_string()),
@@ -331,6 +366,22 @@ struct ContextParams {
 /// (and host)
 async fn log_context(State(app): State<Shared>, Query(p): Query<ContextParams>) -> ApiResult<Value> {
     let n = p.n.unwrap_or(20).min(200);
+    if let Some(vl) = &app.vlogs {
+        let mut cond = format!("job:={}", vlogs::quote(&p.service));
+        if !p.host.is_empty() {
+            cond.push_str(&format!(" host:={}", vlogs::quote(&p.host)));
+        }
+        // A day each side is far more than n lines of a service ever span
+        let (t, day) = (rfc3339_ms(p.ts), 86_400_000);
+        let (from, to) = (rfc3339_ms(p.ts - day), rfc3339_ms(p.ts + day));
+        let (before, after) = tokio::join!(
+            vl.query(format!("_time:[{from}, {t}) {cond} | sort by (_time desc) | limit {n}")),
+            vl.query(format!("_time:[{t}, {to}) {cond} | sort by (_time) | limit {}", n + 1)),
+        );
+        let before: Vec<Value> = before?.iter().rev().map(vlogs::row).collect();
+        let after: Vec<Value> = after?.iter().map(vlogs::row).collect();
+        return Ok(Json(json!({ "before": before, "after": after })));
+    }
     let table = format!("{}.logs", app.db);
     let mut params: Vec<Param> = vec![("service".into(), p.service), ("ts".into(), p.ts.to_string())];
     let mut cond = "Service = {service:String}".to_owned();
@@ -357,6 +408,185 @@ async fn log_context(State(app): State<Shared>, Query(p): Query<ContextParams>) 
         )
         .await?;
     Ok(Json(json!({ "before": before.into_iter().rev().collect::<Vec<_>>(), "after": after })))
+}
+
+// ── VictoriaLogs ─────────────────────────────────────────────────────────────
+
+/// LogsQL filters joined, the empty ones left out
+fn join(parts: &[String]) -> String {
+    parts.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" ")
+}
+
+/// A regular expression matching `s` literally
+fn regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Unix milliseconds as RFC 3339, for a LogsQL time range
+fn rfc3339_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap_or_default()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+/// Seconds of a stats bucket's `_time`
+fn bucket(r: &Value) -> i64 {
+    vlogs::millis(&r["_time"]).div_euclid(1000)
+}
+
+/// The search: the lines, a histogram by level, counts per service, host and level over the range
+/// (ignoring the other filters, for the fields panel) and, if asked, the histogram broken down by a
+/// field (its 6 most frequent values, the rest as "…")
+async fn vl_logs(vl: &vlogs::VictoriaLogs, p: &LogParams, rq: &Option<String>, start: i64, end: i64) -> anyhow::Result<Value> {
+    let range = vlogs::time_range(start, end);
+    let filter = join(&[
+        range.clone(),
+        vlogs::params_filter(&p.service, &p.host, &p.level, &p.q),
+        vlogs::filters(&log_filters(rq))?,
+    ]);
+    let limit = p.limit.unwrap_or(500).min(5000);
+    if p.docs_only {
+        return Ok(json!({ "start": start, "end": end, "logs": vl.rows(&filter, limit).await? }));
+    }
+    let step = ((end - start) / 120).max(1);
+    let fields_q = |f: &str| format!("{range} | stats by ({f}) count() as n | sort by (n desc)");
+    let (rows, hist, svc, host, level) = tokio::join!(
+        vl.rows(&filter, limit),
+        vl.query(format!("{filter} | stats by (_time:{step}s, level) count() as n")),
+        vl.query(fields_q("job")),
+        vl.query(fields_q("host")),
+        vl.query(fields_q("level")),
+    );
+    let mut histogram: Vec<Value> = hist?
+        .iter()
+        .map(|r| json!({ "ts": bucket(r), "level": r["level"], "n": vlogs::num(&r["n"]) as u64 }))
+        .collect();
+    histogram.sort_by_key(|r| r["ts"].as_i64());
+    let mut fields = Vec::new();
+    for (name, stored, rs) in [("host", "host", host?), ("level", "level", level?), ("service", "job", svc?)] {
+        fields.extend(rs.iter().map(|r| json!({ "field": name, "value": r[stored], "n": vlogs::num(&r["n"]) as u64 })));
+    }
+    let breakdown = if p.breakdown.is_empty() {
+        Value::Null
+    } else {
+        let name = vlogs::field_name(&p.breakdown)?;
+        let fl = vlogs::quote(&name);
+        let (tops, series) = tokio::join!(
+            vl.query(format!("{filter} | stats by ({fl}) count() as n | sort by (n desc) | limit 6")),
+            vl.query(format!("{filter} | stats by (_time:{step}s, {fl}) count() as n")),
+        );
+        let tops: Vec<String> = tops?.iter().map(|r| r[name.as_str()].as_str().unwrap_or_default().to_owned()).collect();
+        let mut agg: std::collections::BTreeMap<(i64, String), u64> = Default::default();
+        for r in series? {
+            let v = r[name.as_str()].as_str().unwrap_or_default().to_owned();
+            let v = if tops.contains(&v) { v } else { "…".to_owned() };
+            *agg.entry((bucket(&r), v)).or_default() += vlogs::num(&r["n"]) as u64;
+        }
+        Value::Array(agg.into_iter().map(|((ts, value), n)| json!({ "ts": ts, "value": value, "n": n })).collect())
+    };
+    Ok(json!({ "start": start, "end": end, "step": step, "logs": rows?, "histogram": histogram, "fields": fields, "breakdown": breakdown }))
+}
+
+/// The fields present, with how many lines have each and its 5 most frequent values (`distinct` is
+/// how many of those came back: VictoriaLogs does not count them all)
+async fn vl_fields(vl: &vlogs::VictoriaLogs, filter: &str) -> anyhow::Result<Vec<Value>> {
+    let (names, facets) = tokio::join!(vl.query(format!("{filter} | field_names")), vl.query(format!("{filter} | facets 5")));
+    let mut top: HashMap<String, Vec<(f64, Value)>> = HashMap::new();
+    for f in facets? {
+        let name = f["field_name"].as_str().unwrap_or_default().to_owned();
+        top.entry(name).or_default().push((vlogs::num(&f["hits"]), f["field_value"].clone()));
+    }
+    let shown = |n: &str| -> Option<String> {
+        match n {
+            "_time" | "_stream" | "_stream_id" | "_msg" => None,
+            "job" => Some("service".into()),
+            n => Some(n.strip_prefix("attr.").unwrap_or(n).to_owned()),
+        }
+    };
+    let mut rows: Vec<Value> = names?
+        .iter()
+        .filter_map(|r| {
+            let stored = r["name"].as_str()?;
+            let field = shown(stored)?;
+            let mut vals = top.remove(stored).unwrap_or_default();
+            vals.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let values: Vec<Value> = vals.iter().take(5).map(|(_, v)| v.clone()).collect();
+            Some(json!({ "field": field, "docs": vlogs::num(&r["hits"]) as u64, "distinct": vals.len(), "top": values }))
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b["docs"]
+            .as_u64()
+            .cmp(&a["docs"].as_u64())
+            .then_with(|| a["field"].as_str().cmp(&b["field"].as_str()))
+    });
+    rows.truncate(200);
+    Ok(rows)
+}
+
+/// Line counts in counts_sql's row shape (`ts`, `k0`…, `n`): the `top` most frequent groups of the
+/// `by` fields, with one count each or one per `step`
+async fn vl_count_rows(vl: &vlogs::VictoriaLogs, filter: &str, by: &[String], top: u32, step: Option<i64>) -> anyhow::Result<Vec<Value>> {
+    let names = by.iter().map(|f| vlogs::field_name(f)).collect::<anyhow::Result<Vec<_>>>()?;
+    let keys: Vec<String> = names.iter().map(|n| vlogs::quote(n)).collect();
+    let shape = |r: &Value, with_ts: bool| {
+        let mut o = serde_json::Map::new();
+        if with_ts {
+            o.insert("ts".into(), json!(bucket(r)));
+        }
+        for (i, n) in names.iter().enumerate() {
+            o.insert(format!("k{i}"), json!(r[n.as_str()].as_str().unwrap_or_default()));
+        }
+        o.insert("n".into(), json!(vlogs::num(&r["n"]) as u64));
+        Value::Object(o)
+    };
+    if names.is_empty() {
+        return Ok(match step {
+            Some(s) => vl
+                .query(format!("{filter} | stats by (_time:{s}s) count() as n"))
+                .await?
+                .iter()
+                .map(|r| shape(r, true))
+                .collect(),
+            None => vec![json!({ "n": vl.count(filter).await? })],
+        });
+    }
+    let by_list = keys.join(", ");
+    let tops = vl
+        .query(format!("{filter} | stats by ({by_list}) count() as n | sort by (n desc) | limit {top}"))
+        .await?;
+    let Some(step) = step else {
+        return Ok(tops.iter().map(|r| shape(r, false)).collect());
+    };
+    if tops.is_empty() {
+        return Ok(vec![]);
+    }
+    // Only the top groups, bucketed
+    let groups: Vec<String> = tops
+        .iter()
+        .map(|r| {
+            let conds: Vec<String> = names
+                .iter()
+                .zip(&keys)
+                .map(|(n, k)| format!("{k}:={}", vlogs::quote(r[n.as_str()].as_str().unwrap_or_default())))
+                .collect();
+            format!("({})", conds.join(" "))
+        })
+        .collect();
+    let rows = vl
+        .query(format!("{filter} ({}) | stats by (_time:{step}s, {by_list}) count() as n", groups.join(" or ")))
+        .await?;
+    let mut out: Vec<Value> = rows.iter().map(|r| shape(r, true)).collect();
+    out.sort_by_key(|r| r["ts"].as_i64());
+    Ok(out)
 }
 
 // ── Saved searches (log explorer) ────────────────────────────────────────────

@@ -215,11 +215,10 @@ pub async fn describe(ch: &ClickHouse, db: &str, metric: &str) -> Result<(String
     }
 }
 
-pub async fn run(ch: &ClickHouse, db: &str, q: &TimeSeriesQuery) -> Result<QueryResult> {
-    let started = std::time::Instant::now();
-    let (kind, unit) = describe(ch, db, &q.metric).await?;
-    let counter = kind == "cumulative";
-
+/// The interval, the alignment period and the tier of a query: the finest tier still holding data at
+/// the start's age, and the coarsest one whose resolution fits the period (VictoriaMetrics keeps the
+/// same resolutions with age: raw for 7 days, a minute until 42 and 10 minutes after)
+fn plan(q: &TimeSeriesQuery) -> Result<(i64, i64, i64, Tier)> {
     let end = q.interval.end.unwrap_or_else(now);
     let start = match q.interval.start {
         Some(s) => s,
@@ -229,8 +228,6 @@ pub async fn run(ch: &ClickHouse, db: &str, q: &TimeSeriesQuery) -> Result<Query
         bail!("the interval is empty");
     }
     let span = end - start;
-
-    // Finest tier still holding data at the start's age
     let age = now() - start;
     let required = if age <= RAW_DAYS * 86400 {
         Tier::Raw
@@ -239,7 +236,6 @@ pub async fn run(ch: &ClickHouse, db: &str, q: &TimeSeriesQuery) -> Result<Query
     } else {
         Tier::TenMinutes
     };
-
     let period = match q.aggregation.alignment_period.as_deref() {
         None | Some("auto") | Some("") => {
             let target = span / 300;
@@ -248,13 +244,159 @@ pub async fn run(ch: &ClickHouse, db: &str, q: &TimeSeriesQuery) -> Result<Query
         Some(s) => parse_duration(s)?,
     }
     .max(required.resolution());
-
-    // The coarsest tier whose resolution fits the period, but no finer than the
-    // age allows.
     let tier = [Tier::TenMinutes, Tier::OneMinute, Tier::Raw]
         .into_iter()
         .find(|t| t.resolution() <= period && t.resolution() >= required.resolution())
         .unwrap_or(required);
+    Ok((start, end, period, tier))
+}
+
+/// The PromQL label of a field: `service` is job, `resource.host.name` instance, any other resource
+/// key that key with `_` for `.` (nomad_group…), and `metric.<key>` the exporter's label (job and
+/// instance as exported_*), as the engine's label_view names them
+pub fn promql_label(field: &str) -> Result<String> {
+    let ok = |k: &str| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c));
+    if field == "service" {
+        return Ok("job".into());
+    }
+    if let Some(k) = field.strip_prefix("resource.") {
+        if !ok(k) {
+            bail!("invalid label key: {k}");
+        }
+        if k == "host.name" {
+            return Ok("instance".into());
+        }
+        let mut n: String = k.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        if n.starts_with(|c: char| c.is_ascii_digit()) {
+            n.insert(0, '_');
+        }
+        return Ok(n);
+    }
+    if let Some(k) = field.strip_prefix("metric.") {
+        if !ok(k) {
+            bail!("invalid label key: {k}");
+        }
+        return Ok(match k {
+            "job" | "instance" => format!("exported_{k}"),
+            k => k.to_owned(),
+        });
+    }
+    bail!("invalid label: {field} (use resource.*, metric.* or service)")
+}
+
+/// The field name the UI uses for a PromQL label (the reverse of promql_label)
+pub fn field_of_label(label: &str) -> Option<String> {
+    Some(match label {
+        "__name__" => return None,
+        "job" => "service".into(),
+        "instance" => "resource.host.name".into(),
+        "exported_job" => "metric.job".into(),
+        "exported_instance" => "metric.instance".into(),
+        l => match l.strip_prefix("nomad_") {
+            Some(rest) => format!("resource.nomad.{rest}"),
+            None => format!("metric.{l}"),
+        },
+    })
+}
+
+fn promql_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// The query on VictoriaMetrics: the filters as a selector, the aligner as a *_over_time (or rate,
+/// increase) over the period, the reducer as an aggregation by the group fields, one point per period
+pub async fn run_victoria(backend: &atalaya::promql::Backend, q: &TimeSeriesQuery) -> Result<QueryResult> {
+    let started = std::time::Instant::now();
+    if q.metric.is_empty() || !q.metric.chars().all(|c| c.is_ascii_alphanumeric() || "_:".contains(c)) {
+        bail!("invalid metric: {}", q.metric);
+    }
+    // No descriptors there: a counter by its name, as the engine guesses one without a descriptor
+    let counter = ["_total", "_count", "_sum", "_bucket"].iter().any(|s| q.metric.ends_with(s));
+    let (start, end, period, tier) = plan(q)?;
+    let mut matchers = Vec::new();
+    for (field, raw) in &q.filter {
+        let l = promql_label(field)?;
+        let (op, v) = if let Some(v) = raw.strip_prefix("!~") {
+            ("!~", v)
+        } else if let Some(v) = raw.strip_prefix('~') {
+            ("=~", v)
+        } else if let Some(v) = raw.strip_prefix('!') {
+            ("!=", v)
+        } else {
+            ("=", raw.as_str())
+        };
+        matchers.push(format!("{l}{op}{}", promql_string(v)));
+    }
+    let sel = format!("{}{{{}}}[{period}s]", q.metric, matchers.join(","));
+    let aligner = q
+        .aggregation
+        .per_series_aligner
+        .unwrap_or(if counter { Aligner::AlignRate } else { Aligner::AlignMean });
+    let aligned = match aligner {
+        Aligner::AlignMean => format!("avg_over_time({sel})"),
+        Aligner::AlignMin => format!("min_over_time({sel})"),
+        Aligner::AlignMax => format!("max_over_time({sel})"),
+        Aligner::AlignSum => format!("sum_over_time({sel})"),
+        Aligner::AlignCount => format!("count_over_time({sel})"),
+        Aligner::AlignRate => format!("rate({sel})"),
+        Aligner::AlignDelta => format!("increase({sel})"),
+        Aligner::AlignPercentile50 => format!("quantile_over_time(0.5, {sel})"),
+        Aligner::AlignPercentile95 => format!("quantile_over_time(0.95, {sel})"),
+        Aligner::AlignPercentile99 => format!("quantile_over_time(0.99, {sel})"),
+    };
+    let reducer = q.aggregation.cross_series_reducer;
+    let by = q
+        .aggregation
+        .group_by_fields
+        .iter()
+        .map(|f| promql_label(f))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let promql = match reducer {
+        Reducer::ReduceNone => aligned,
+        Reducer::ReduceMean => format!("avg by ({by}) ({aligned})"),
+        Reducer::ReduceSum => format!("sum by ({by}) ({aligned})"),
+        Reducer::ReduceMin => format!("min by ({by}) ({aligned})"),
+        Reducer::ReduceMax => format!("max by ({by}) ({aligned})"),
+        Reducer::ReduceCount => format!("count by ({by}) ({aligned})"),
+        Reducer::ReducePercentile50 => format!("quantile by ({by}) (0.5, {aligned})"),
+        Reducer::ReducePercentile95 => format!("quantile by ({by}) (0.95, {aligned})"),
+        Reducer::ReducePercentile99 => format!("quantile by ({by}) (0.99, {aligned})"),
+    };
+    let r = backend.range(&promql, start - start.rem_euclid(period), end, period).await?;
+    let atalaya::promql::Output::Matrix(m) = r.output else {
+        bail!("the query does not return series");
+    };
+    let time_series = m
+        .into_iter()
+        .take(MAX_SERIES)
+        .map(|(labels, pts)| TimeSeries {
+            labels: labels.iter().filter_map(|(k, v)| field_of_label(k).map(|f| (f, v.clone()))).collect(),
+            points: pts.into_iter().map(|(t, v)| (t, v.is_finite().then_some(v))).collect(),
+        })
+        .collect();
+    Ok(QueryResult {
+        metric: q.metric.clone(),
+        kind: if counter { "cumulative".into() } else { "gauge".into() },
+        unit: String::new(),
+        tier,
+        aligner,
+        reducer,
+        alignment_period_seconds: period,
+        start,
+        end,
+        sql: promql,
+        elapsed_ms: started.elapsed().as_millis(),
+        time_series,
+    })
+}
+
+pub async fn run(ch: &ClickHouse, db: &str, q: &TimeSeriesQuery) -> Result<QueryResult> {
+    let started = std::time::Instant::now();
+    let (kind, unit) = describe(ch, db, &q.metric).await?;
+    let counter = kind == "cumulative";
+
+    let (start, end, period, tier) = plan(q)?;
 
     let aligner = q
         .aggregation

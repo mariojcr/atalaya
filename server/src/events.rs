@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::app::App;
 use atalaya::ch::Param;
-use atalaya::promql::Output;
+use atalaya::promql::{Labels, Output};
 
 const MAX_EVENTS: usize = 400;
 
@@ -186,6 +186,124 @@ fn tr(lang: &str, key: &str) -> &'static str {
     }
 }
 
+/// A PromQL regex matching any of the values literally
+fn promql_alternation(vals: &[String]) -> String {
+    vals.iter()
+        .map(|v| {
+            v.chars()
+                .map(|c| if "\\.+*?()|[]{}^$".contains(c) { format!("\\\\{c}") } else { c.to_string() })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The same rows as the three ClickHouse queries, from Victoria: each alloc's first and last sample
+/// in the range (VictoriaMetrics' tfirst/tlast_over_time), its restarts per bucket (increase of
+/// nomad_client_allocs_restart), and lines and errors per service and bucket (VictoriaLogs). The Nomad
+/// job of an alloc metric is `exported_job` there, as in the PromQL labels of atalaya's engine
+#[allow(clippy::too_many_arguments)]
+async fn victoria_rows(
+    app: &App,
+    vl: &crate::vlogs::VictoriaLogs,
+    start: i64,
+    end: i64,
+    bucket: i64,
+    res: i64,
+    service: Option<&str>,
+    ignore: &[String],
+) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>)> {
+    use crate::vlogs::{millis, num, quote, time_range};
+    let mut m = vec![];
+    if !ignore.is_empty() {
+        m.push(format!("task!~{}", serde_json::to_string(&promql_alternation(ignore)).unwrap_or_default()));
+    }
+    if let Some(svc) = service {
+        m.push(format!("exported_job={}", serde_json::to_string(svc).unwrap_or_default()));
+    }
+    let sel = |metric: &str| format!("{metric}{{{}}}", m.join(","));
+    let window = end - start + res;
+    let by = "max by (exported_job, alloc_id, instance)";
+    let q_first = format!("{by} (tfirst_over_time({}[{window}s]))", sel("nomad_client_allocs_cpu_total_percent"));
+    let q_last = format!("{by} (tlast_over_time({}[{window}s]))", sel("nomad_client_allocs_cpu_total_percent"));
+    let q_restarts = format!(
+        "sum by (exported_job, alloc_id, instance) (increase({}[{bucket}s])) > 0",
+        sel("nomad_client_allocs_restart")
+    );
+    let mut lf = vec![time_range(start, end)];
+    if !ignore.is_empty() {
+        lf.push(format!("!\"nomad.task\":in({})", ignore.iter().map(|t| quote(t)).collect::<Vec<_>>().join(",")));
+    }
+    if let Some(svc) = service {
+        lf.push(format!("job:={}", quote(svc)));
+    }
+    let errors = "level:in(\"ERROR\",\"FATAL\")";
+    let q_logs = format!(
+        "{} | stats by (job, _time:{bucket}s) count() as n, count() if ({errors}) as errors, row_any(_msg) if ({errors}) as sample, row_any(host) as h",
+        lf.join(" ")
+    );
+    let (first, last, restarts, logs) = tokio::join!(
+        app.promql.instant(&q_first, end),
+        app.promql.instant(&q_last, end),
+        app.promql.range(&q_restarts, start, end, bucket),
+        vl.query(q_logs),
+    );
+    type Series = Vec<(Labels, Vec<(i64, f64)>)>;
+    let series = |r: Result<atalaya::promql::Evaluated>, what: &str| -> Result<Series> {
+        match r.with_context(|| what.to_owned())?.output {
+            Output::Matrix(m) => Ok(m),
+            _ => Ok(vec![]),
+        }
+    };
+    let key = |l: &Labels| {
+        (
+            l.get("exported_job").cloned().unwrap_or_default(),
+            l.get("alloc_id").cloned().unwrap_or_default(),
+            l.get("instance").cloned().unwrap_or_default(),
+        )
+    };
+    let lasts: std::collections::HashMap<_, f64> = series(last, "allocs")?
+        .into_iter()
+        .filter_map(|(l, p)| p.last().map(|x| (key(&l), x.1)))
+        .collect();
+    let allocs = series(first, "allocs")?
+        .into_iter()
+        .filter_map(|(l, p)| {
+            let k = key(&l);
+            let first = p.last()?.1 as i64;
+            let last = lasts.get(&k).copied().unwrap_or(first as f64) as i64;
+            Some(json!({ "job": k.0, "alloc": k.1, "host": k.2, "first": first, "last": last }))
+        })
+        .collect();
+    let restarts = series(restarts, "restarts")?
+        .into_iter()
+        .flat_map(|(l, p)| {
+            let k = key(&l);
+            p.into_iter()
+                .filter(|(_, v)| *v >= 0.5)
+                .map(move |(t, v)| json!({ "job": k.0, "alloc": k.1, "host": k.2, "t": t, "n": v.round() as i64 }))
+        })
+        .collect();
+    let mut logs: Vec<Value> = logs
+        .context("logs")?
+        .iter()
+        .map(|r| {
+            // row_any(...) answers a JSON object with the field: {"_msg": "..."}
+            let field = |v: &Value, k: &str| -> String {
+                v.as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .and_then(|o| o[k].as_str().map(str::to_owned))
+                    .unwrap_or_default()
+            };
+            let sample: String = field(&r["sample"], "_msg").chars().take(200).collect();
+            json!({ "service": r["job"], "t": millis(&r["_time"]).div_euclid(1000), "n": num(&r["n"]) as u64,
+                    "errors": num(&r["errors"]) as u64, "sample": sample, "host": field(&r["h"], "host") })
+        })
+        .collect();
+    logs.sort_by(|a, b| a["service"].as_str().cmp(&b["service"].as_str()).then(a["t"].as_i64().cmp(&b["t"].as_i64())));
+    Ok((allocs, restarts, logs))
+}
+
 pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang: &str, with_lanes: bool) -> Result<Value> {
     let cfg = load_config(&app.timeline);
     let range = end - start;
@@ -247,12 +365,16 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
            AND NOT has({{ignore:Array(String)}}, Resource['nomad.task']){svc_cond}
          GROUP BY service, t ORDER BY service, t"
     );
-    let (allocs, restarts, logs) = tokio::join!(
-        app.ch.rows(&sql_allocs, &params),
-        app.ch.rows(&sql_restarts, &params),
-        app.ch.rows(&sql_logs, &params)
-    );
-    let (allocs, restarts, logs) = (allocs.context("allocs")?, restarts.context("restarts")?, logs.context("logs")?);
+    let (allocs, restarts, logs) = if let Some(vl) = &app.vlogs {
+        victoria_rows(app, vl, start, end, bucket, res, service, &cfg.ignore_tasks).await?
+    } else {
+        let (allocs, restarts, logs) = tokio::join!(
+            app.ch.rows(&sql_allocs, &params),
+            app.ch.rows(&sql_restarts, &params),
+            app.ch.rows(&sql_logs, &params)
+        );
+        (allocs.context("allocs")?, restarts.context("restarts")?, logs.context("logs")?)
+    };
 
     let mut events: Vec<Value> = Vec::new();
     // Deployments and stops. A first sample right at the start of the range is

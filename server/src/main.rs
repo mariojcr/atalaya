@@ -26,6 +26,10 @@
 //!   ATALAYA_SESSION_DAYS      session length (30)
 //!   ATALAYA_NOW_DELAY         seconds panels, alerts and the home page stay behind now (45; 30 with a 15 s flush)
 //!   ATALAYA_REFRESH           seconds between refreshes of the pages that are not dashboards (60)
+//!   ATALAYA_VICTORIA_METRICS_URL  VictoriaMetrics (http://host:8428): PromQL runs there instead of on
+//!                             ClickHouse, for the dashboards, the home page and the alert rules
+//!   ATALAYA_VICTORIA_LOGS_URL     VictoriaLogs (http://host:9428): logs are read there instead of from
+//!                             ClickHouse's logs table. With both, ClickHouse is not used at all
 //!
 //! `atalaya-server schema` prints the schema; `atalaya-server schema --apply` applies it
 //! (idempotent) as CLICKHOUSE_USER, which must be allowed to create tables.
@@ -41,6 +45,7 @@ mod notebooks;
 mod overview;
 mod query;
 mod schema;
+mod vlogs;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -67,8 +72,23 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
     );
     let db = ident(&env("ATALAYA_DB", "atalaya"))?;
+    let vm_url = env("ATALAYA_VICTORIA_METRICS_URL", "");
+    let vl_url = env("ATALAYA_VICTORIA_LOGS_URL", "");
+    let promql = if vm_url.is_empty() {
+        promql::Backend::Native(Box::new(promql::Engine::new(promql::store::Store::new(ch.clone(), db.clone()))))
+    } else {
+        tracing::info!("PromQL on VictoriaMetrics at {vm_url}");
+        promql::Backend::Victoria(promql::victoria::VictoriaMetrics::new(&vm_url)?)
+    };
+    let vlogs = if vl_url.is_empty() {
+        None
+    } else {
+        tracing::info!("logs on VictoriaLogs at {vl_url}");
+        Some(vlogs::VictoriaLogs::new(&vl_url)?)
+    };
     let app = Arc::new(App {
-        promql: promql::Engine::new(promql::store::Store::new(ch.clone(), db.clone())),
+        promql,
+        vlogs,
         ch,
         db,
         dashboards: PathBuf::from(env("ATALAYA_DASHBOARDS", "dashboards")),
