@@ -4,7 +4,10 @@
 //! PromQL on VictoriaMetrics: the same answers as the engine over ClickHouse (Output, Labels),
 //! computed by VictoriaMetrics. The atalaya-collector writes each series with the labels the engine
 //! gives it (label_view), so dashboards, the home page and alert rules read the same series here.
-//! The Grafana macros are expanded as the engine does on its raw tier (15 s, the scrape interval).
+//! The Grafana macros are expanded as the engine does: with the resolution of the data the range
+//! reaches. That is the scrape interval (15 s) for recent data, and the interval VictoriaMetrics
+//! downsamples to once the data is older (`with_downsampling`, the same periods as its
+//! `-downsampling.period`), so a zoom into old data still finds a sample in every window.
 
 use std::time::Duration;
 
@@ -32,6 +35,42 @@ const RES: i64 = 15;
 pub struct VictoriaMetrics {
     http: reqwest::Client,
     url: String,
+    /// (age, interval) in seconds, by age: data older than `age` keeps one sample per `interval`
+    downsampling: Vec<(i64, i64)>,
+}
+
+/// Parses VictoriaMetrics' `-downsampling.period` (`7d:1m,42d:10m`): from each age on, one sample
+/// per interval. Periods with a series filter (`{job="x"}:30d:5m`) apply only to some series, and
+/// the resolution here is per query: better to refuse them than to widen every window for them
+pub fn parse_downsampling(spec: &str) -> Result<Vec<(i64, i64)>> {
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        anyhow::ensure!(!part.contains('{'), "downsampling period with a series filter is not supported: {part}");
+        let (age, every) = part.split_once(':').ok_or_else(|| anyhow!("downsampling period without ':': {part}"))?;
+        let (age, every) = (duration_secs(age)?, duration_secs(every)?);
+        anyhow::ensure!(every > 0, "downsampling interval must be positive: {part}");
+        out.push((age, every));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// `30s`, `5m`, `2h`, `7d`, `1w`, `1y` in seconds
+fn duration_secs(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(|| anyhow!("duration without a unit: {s}"))?;
+    let (n, unit) = s.split_at(split);
+    let n: i64 = n.parse().map_err(|_| anyhow!("bad duration: {s}"))?;
+    let k = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 7 * 86400,
+        "y" => 365 * 86400,
+        _ => anyhow::bail!("bad duration unit: {s}"),
+    };
+    n.checked_mul(k).ok_or_else(|| anyhow!("duration too large: {s}"))
 }
 
 impl VictoriaMetrics {
@@ -43,7 +82,26 @@ impl VictoriaMetrics {
                 .pool_idle_timeout(Duration::from_secs(5))
                 .build()?,
             url: url.trim_end_matches('/').to_owned(),
+            downsampling: Vec::new(),
         })
+    }
+
+    /// The periods VictoriaMetrics downsamples with (`parse_downsampling`)
+    pub fn with_downsampling(mut self, periods: Vec<(i64, i64)>) -> Self {
+        self.downsampling = periods;
+        self
+    }
+
+    /// Seconds between samples of data from `t`: the scrape interval, or the downsampling interval
+    /// its age falls in
+    fn resolution(&self, t: i64, now: i64) -> i64 {
+        // A time from the request: saturating, so an absurd one cannot overflow
+        let age = now.saturating_sub(t);
+        self.downsampling
+            .iter()
+            .filter(|(from, _)| age > *from)
+            .map(|(_, every)| *every)
+            .fold(RES, i64::max)
     }
 
     /// GET <path> with the parameters; the `data` of a successful answer
@@ -75,7 +133,8 @@ impl VictoriaMetrics {
         if end < start {
             anyhow::bail!("end is before start");
         }
-        let q = expand_macros(query, step, RES, end - start);
+        // The oldest point decides: its data is the coarsest in the range
+        let q = expand_macros(query, step, self.resolution(start, super::now()), end - start);
         let t0 = std::time::Instant::now();
         let data = self
             .get(
@@ -92,7 +151,8 @@ impl VictoriaMetrics {
     }
 
     pub async fn instant(&self, query: &str, time: i64) -> Result<Evaluated> {
-        let q = expand_macros(query, RES, RES, 0);
+        let res = self.resolution(time, super::now());
+        let q = expand_macros(query, res, res, 0);
         let t0 = std::time::Instant::now();
         let data = self.get("/api/v1/query", &[("query", q), ("time", time.to_string())]).await?;
         let output = match data["resultType"].as_str() {
@@ -220,5 +280,30 @@ mod tests {
             assert!(e.to_string().contains("invalid label name"), "{bad}: {e}");
         }
         assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn the_rate_window_follows_the_resolution_of_old_data() {
+        let periods = parse_downsampling("42d:10m, 7d:1m").unwrap();
+        assert_eq!(periods, vec![(7 * 86400, 60), (42 * 86400, 600)]);
+        let vm = VictoriaMetrics::new("http://127.0.0.1:1").unwrap().with_downsampling(periods);
+        let now = 2_000_000_000;
+        assert_eq!(vm.resolution(now - 3600, now), RES);
+        assert_eq!(vm.resolution(now - 20 * 86400, now), 60);
+        assert_eq!(vm.resolution(now - 60 * 86400, now), 600);
+        assert_eq!(
+            vm.resolution(i64::MIN, now),
+            600,
+            "the oldest possible time: the coarsest interval, no overflow"
+        );
+        // 6 h from 60 days ago at a 1-minute step: a window of 4 samples of 10 minutes, as the
+        // engine does on its 10-minute tier (with 15 s it was 1 minute: most steps came out empty)
+        let res = vm.resolution(now - 60 * 86400, now);
+        assert_eq!(expand_macros("rate(x[$__rate_interval])", 60, res, 6 * 3600), "rate(x[2400s])");
+        assert_eq!(VictoriaMetrics::new("http://127.0.0.1:1").unwrap().resolution(now - 60 * 86400, now), RES);
+        for bad in ["7d", "7d:0m", "7x:1m", "{job=\"a\"}:30d:5m", "d:1m"] {
+            assert!(parse_downsampling(bad).is_err(), "{bad}");
+        }
+        assert!(parse_downsampling("").unwrap().is_empty());
     }
 }

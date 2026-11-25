@@ -198,22 +198,11 @@ fn promql_alternation(vals: &[String]) -> String {
         .join("|")
 }
 
-/// The same rows as the three ClickHouse queries, from Victoria: each alloc's first and last sample
-/// in the range (VictoriaMetrics' tfirst/tlast_over_time), its restarts per bucket (increase of
-/// nomad_client_allocs_restart), and lines and errors per service and bucket (VictoriaLogs). The Nomad
-/// job of an alloc metric is `exported_job` there, as in the PromQL labels of atalaya's engine
-#[allow(clippy::too_many_arguments)]
-async fn victoria_rows(
-    app: &App,
-    vl: &crate::vlogs::VictoriaLogs,
-    start: i64,
-    end: i64,
-    bucket: i64,
-    res: i64,
-    service: Option<&str>,
-    ignore: &[String],
-) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>)> {
-    use crate::vlogs::{millis, num, quote, time_range};
+/// The same rows as the ClickHouse queries on allocs and restarts, from VictoriaMetrics: each
+/// alloc's first and last sample in the range (tfirst/tlast_over_time) and its restarts per bucket
+/// (increase of nomad_client_allocs_restart). The Nomad job of an alloc metric is `exported_job`
+/// there, as in the PromQL labels of atalaya's engine
+async fn victoria_allocs(app: &App, start: i64, end: i64, bucket: i64, res: i64, service: Option<&str>, ignore: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
     let mut m = vec![];
     if !ignore.is_empty() {
         m.push(format!("task!~{}", serde_json::to_string(&promql_alternation(ignore)).unwrap_or_default()));
@@ -230,23 +219,10 @@ async fn victoria_rows(
         "sum by (exported_job, alloc_id, instance) (increase({}[{bucket}s])) > 0",
         sel("nomad_client_allocs_restart")
     );
-    let mut lf = vec![time_range(start, end)];
-    if !ignore.is_empty() {
-        lf.push(format!("!\"nomad.task\":in({})", ignore.iter().map(|t| quote(t)).collect::<Vec<_>>().join(",")));
-    }
-    if let Some(svc) = service {
-        lf.push(format!("job:={}", quote(svc)));
-    }
-    let errors = "level:in(\"ERROR\",\"FATAL\")";
-    let q_logs = format!(
-        "{} | stats by (job, _time:{bucket}s) count() as n, count() if ({errors}) as errors, row_any(_msg) if ({errors}) as sample, row_any(host) as h",
-        lf.join(" ")
-    );
-    let (first, last, restarts, logs) = tokio::join!(
+    let (first, last, restarts) = tokio::join!(
         app.promql.instant(&q_first, end),
         app.promql.instant(&q_last, end),
         app.promql.range(&q_restarts, start, end, bucket),
-        vl.query(q_logs),
     );
     type Series = Vec<(Labels, Vec<(i64, f64)>)>;
     let series = |r: Result<atalaya::promql::Evaluated>, what: &str| -> Result<Series> {
@@ -284,7 +260,28 @@ async fn victoria_rows(
                 .map(move |(t, v)| json!({ "job": k.0, "alloc": k.1, "host": k.2, "t": t, "n": v.round() as i64 }))
         })
         .collect();
-    let mut logs: Vec<Value> = logs
+    Ok((allocs, restarts))
+}
+
+/// Lines and errors per service and bucket, from VictoriaLogs: the same rows as the ClickHouse query
+/// on the logs table
+async fn victoria_logs(vl: &crate::vlogs::VictoriaLogs, start: i64, end: i64, bucket: i64, service: Option<&str>, ignore: &[String]) -> Result<Vec<Value>> {
+    use crate::vlogs::{millis, num, quote, time_range};
+    let mut lf = vec![time_range(start, end)];
+    if !ignore.is_empty() {
+        lf.push(format!("!\"nomad.task\":in({})", ignore.iter().map(|t| quote(t)).collect::<Vec<_>>().join(",")));
+    }
+    if let Some(svc) = service {
+        lf.push(format!("job:={}", quote(svc)));
+    }
+    let errors = "level:in(\"ERROR\",\"FATAL\")";
+    let q_logs = format!(
+        "{} | stats by (job, _time:{bucket}s) count() as n, count() if ({errors}) as errors, row_any(_msg) if ({errors}) as sample, row_any(host) as h",
+        lf.join(" ")
+    );
+    let mut logs: Vec<Value> = vl
+        .query(q_logs)
+        .await
         .context("logs")?
         .iter()
         .map(|r| {
@@ -301,7 +298,7 @@ async fn victoria_rows(
         })
         .collect();
     logs.sort_by(|a, b| a["service"].as_str().cmp(&b["service"].as_str()).then(a["t"].as_i64().cmp(&b["t"].as_i64())));
-    Ok((allocs, restarts, logs))
+    Ok(logs)
 }
 
 pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang: &str, with_lanes: bool) -> Result<Value> {
@@ -365,16 +362,25 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
            AND NOT has({{ignore:Array(String)}}, Resource['nomad.task']){svc_cond}
          GROUP BY service, t ORDER BY service, t"
     );
-    let (allocs, restarts, logs) = if let Some(vl) = &app.vlogs {
-        victoria_rows(app, vl, start, end, bucket, res, service, &cfg.ignore_tasks).await?
-    } else {
-        let (allocs, restarts, logs) = tokio::join!(
-            app.ch.rows(&sql_allocs, &params),
-            app.ch.rows(&sql_restarts, &params),
-            app.ch.rows(&sql_logs, &params)
-        );
-        (allocs.context("allocs")?, restarts.context("restarts")?, logs.context("logs")?)
+    // Allocs and restarts from wherever the metrics are, lines from wherever the logs are: each on
+    // its own (metrics on VictoriaMetrics with logs on ClickHouse reads no metrics table of ClickHouse)
+    let allocs = async {
+        if matches!(app.promql, atalaya::promql::Backend::Victoria(_)) {
+            victoria_allocs(app, start, end, bucket, res, service, &cfg.ignore_tasks).await
+        } else {
+            let (allocs, restarts) = tokio::join!(app.ch.rows(&sql_allocs, &params), app.ch.rows(&sql_restarts, &params));
+            Ok((allocs.context("allocs")?, restarts.context("restarts")?))
+        }
     };
+    let lines = async {
+        match &app.vlogs {
+            Some(vl) => victoria_logs(vl, start, end, bucket, service, &cfg.ignore_tasks).await,
+            None => app.ch.rows(&sql_logs, &params).await.context("logs"),
+        }
+    };
+    let (allocs, logs) = tokio::join!(allocs, lines);
+    let (allocs, restarts) = allocs?;
+    let logs = logs?;
 
     let mut events: Vec<Value> = Vec::new();
     // Deployments and stops. A first sample right at the start of the range is

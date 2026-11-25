@@ -18,6 +18,9 @@ clickhouse:                    # ClickHouse, Victoria or both: at least one
   database: atalaya            # default atalaya
   flush_interval: 30s          # how often rows are sent (default 30s)
   max_spool_mb: 1024           # disk queue limit; the oldest batches go first (default 1024)
+  metrics: true                # send metrics here (default true)
+  logs: true                   # send logs here (default true); e.g. metrics: false with
+                               # victoria.metrics_url keeps only the logs table in ClickHouse
 
 victoria:                      # VictoriaMetrics and VictoriaLogs (see "Sending to Victoria")
   metrics_url: http://victoriametrics:8428   # points, to /api/v1/import
