@@ -5,13 +5,25 @@ use atalaya::ch::ClickHouse;
 
 use crate::app::{env, ident};
 
-const SCHEMA: &str = include_str!("../schema/atalaya.sql");
+const LOGS: &str = include_str!("../schema/logs.sql");
+const METRICS: &str = include_str!("../schema/metrics.sql");
 
-/// The schema for the ATALAYA_DB database: the file says `atalaya`, and the same
+/// The database and the logs table always; the metric tables only while metrics are stored in
+/// ClickHouse. With them on VictoriaMetrics the server never reads those tables, and creating them
+/// on every deploy would bring back the ones dropped after the move.
+fn schema_text(metrics_in_clickhouse: bool) -> String {
+    if metrics_in_clickhouse {
+        format!("{LOGS}\n{METRICS}")
+    } else {
+        LOGS.to_owned()
+    }
+}
+
+/// The schema for the ATALAYA_DB database: the files say `atalaya`, and the same
 /// variable decides where the server and the alerts query
-fn schema_for(db: &str) -> String {
+fn schema_for(db: &str, schema: &str) -> String {
     let re = regex::Regex::new(r"\batalaya\.").expect("regex");
-    re.replace_all(SCHEMA, format!("{db}.").as_str())
+    re.replace_all(schema, format!("{db}.").as_str())
         .replace("CREATE DATABASE IF NOT EXISTS atalaya;", &format!("CREATE DATABASE IF NOT EXISTS {db};"))
 }
 
@@ -53,8 +65,14 @@ fn unknown_table(e: &anyhow::Error) -> bool {
 pub async fn schema(apply: bool) -> anyhow::Result<()> {
     let db = ident(&env("ATALAYA_DB", "atalaya"))?;
     let is_replicated = env("ATALAYA_REPLICATED", "") == "1";
-    let schema = if is_replicated { replicated(&schema_for(&db)) } else { schema_for(&db) };
+    // The same variable that sends the server's PromQL to VictoriaMetrics
+    let metrics_in_clickhouse = env("ATALAYA_VICTORIA_METRICS_URL", "").is_empty();
+    let schema = schema_for(&db, &schema_text(metrics_in_clickhouse));
+    let schema = if is_replicated { replicated(&schema) } else { schema };
     if !apply {
+        if !metrics_in_clickhouse {
+            println!("-- ATALAYA_VICTORIA_METRICS_URL is set: metrics are on VictoriaMetrics, so their tables are left out");
+        }
         print!("{schema}");
         return Ok(());
     }
@@ -96,7 +114,14 @@ pub async fn schema(apply: bool) -> anyhow::Result<()> {
             }
         }
     }
-    println!("schema applied: {} statements", statements.len());
+    if metrics_in_clickhouse {
+        println!("schema applied: {} statements", statements.len());
+    } else {
+        println!(
+            "schema applied: {} statements (logs only: ATALAYA_VICTORIA_METRICS_URL is set, metric tables are not created)",
+            statements.len()
+        );
+    }
     Ok(())
 }
 
@@ -104,28 +129,74 @@ pub async fn schema(apply: bool) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// Tables and views a schema creates, by name
+    fn created(schema: &str) -> Vec<String> {
+        let re = regex::Regex::new(r"CREATE (?:TABLE|MATERIALIZED VIEW) IF NOT EXISTS \w+\.(\w+)").expect("regex");
+        re.captures_iter(schema).map(|c| c[1].to_owned()).collect()
+    }
+
     #[test]
     fn schema_uses_the_configured_database() {
-        let s = schema_for("other");
-        assert!(s.contains("CREATE DATABASE IF NOT EXISTS other;"));
-        assert!(s.contains("CREATE TABLE IF NOT EXISTS other.points"));
-        assert!(!s.contains("atalaya.points"));
-        assert_eq!(schema_statements(&s).len(), schema_statements(SCHEMA).len());
+        for metrics in [true, false] {
+            let s = schema_for("other", &schema_text(metrics));
+            assert!(s.contains("CREATE DATABASE IF NOT EXISTS other;"));
+            assert!(s.contains("CREATE TABLE IF NOT EXISTS other.logs"));
+            assert!(!s.contains("atalaya."), "metrics: {metrics}");
+            assert_eq!(schema_statements(&s).len(), schema_statements(&schema_text(metrics)).len());
+        }
+        assert!(schema_for("other", &schema_text(true)).contains("CREATE TABLE IF NOT EXISTS other.points"));
+    }
+
+    #[test]
+    fn metrics_on_victoria_leave_every_metric_table_out() {
+        let logs_only = schema_for("other", &schema_text(false));
+        assert_eq!(created(&logs_only), ["logs"]);
+        // Nothing else either: no ALTER of a metric table or view, which would fail once they are dropped
+        for st in schema_statements(&logs_only) {
+            assert!(
+                st.starts_with("CREATE DATABASE IF NOT EXISTS other") || st.starts_with("CREATE TABLE IF NOT EXISTS other.logs"),
+                "{st}"
+            );
+        }
+        let full = schema_for("other", &schema_text(true));
+        let metrics = created(&full);
+        for t in [
+            "metric_descriptors",
+            "series",
+            "points",
+            "points_1m_mv",
+            "dist_points_10m",
+            "stale",
+            "dist_import_10m_only_mv",
+        ] {
+            assert!(metrics.iter().any(|m| m == t), "{t} is in the full schema");
+        }
+        // The metrics part adds only metric objects: the database and logs live in the logs part
+        assert_eq!(metrics.iter().filter(|m| *m == "logs").count(), 1);
+        assert_eq!(
+            schema_statements(&full).len(),
+            schema_statements(&logs_only).len() + schema_statements(&schema_for("other", METRICS)).len()
+        );
+        assert!(!METRICS.contains("CREATE DATABASE") && !METRICS.contains("atalaya.logs"));
     }
 
     #[test]
     fn replicated_schema_replicates_every_merge_tree_and_leaves_the_database_alone() {
-        let s = replicated(&schema_for("other"));
-        assert!(!s.contains("CREATE DATABASE"), "the database is the cluster's to create");
-        let engines: Vec<&str> = s.lines().filter_map(|l| l.split("ENGINE = ").nth(1)).collect();
-        assert!(engines.iter().any(|e| e.starts_with("ReplicatedReplacingMergeTree(Updated)")));
-        assert!(engines.iter().any(|e| e.starts_with("ReplicatedAggregatingMergeTree")));
-        for e in &engines {
-            assert!(e.starts_with("Replicated") || e.starts_with("Null"), "not replicated: {e}");
-            assert!(!e.starts_with("ReplicatedReplicated"), "replicated twice: {e}");
+        for metrics in [true, false] {
+            let plain = schema_for("other", &schema_text(metrics));
+            let s = replicated(&plain);
+            assert!(!s.contains("CREATE DATABASE"), "the database is the cluster's to create");
+            let engines: Vec<&str> = s.lines().filter_map(|l| l.split("ENGINE = ").nth(1)).collect();
+            assert!(engines.iter().any(|e| e.starts_with("ReplicatedMergeTree")), "the logs table");
+            assert_eq!(engines.iter().any(|e| e.starts_with("ReplicatedReplacingMergeTree(Updated)")), metrics);
+            assert_eq!(engines.iter().any(|e| e.starts_with("ReplicatedAggregatingMergeTree")), metrics);
+            for e in &engines {
+                assert!(e.starts_with("Replicated") || e.starts_with("Null"), "not replicated: {e}");
+                assert!(!e.starts_with("ReplicatedReplicated"), "replicated twice: {e}");
+            }
+            // Same statements as the plain schema, minus CREATE DATABASE.
+            assert_eq!(schema_statements(&s).len() + 1, schema_statements(&plain).len());
         }
-        // Same statements as the plain schema, minus CREATE DATABASE.
-        assert_eq!(schema_statements(&s).len() + 1, schema_statements(&schema_for("other")).len());
     }
 
     #[test]

@@ -49,7 +49,8 @@ failed batches go to an on-disk queue that is retried in order. See
 
 **ClickHouse** stores everything. The schema (`atalaya-server schema --apply`) creates
 the tables and the materialized views that build the aggregated tiers at insert
-time.
+time. With metrics on VictoriaMetrics it holds only the logs, and the schema
+creates only that table.
 
 **Server** (`atalaya`) answers the UI and the HTTP APIs, evaluates alert rules
 and delivers notifications. It only needs a read-only ClickHouse user. The UI is

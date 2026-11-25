@@ -1,6 +1,8 @@
 -- SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 -- SPDX-License-Identifier: Apache-2.0
--- atalaya schema. Idempotent (IF NOT EXISTS): `atalaya-server schema --apply`.
+-- atalaya schema, metrics part. Idempotent (IF NOT EXISTS): `atalaya-server schema --apply`
+-- applies it after logs.sql, and leaves it out when ATALAYA_VICTORIA_METRICS_URL is set: the
+-- metrics then live in VictoriaMetrics and the server never reads these tables.
 --
 -- Cloud Monitoring model:
 --   metric_descriptors  one row per metric: kind, unit, description
@@ -11,12 +13,9 @@
 --                       (6 weeks / forever), written on insert
 --   dist_points         distributions (Prometheus histograms): count, sum and
 --                       cumulative buckets (7 days), with their tiers
---   logs                logs, kept forever, with their service and resource
 --
 -- The collector registers each series once (refreshing LastSeen hourly) and
 -- then only sends points. Materialized views compute the tiers on insert.
-
-CREATE DATABASE IF NOT EXISTS atalaya;
 
 CREATE TABLE IF NOT EXISTS atalaya.metric_descriptors
 (
@@ -208,25 +207,6 @@ SELECT Metric, SeriesId, toStartOfInterval(T0, INTERVAL 10 MINUTE) AS Time,
        argMaxState(tuple(Count, Sum, Buckets), T0) AS Last
 FROM (SELECT Metric, SeriesId, Time AS T0, Count, Sum, Buckets FROM atalaya.dist_points)
 GROUP BY Metric, SeriesId, Time;
-
--- Logs, kept forever. Resource holds the Nomad job, group, task and alloc
--- (when collected from Nomad); Attributes holds fields of JSON lines (nginx…).
-CREATE TABLE IF NOT EXISTS atalaya.logs
-(
-    Time       DateTime64(3) CODEC(Delta(8), ZSTD(1)),
-    Service    LowCardinality(String),
-    Host       LowCardinality(String),
-    Stream     LowCardinality(String),
-    Level      LowCardinality(String),
-    Body       String CODEC(ZSTD(3)),
-    Resource   Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    Attributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
-    INDEX idx_body lower(Body) TYPE text(tokenizer = 'splitByNonAlpha'),
-    INDEX idx_level Level TYPE set(16) GRANULARITY 4
-)
-ENGINE = MergeTree
-PARTITION BY toYYYYMM(Time)
-ORDER BY (Service, Time);
 
 -- History import (e.g. from VictoriaMetrics). Null input tables store nothing,
 -- and their views write straight into the tiers, so old data skips the raw

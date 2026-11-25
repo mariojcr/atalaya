@@ -94,6 +94,47 @@ Tested with ClickHouse 26.8. Create the schema once and after every upgrade
 CLICKHOUSE_URL=http://clickhouse:8123/ CLICKHOUSE_USER=admin CLICKHOUSE_PASSWORD=… atalaya-server schema --apply
 ```
 
+### Metrics on VictoriaMetrics
+
+With metrics on VictoriaMetrics (`ATALAYA_VICTORIA_METRICS_URL`) ClickHouse holds
+only the logs: the server reads no metric table there. Give the schema step the
+same `ATALAYA_VICTORIA_METRICS_URL` as the server and it creates only the database
+and the `logs` table (`schema applied: N statements (logs only: …)`). Without it
+the schema creates the metric tables again on every run.
+
+A database created before the move keeps its metric tables, and the schema never
+drops anything. Drop them yourself once the server reads VictoriaMetrics, the
+schema step has the variable and no collector writes metrics to ClickHouse
+(`clickhouse.metrics: false`, see [collector](collector.md); a batch already in a
+disk queue is still sent, and a missing table makes it wait there, retried).
+Views first; on a replicated database the DDL reaches every replica:
+
+```sql
+DROP VIEW IF EXISTS atalaya.points_1m_mv;
+DROP VIEW IF EXISTS atalaya.points_10m_mv;
+DROP VIEW IF EXISTS atalaya.dist_points_1m_mv;
+DROP VIEW IF EXISTS atalaya.dist_points_10m_mv;
+DROP VIEW IF EXISTS atalaya.points_import_1m_mv;
+DROP VIEW IF EXISTS atalaya.points_import_10m_mv;
+DROP VIEW IF EXISTS atalaya.points_import_10m_only_mv;
+DROP VIEW IF EXISTS atalaya.dist_import_1m_mv;
+DROP VIEW IF EXISTS atalaya.dist_import_10m_mv;
+DROP VIEW IF EXISTS atalaya.dist_import_10m_only_mv;
+DROP TABLE IF EXISTS atalaya.points_import;
+DROP TABLE IF EXISTS atalaya.points_import_10m;
+DROP TABLE IF EXISTS atalaya.dist_import;
+DROP TABLE IF EXISTS atalaya.dist_import_10m;
+DROP TABLE IF EXISTS atalaya.points;
+DROP TABLE IF EXISTS atalaya.points_1m;
+DROP TABLE IF EXISTS atalaya.points_10m;
+DROP TABLE IF EXISTS atalaya.dist_points;
+DROP TABLE IF EXISTS atalaya.dist_points_1m;
+DROP TABLE IF EXISTS atalaya.dist_points_10m;
+DROP TABLE IF EXISTS atalaya.stale;
+DROP TABLE IF EXISTS atalaya.series;
+DROP TABLE IF EXISTS atalaya.metric_descriptors;
+```
+
 ### Replicated ClickHouse
 
 On a cluster of replicas, set `ATALAYA_REPLICATED=1` when applying the schema.
@@ -117,9 +158,9 @@ sets them up):
 - **The server:** `SELECT` on `atalaya.*` and `readonly` 2 (read-only, but it
   may set query settings).
 - **The collectors:** `INSERT` and `SELECT` on `atalaya.*`. They insert into
-  `series`, `metric_descriptors`, `points`, `dist_points`, `stale` and `logs`,
-  and the materialized views that fill the aggregate tiers run as the inserting
-  user.
+  `series`, `metric_descriptors`, `points`, `dist_points`, `stale` and `logs`
+  (only `logs` with metrics on VictoriaMetrics), and the materialized views that
+  fill the aggregate tiers run as the inserting user.
 
 Storage grows with the number of series and log volume. Raw points expire after
 7 days and 1-minute aggregates after 42 days (cleaned once a day, so they can
