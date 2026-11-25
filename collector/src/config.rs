@@ -91,6 +91,7 @@ impl Config {
         if let Some(v) = &self.victoria {
             parse_duration(&v.flush_interval).context("victoria.flush_interval")?;
             anyhow::ensure!(v.metrics_url.is_some() || v.logs_url.is_some(), "victoria needs metrics_url, logs_url or both");
+            anyhow::ensure!(v.user.as_deref().is_none_or(|u| !u.is_empty()), "victoria.user is empty");
             for (name, url) in [("victoria.metrics_url", &v.metrics_url), ("victoria.logs_url", &v.logs_url)] {
                 if let Some(u) = url {
                     check_url(name, u)?;
@@ -121,8 +122,15 @@ impl Config {
 /// A Nomad template that resolves a URL with nomadService can render it empty ("http:///") while
 /// the allocation starts: better to exit and let Nomad restart the collector when the template
 /// re-renders than to spool batches that can never be sent
+///
+/// Credentials never go in a URL: errors and logs print URLs, so they go in their own fields
 fn check_url(name: &str, url: &str) -> Result<()> {
-    let u = reqwest::Url::parse(url).with_context(|| format!("invalid {name}: {url}"))?;
+    // Not even an invalid URL is printed if it may carry a password
+    let shown = if url.contains('@') { "<hidden: it has an @>" } else { url };
+    let u = reqwest::Url::parse(url).with_context(|| format!("invalid {name}: {shown}"))?;
+    if !u.username().is_empty() || u.password().is_some() {
+        anyhow::bail!("{name} carries credentials: put the user in victoria.user and the password in VICTORIA_PASSWORD");
+    }
     if u.host_str().is_none_or(str::is_empty) {
         anyhow::bail!("{name} has no host ({url}): is its Nomad service not resolved yet?");
     }
@@ -140,6 +148,10 @@ pub(crate) struct VictoriaConfig {
     /// VictoriaLogs' base URL (http://host:9428)
     #[serde(default)]
     pub(crate) logs_url: Option<String>,
+    /// Basic auth user for both URLs (-httpAuth.username of vminsert / VictoriaLogs); the password
+    /// comes from VICTORIA_PASSWORD, like ClickHouse's, so the config file holds no secret
+    #[serde(default)]
+    pub(crate) user: Option<String>,
     #[serde(default = "default_spool")]
     pub(crate) max_spool_mb: u64,
     /// Used when there is no ClickHouse: Victoria takes small batches well
@@ -243,6 +255,10 @@ pub(crate) struct LogsConfig {
     /// /var/lib/docker/containers mounted read-only
     #[serde(default)]
     pub(crate) docker_dir: Option<PathBuf>,
+    /// Nomad jobs whose allocation logs are never read: their lines can carry what the logs' readers
+    /// must not see (VictoriaMetrics logs the URI of a failed admin call, with its authKey)
+    #[serde(default)]
+    pub(crate) skip_jobs: Vec<String>,
 }
 impl Default for LogsConfig {
     fn default() -> Self {
@@ -250,6 +266,7 @@ impl Default for LogsConfig {
             enabled: true,
             alloc_dir: default_alloc_dir(),
             docker_dir: None,
+            skip_jobs: Vec::new(),
         }
     }
 }
@@ -421,6 +438,11 @@ mod tests {
             ("", "nowhere to send"),
             ("victoria: {}\n", "metrics_url, logs_url or both"),
             ("victoria: { metrics_url: 'http:///' }\n", "victoria.metrics_url"),
+            (
+                "victoria: { metrics_url: 'http://w:secret@vm:8480/insert/0/prometheus' }\n",
+                "carries credentials",
+            ),
+            ("victoria: { metrics_url: 'http://vm:8428', user: '' }\n", "victoria.user is empty"),
             ("clickhouse: { url: 'http://c:8123/', user: u, metrics: false }\n", "metrics would go nowhere"),
             (
                 "clickhouse: { url: 'http://c:8123/', user: u, logs: false }\nvictoria: { metrics_url: 'http://vm:8428' }\n",

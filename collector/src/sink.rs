@@ -90,6 +90,8 @@ enum Backend {
     Victoria {
         metrics_url: Option<String>,
         logs_url: Option<String>,
+        /// Basic auth (user, password) for both
+        auth: Option<(String, String)>,
     },
 }
 
@@ -190,16 +192,22 @@ impl Pipe {
                     // waiting for the server-side flush (up to 5 s per insert) slows it down.
                     .query(&[("query", query.as_str()), ("input_format_skip_unknown_fields", "1"), ("async_insert", "0")])
             }
-            Backend::Victoria { metrics_url, logs_url } => match (table, metrics_url, logs_url) {
-                ("vm", Some(u), _) => self.http.post(format!("{}/api/v1/import", u.trim_end_matches('/'))),
-                ("vl", _, Some(u)) => self.http.post(format!("{}/insert/jsonline", u.trim_end_matches('/'))).query(&[
-                    ("_stream_fields", LOG_STREAM_FIELDS),
-                    ("_time_field", "_time"),
-                    ("_msg_field", "_msg"),
-                ]),
-                // A spooled batch for a destination no longer configured: it can never be sent
-                _ => return Err(SendError::Rejected(format!("no destination configured for {table}"))),
-            },
+            Backend::Victoria { metrics_url, logs_url, auth } => {
+                let req = match (table, metrics_url, logs_url) {
+                    ("vm", Some(u), _) => self.http.post(format!("{}/api/v1/import", u.trim_end_matches('/'))),
+                    ("vl", _, Some(u)) => self.http.post(format!("{}/insert/jsonline", u.trim_end_matches('/'))).query(&[
+                        ("_stream_fields", LOG_STREAM_FIELDS),
+                        ("_time_field", "_time"),
+                        ("_msg_field", "_msg"),
+                    ]),
+                    // A spooled batch for a destination no longer configured: it can never be sent
+                    _ => return Err(SendError::Rejected(format!("no destination configured for {table}"))),
+                };
+                match auth {
+                    Some((user, password)) => req.basic_auth(user, Some(password)),
+                    None => req,
+                }
+            }
         };
         let resp = req
             .header("Content-Encoding", "gzip")
@@ -635,7 +643,14 @@ impl Sink {
 
     /// Victoria's pipes share one set of stats; each has its own spool (`<spool>/metrics`,
     /// `<spool>/logs`) and half of the spool's size
-    fn victoria_pipe(metrics_url: Option<String>, logs_url: Option<String>, spool: PathBuf, max_spool_bytes: u64, stats: Arc<Stats>) -> Result<Victoria> {
+    fn victoria_pipe(
+        metrics_url: Option<String>,
+        logs_url: Option<String>,
+        auth: Option<(String, String)>,
+        spool: PathBuf,
+        max_spool_bytes: u64,
+        stats: Arc<Stats>,
+    ) -> Result<Victoria> {
         anyhow::ensure!(metrics_url.is_some() || logs_url.is_some(), "victoria needs metrics_url, logs_url or both");
         let pipe = |url: Option<String>, metrics: bool| -> Result<Option<Pipe>> {
             let Some(u) = url else { return Ok(None) };
@@ -644,6 +659,7 @@ impl Sink {
                     Backend::Victoria {
                         metrics_url: Some(u),
                         logs_url: None,
+                        auth: auth.clone(),
                     },
                     VM_TABLES,
                     "metrics",
@@ -653,6 +669,7 @@ impl Sink {
                     Backend::Victoria {
                         metrics_url: None,
                         logs_url: Some(u),
+                        auth: auth.clone(),
                     },
                     VL_TABLES,
                     "logs",
@@ -674,17 +691,30 @@ impl Sink {
         })
     }
 
-    /// To VictoriaMetrics (metrics_url) and VictoriaLogs (logs_url) only
-    pub fn victoria(metrics_url: Option<String>, logs_url: Option<String>, spool: PathBuf, max_spool_bytes: u64) -> Result<Self> {
+    /// To VictoriaMetrics (metrics_url) and VictoriaLogs (logs_url) only, with basic auth if `auth`
+    pub fn victoria(
+        metrics_url: Option<String>,
+        logs_url: Option<String>,
+        auth: Option<(String, String)>,
+        spool: PathBuf,
+        max_spool_bytes: u64,
+    ) -> Result<Self> {
         let stats = Arc::new(Stats::default());
-        let v = Self::victoria_pipe(metrics_url, logs_url, spool, max_spool_bytes, stats.clone())?;
+        let v = Self::victoria_pipe(metrics_url, logs_url, auth, spool, max_spool_bytes, stats.clone())?;
         Ok(Self::with(None, Some(v), stats))
     }
 
     /// Also to VictoriaMetrics and VictoriaLogs, with their own disk spool
-    pub fn and_victoria(mut self, metrics_url: Option<String>, logs_url: Option<String>, spool: PathBuf, max_spool_bytes: u64) -> Result<Self> {
+    pub fn and_victoria(
+        mut self,
+        metrics_url: Option<String>,
+        logs_url: Option<String>,
+        auth: Option<(String, String)>,
+        spool: PathBuf,
+        max_spool_bytes: u64,
+    ) -> Result<Self> {
         let stats = Arc::new(Stats::default());
-        self.victoria = Some(Self::victoria_pipe(metrics_url, logs_url, spool, max_spool_bytes, stats.clone())?);
+        self.victoria = Some(Self::victoria_pipe(metrics_url, logs_url, auth, spool, max_spool_bytes, stats.clone())?);
         self.victoria_stats = Some(stats);
         Ok(self)
     }
@@ -1192,7 +1222,7 @@ mod tests {
     async fn victoria_gets_points_with_labels_histograms_as_buckets_and_log_lines_with_their_fields() {
         let dir = spool_dir("victoria");
         let (url, seen) = capturing().await;
-        let sink = Sink::victoria(Some(url.clone()), Some(url), dir.clone(), 1 << 20).unwrap();
+        let sink = Sink::victoria(Some(url.clone()), Some(url), None, dir.clone(), 1 << 20).unwrap();
         let res = json!({"host.name": "thor", "nomad.group": "web"});
         sink.push(
             "series",
@@ -1258,11 +1288,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The Authorization header of each request a test server gets
+    async fn auth_headers() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let keep = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let keep = keep.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let Ok(n) = s.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_owned()))
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() < end + 4 + len {
+                            continue;
+                        }
+                        let auth = head.lines().find_map(|l| {
+                            l.split_once(':')
+                                .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                                .map(|(_, v)| v.trim().to_owned())
+                        });
+                        keep.lock().unwrap().push(auth);
+                        buf.drain(..end + 4 + len);
+                        if s.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn victoria_sends_basic_auth_only_when_it_has_a_user() {
+        for (auth, want) in [
+            (Some(("writer".to_owned(), "s3cret".to_owned())), Some("Basic d3JpdGVyOnMzY3JldA==".to_owned())),
+            (None, None),
+        ] {
+            let dir = spool_dir(&format!("victoria-auth-{}", want.is_some()));
+            let (url, seen) = auth_headers().await;
+            let sink = Sink::victoria(Some(url), None, auth, dir.clone(), 1 << 20).unwrap();
+            sink.push(
+                "series",
+                json!({"SeriesId": 1, "Metric": "up", "Service": "api", "Resource": {"host.name": "h"}, "Labels": {}, "Bounds": []}),
+            );
+            sink.push("points", json!({"Metric": "up", "SeriesId": 1, "Time": 1000, "Value": 1.0, "Counter": false}));
+            let m = sink.mark();
+            sink.flush().await;
+            assert!(sink.is_durable(m));
+            let got = seen.lock().unwrap().clone();
+            assert!(!got.is_empty(), "nothing reached VictoriaMetrics");
+            assert!(got.iter().all(|a| *a == want), "{got:?}, want {want:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[tokio::test]
     async fn a_point_whose_series_victoria_never_saw_is_dropped_and_counted() {
         let dir = spool_dir("noseries");
         let (url, seen) = capturing().await;
-        let sink = Sink::victoria(Some(url), None, dir.clone(), 1 << 20).unwrap();
+        let sink = Sink::victoria(Some(url), None, None, dir.clone(), 1 << 20).unwrap();
         sink.push("points", json!({"Metric": "up", "SeriesId": 9, "Time": 1, "Value": 1.0}));
         sink.flush().await;
         assert!(sent_to(&seen, "/api/v1/import").is_empty());
@@ -1278,7 +1378,7 @@ mod tests {
         let v_dir = spool_dir("both-v");
         let sink = Sink::new(answering(200).await, "u".into(), test_password(), "atalaya".into(), ch_dir.clone(), 1 << 20)
             .unwrap()
-            .and_victoria(None, Some("http://127.0.0.1:1".into()), v_dir.clone(), 1 << 20)
+            .and_victoria(None, Some("http://127.0.0.1:1".into()), None, v_dir.clone(), 1 << 20)
             .unwrap();
         assert!(sink.victoria_stats.is_some());
         // Victoria is unreachable and its logs spool is not a directory any more
@@ -1308,7 +1408,7 @@ mod tests {
     async fn a_spooled_batch_for_a_destination_no_longer_configured_is_set_aside() {
         let dir = spool_dir("gone");
         let (url, _seen) = capturing().await;
-        let sink = Sink::victoria(Some(url), None, dir.clone(), 1 << 20).unwrap();
+        let sink = Sink::victoria(Some(url), None, None, dir.clone(), 1 << 20).unwrap();
         let v = sink.victoria.as_ref().unwrap();
         let metrics = v.metrics.as_ref().unwrap();
         assert!(metrics.to_spool("vl", &gzip(&[r#"{"_msg":"x"}"#.into()]).unwrap()));
@@ -1331,7 +1431,7 @@ mod victoria_outage_tests {
         let dir = std::env::temp_dir().join(format!("atalaya-sink-vl-down-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (url, seen) = tests_support::capturing().await;
-        let sink = Sink::victoria(Some(url), Some("http://127.0.0.1:1".into()), dir.clone(), 1 << 20).unwrap();
+        let sink = Sink::victoria(Some(url), Some("http://127.0.0.1:1".into()), None, dir.clone(), 1 << 20).unwrap();
         sink.push(
             "series",
             json!({"SeriesId": 1, "Metric": "up", "Service": "a", "Resource": {}, "Labels": {}, "Bounds": []}),

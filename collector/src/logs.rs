@@ -77,6 +77,8 @@ pub struct Tailer {
     /// time does not always go to the same allocations
     passes: usize,
     host: String,
+    /// Jobs whose logs are never read (logs.skip_jobs)
+    skip_jobs: HashSet<String>,
     pub lines: u64,
     /// Lines truncated or dropped for being too long
     pub truncated: u64,
@@ -133,9 +135,15 @@ impl Tailer {
             over_budget: HashSet::new(),
             passes: 0,
             host,
+            skip_jobs: HashSet::new(),
             lines: 0,
             truncated: 0,
         }
+    }
+
+    pub fn skipping_jobs(mut self, jobs: Vec<String>) -> Self {
+        self.skip_jobs = jobs.into_iter().collect();
+        self
     }
 
     /// The log files of every allocation, and the allocations whose directory could not be read this
@@ -221,6 +229,14 @@ impl Tailer {
             }
             let (mut idx, mut pos) = self.state.files.get(key).copied().unwrap_or((g.files[0].0, 0));
             let info = nomad.alloc(&g.alloc).await.unwrap_or_default();
+            if [&info.job, &info.parent].iter().any(|j| !j.is_empty() && self.skip_jobs.contains(*j)) {
+                // Never read: the offset jumps to the end, so nothing of it is sent later either
+                if let Some((n, path)) = g.files.last() {
+                    let len = std::fs::symlink_metadata(path).map(|m| m.len()).unwrap_or(0);
+                    self.state.files.insert(key.clone(), (*n, len));
+                }
+                continue;
+            }
             loop {
                 // Backpressure: with this many lines waiting for the next flush, the rest waits on
                 // disk where it is (see HIGH_WATER)
@@ -359,7 +375,7 @@ impl Tailer {
             &service,
             &stream,
             time,
-            text,
+            redact_auth_keys(text),
             resource,
             LinePatterns { list, until: started + left },
         );
@@ -467,6 +483,18 @@ fn is_level_key(k: &str) -> bool {
 /// A log line in the logs table format: level (from JSON or from the text),
 /// attributes from JSON or from the named groups of the first pattern a
 /// plain-text line matches, and the body truncated to MAX_BODY
+/// `authKey=<value>` never leaves the node: VictoriaMetrics logs the URI of a failed admin call with
+/// it, and a job left out of logs.skip_jobs (or whose allocation Nomad did not describe) would ship it
+fn redact_auth_keys(text: String) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"(?i)(authkey=)[^&\s"']+"#).unwrap());
+    if re.is_match(&text) {
+        re.replace_all(&text, "${1}<redacted>").into_owned()
+    } else {
+        text
+    }
+}
+
 pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<Utc>, text: String, resource: Value, patterns: LinePatterns) -> Option<Value> {
     if text.trim().is_empty() {
         return None;
@@ -619,6 +647,41 @@ mod tests {
         assert!(most < HIGH_WATER + 50_000, "at most one read past the high-water mark: {most}");
         assert_eq!(sink.stats.dropped_rows.load(std::sync::atomic::Ordering::Relaxed), 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A job in logs.skip_jobs is never read, not even what it writes later: its lines can carry an
+    /// admin key, and every Atalaya user reads the logs
+    #[tokio::test]
+    async fn the_logs_of_a_skipped_job_are_never_read() {
+        let root = std::env::temp_dir().join(format!("atalaya-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for alloc in ["vm", "web"] {
+            std::fs::create_dir_all(root.join(format!("allocs/{alloc}/alloc/logs"))).unwrap();
+            std::fs::write(root.join(format!("allocs/{alloc}/alloc/logs/task.stdout.0")), b"").unwrap();
+        }
+        let sink = test_sink(&root);
+        let nomad = Nomad::new("http://127.0.0.1:1".into(), "n".into(), None, None).unwrap();
+        nomad.seed_alloc("vm", "victoria-metrics");
+        nomad.seed_alloc("web", "web");
+        let mut t = Tailer::new(root.join("allocs"), &root, "host-1".into()).skipping_jobs(vec!["victoria-metrics".into()]);
+        t.poll(&nomad, &sink).await;
+        for _ in 0..2 {
+            std::fs::write(root.join("allocs/vm/alloc/logs/task.stdout.0"), b"requestURI: /delete?authKey=secret\n").unwrap();
+            std::fs::write(root.join("allocs/web/alloc/logs/task.stdout.0"), b"hello\n").unwrap();
+            t.poll(&nomad, &sink).await;
+        }
+        assert_eq!(t.lines, 1, "only the web job's line");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auth_keys_are_redacted_from_log_lines() {
+        assert_eq!(
+            redact_auth_keys("warn requestURI: /delete/0/prometheus/api/v1/admin/tsdb/delete_series?match[]=x&authKey=s3cret&y=1".into()),
+            "warn requestURI: /delete/0/prometheus/api/v1/admin/tsdb/delete_series?match[]=x&authKey=<redacted>&y=1"
+        );
+        assert_eq!(redact_auth_keys("AUTHKEY=abc def".into()), "AUTHKEY=<redacted> def");
+        assert_eq!(redact_auth_keys("nothing to see".into()), "nothing to see");
     }
 
     /// A pass that cannot list the allocations keeps every offset: before, it dropped them all, and

@@ -8,7 +8,7 @@
 //! after that only points are sent), to VictoriaMetrics and VictoriaLogs, or to
 //! both at once.
 //!
-//! Usage: atalaya-collector <config.yaml>   (password in CLICKHOUSE_PASSWORD)
+//! Usage: atalaya-collector <config.yaml>   (passwords in CLICKHOUSE_PASSWORD and VICTORIA_PASSWORD)
 
 mod chrony;
 mod collector;
@@ -52,6 +52,15 @@ async fn main() -> Result<()> {
     // ClickHouse, Victoria or both (validate checked there is at least one and that the URLs have
     // a host), each with its own disk spool
     let victoria_spool = cfg.state_dir.join("spool-victoria");
+    // vminsert's -httpAuth: the user in the config, the password from the environment
+    let victoria_auth = match cfg.victoria.as_ref().and_then(|v| v.user.clone()) {
+        Some(user) => {
+            let password = std::env::var("VICTORIA_PASSWORD").unwrap_or_default();
+            anyhow::ensure!(!password.is_empty(), "victoria.user is set and VICTORIA_PASSWORD is empty");
+            Some((user, password))
+        }
+        None => None,
+    };
     let sink = match (&cfg.clickhouse, &cfg.victoria) {
         (Some(ch), v) => {
             let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
@@ -65,11 +74,11 @@ async fn main() -> Result<()> {
             )?
             .clickhouse_signals(ch.metrics, ch.logs);
             match v {
-                Some(v) => s.and_victoria(v.metrics_url.clone(), v.logs_url.clone(), victoria_spool, v.max_spool_mb << 20)?,
+                Some(v) => s.and_victoria(v.metrics_url.clone(), v.logs_url.clone(), victoria_auth, victoria_spool, v.max_spool_mb << 20)?,
                 None => s,
             }
         }
-        (None, Some(v)) => Sink::victoria(v.metrics_url.clone(), v.logs_url.clone(), victoria_spool, v.max_spool_mb << 20)?,
+        (None, Some(v)) => Sink::victoria(v.metrics_url.clone(), v.logs_url.clone(), victoria_auth, victoria_spool, v.max_spool_mb << 20)?,
         (None, None) => unreachable!("validate requires a destination"),
     };
     let sink = Arc::new(sink);
@@ -142,7 +151,7 @@ async fn main() -> Result<()> {
             let mut alloc = c
                 .nomad
                 .is_some()
-                .then(|| logs::Tailer::new(c.cfg.logs.alloc_dir.clone(), &c.cfg.state_dir, node.clone()));
+                .then(|| logs::Tailer::new(c.cfg.logs.alloc_dir.clone(), &c.cfg.state_dir, node.clone()).skipping_jobs(c.cfg.logs.skip_jobs.clone()));
             let mut docker = c
                 .cfg
                 .logs
