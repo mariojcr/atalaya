@@ -624,8 +624,8 @@ mod tests {
     fn count_series_fill_the_buckets_without_lines() {
         let by = ["host".to_owned()];
         let rows = [
-            json!({"ts": 1200, "k0": "Thor", "n": 3}),
-            json!({"ts": 1800, "k0": "Thor", "n": 1}),
+            json!({"ts": 1200, "k0": "node-1", "n": 3}),
+            json!({"ts": 1800, "k0": "node-1", "n": 1}),
             json!({"ts": 1800, "k0": "Odin", "n": 2}),
         ];
         // Buckets start at the one holding `start` and stop before `end`
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                json!({"labels": {"host": "Thor"}, "points": [[1200, 3], [1800, 1]]}),
+                json!({"labels": {"host": "node-1"}, "points": [[1200, 3], [1800, 1]]}),
                 json!({"labels": {"host": "Odin"}, "points": [[1200, 0], [1800, 2]]}),
             ]
         );
@@ -645,7 +645,7 @@ mod tests {
             "the bucket holding start, then MAX_POINTS more"
         );
         // Without a step: one count per group, at the end
-        let got = count_series(&by, &[json!({"k0": "Thor", "n": 4})], 0, 3600, None);
-        assert_eq!(got, [json!({"labels": {"host": "Thor"}, "points": [[3600, 4]]})]);
+        let got = count_series(&by, &[json!({"k0": "node-1", "n": 4})], 0, 3600, None);
+        assert_eq!(got, [json!({"labels": {"host": "node-1"}, "points": [[3600, 4]]})]);
     }
 }
