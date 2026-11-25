@@ -27,9 +27,12 @@
 //!   ATALAYA_NOW_DELAY         seconds panels, alerts and the home page stay behind now (45; 30 with a 15 s flush)
 //!   ATALAYA_REFRESH           seconds between refreshes of the pages that are not dashboards (60)
 //!   ATALAYA_VICTORIA_METRICS_URL  VictoriaMetrics (http://host:8428): PromQL runs there instead of on
-//!                             ClickHouse, for the dashboards, the home page and the alert rules
+//!                             ClickHouse, for the dashboards, the home page, the timeline and the alert rules
+//!   ATALAYA_VICTORIA_DOWNSAMPLING its -downsampling.period (7d:1m,42d:10m), so rate windows over old
+//!                             data are as wide as its samples are apart
 //!   ATALAYA_VICTORIA_LOGS_URL     VictoriaLogs (http://host:9428): logs are read there instead of from
-//!                             ClickHouse's logs table. With both, ClickHouse is not used at all
+//!                             ClickHouse's logs table. Each one is independent: with both, ClickHouse
+//!                             is not used at all
 //!
 //! `atalaya-server schema` prints the schema; `atalaya-server schema --apply` applies it
 //! (idempotent) as CLICKHOUSE_USER, which must be allowed to create tables.
@@ -48,6 +51,8 @@ mod schema;
 mod vlogs;
 
 use std::{path::PathBuf, sync::Arc};
+
+use anyhow::Context;
 
 use atalaya::{ch::ClickHouse, promql};
 
@@ -78,7 +83,8 @@ async fn main() -> anyhow::Result<()> {
         promql::Backend::Native(Box::new(promql::Engine::new(promql::store::Store::new(ch.clone(), db.clone()))))
     } else {
         tracing::info!("PromQL on VictoriaMetrics at {vm_url}");
-        promql::Backend::Victoria(promql::victoria::VictoriaMetrics::new(&vm_url)?)
+        let periods = promql::victoria::parse_downsampling(&env("ATALAYA_VICTORIA_DOWNSAMPLING", "")).context("ATALAYA_VICTORIA_DOWNSAMPLING")?;
+        promql::Backend::Victoria(promql::victoria::VictoriaMetrics::new(&vm_url)?.with_downsampling(periods))
     };
     let vlogs = if vl_url.is_empty() {
         None

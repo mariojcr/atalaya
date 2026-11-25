@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::app::Shared;
 
@@ -77,34 +77,51 @@ pub fn router(app: Shared) -> Router {
         .with_state(app)
 }
 
-/// Whether the server can serve: ClickHouse answers and alerts are evaluated.
-/// 503 if ClickHouse does not answer; the age of the last alert evaluation is
-/// in the body for whoever monitors it. The route needs no session, so the
-/// body says only ok or down: why ClickHouse failed (its address, version or
-/// "authentication failed") goes to the log.
+/// Whether the server can serve: every store it reads answers (VictoriaMetrics or ClickHouse for
+/// metrics, VictoriaLogs or ClickHouse for logs) and alerts are evaluated. 503 if one does not
+/// answer; the age of the last alert evaluation is in the body for whoever monitors it. The route
+/// needs no session, so the body says only ok or down per store: why one failed (its address,
+/// version or "authentication failed") goes to the log.
 async fn readyz(axum::extract::State(app): axum::extract::State<Shared>) -> Response {
-    // What this server reads: ClickHouse, unless both metrics and logs are on Victoria
     let victoria = matches!(app.promql, atalaya::promql::Backend::Victoria(_));
-    let (name, ok) = if let (true, Some(vl)) = (victoria, &app.vlogs) {
-        let m = app.promql.instant("vector(1)", super::app::unix_now()).await;
-        let l = vl.count("_time:1m").await;
-        for e in [m.as_ref().err(), l.as_ref().err()].into_iter().flatten() {
-            tracing::warn!("readyz: {e:#}");
+    let uses_ch = !victoria || app.vlogs.is_none();
+    let now = super::app::unix_now();
+    let metrics = async {
+        if victoria {
+            Some(app.promql.instant("vector(1)", now).await.map(|_| ()))
+        } else {
+            None
         }
-        ("victoria", m.is_ok() && l.is_ok())
-    } else {
-        let ch = app.ch.text("SELECT 1", &[], &[]).await;
-        if let Err(e) = &ch {
-            tracing::warn!("readyz: {e:#}");
-        }
-        ("clickhouse", ch.is_ok())
     };
+    let logs = async {
+        match &app.vlogs {
+            Some(vl) => Some(vl.count("_time:1m").await.map(|_| ())),
+            None => None,
+        }
+    };
+    let ch = async {
+        if uses_ch {
+            Some(app.ch.text("SELECT 1", &[], &[]).await.map(|_| ()))
+        } else {
+            None
+        }
+    };
+    let (metrics, logs, ch) = tokio::join!(metrics, logs, ch);
+    let mut body = serde_json::Map::new();
+    let mut ok = true;
+    for (name, r) in [("victoriametrics", metrics), ("victorialogs", logs), ("clickhouse", ch)] {
+        let Some(r) = r else { continue };
+        if let Err(e) = &r {
+            tracing::warn!("readyz: {name}: {e:#}");
+        }
+        ok &= r.is_ok();
+        body.insert(name.into(), json!(if r.is_ok() { "ok" } else { "down" }));
+    }
     let last_eval = app.alerts.last_tick();
     let age = last_eval.map(|t| super::app::unix_now() - t);
-    let body = json!({
-        name: if ok { "ok" } else { "down" },
-        "alerts_last_eval": last_eval, "alerts_age_s": age,
-    });
+    body.insert("alerts_last_eval".into(), json!(last_eval));
+    body.insert("alerts_age_s".into(), json!(age));
+    let body = Value::Object(body);
     let status = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, Json(body)).into_response()
 }

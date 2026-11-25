@@ -146,8 +146,10 @@ persistent `ATALAYA_DATA` directory and a read-only ClickHouse user.
   notebooks and create silences, so keep it on a private network or behind a
   reverse proxy with authentication.
 - **Health:** `/healthz` answers while the process runs (use it for restarts);
-  `/readyz` returns 503 when ClickHouse does not answer and reports how long ago
-  alerts were evaluated (use it for load balancers and monitoring).
+  `/readyz` returns 503 when a store the server reads does not answer, with
+  `ok` or `down` for each one (`clickhouse`, `victoriametrics`, `victorialogs`,
+  whichever are in use), and reports how long ago alerts were evaluated (use it
+  for load balancers and monitoring).
 - **Errors:** API errors caused by ClickHouse return 502; invalid requests 400.
 - It stops cleanly on SIGTERM.
 

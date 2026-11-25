@@ -62,7 +62,8 @@ async fn main() -> Result<()> {
                 ch.database.clone(),
                 cfg.state_dir.join("spool"),
                 ch.max_spool_mb << 20,
-            )?;
+            )?
+            .clickhouse_signals(ch.metrics, ch.logs);
             match v {
                 Some(v) => s.and_victoria(v.metrics_url.clone(), v.logs_url.clone(), victoria_spool, v.max_spool_mb << 20)?,
                 None => s,

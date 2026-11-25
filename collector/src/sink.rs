@@ -31,6 +31,9 @@ use flate2::{Compression, write::GzEncoder};
 use serde_json::{Map, Value, json};
 
 pub const TABLES: &[&str] = &["metric_descriptors", "series", "points", "dist_points", "logs"];
+/// The same, when ClickHouse takes only metrics or only logs (`Sink::clickhouse_signals`)
+const CH_METRIC_TABLES: &[&str] = &["metric_descriptors", "series", "points", "dist_points"];
+const CH_LOG_TABLES: &[&str] = &["logs"];
 /// Victoria's batches: points for VictoriaMetrics' /api/v1/import and lines for VictoriaLogs'
 /// /insert/jsonline, each in its own pipe and spool, so one being down does not hold up the other
 const VM_TABLES: &[&str] = &["vm"];
@@ -148,6 +151,11 @@ impl Pipe {
             Backend::ClickHouse { .. } => "ClickHouse",
             Backend::Victoria { .. } => "Victoria",
         }
+    }
+
+    /// Whether this destination takes the table's rows
+    fn has(&self, table: &str) -> bool {
+        self.tables.contains(&table)
     }
 
     fn pending_rows(&self, table: &str) -> usize {
@@ -681,6 +689,23 @@ impl Sink {
         Ok(self)
     }
 
+    /// What goes to ClickHouse: metrics, logs or both (both unless this is called). Its queue keeps
+    /// only those tables, and the rest of the rows are not written there (nor the staleness
+    /// markers, which go with the metrics). A batch already in its disk spool is still sent
+    pub fn clickhouse_signals(mut self, metrics: bool, logs: bool) -> Self {
+        if let Some(ch) = &mut self.clickhouse {
+            let tables = match (metrics, logs) {
+                (true, true) => TABLES,
+                (true, false) => CH_METRIC_TABLES,
+                (false, true) => CH_LOG_TABLES,
+                (false, false) => &[],
+            };
+            ch.tables = tables;
+            *ch.pending.get_mut().unwrap() = vec![Vec::new(); tables.len()];
+        }
+        self
+    }
+
     /// Rows of a table waiting in memory for the next flush, in the destination that has the most.
     /// The log tailers stop reading past `crate::logs::HIGH_WATER` instead of letting the cap
     /// drop lines they then count as read
@@ -696,7 +721,7 @@ impl Sink {
 
     pub fn push(&self, table: &str, row: Value) {
         if table == STALE {
-            if self.clickhouse.is_some() {
+            if self.clickhouse.as_ref().is_some_and(|c| c.has("points")) {
                 let mut p = self.stale.lock().unwrap();
                 if p.len() < MAX_PENDING_ROWS {
                     p.push(row.to_string());
@@ -707,7 +732,7 @@ impl Sink {
         if let Some(v) = &self.victoria {
             v.push(table, &row);
         }
-        if let Some(ch) = &self.clickhouse {
+        if let Some(ch) = self.clickhouse.as_ref().filter(|c| c.has(table)) {
             ch.push_line(table, row.to_string());
         }
     }
@@ -975,6 +1000,41 @@ mod tests {
         assert!(left.iter().any(|b| b.contains("new")));
         sink.flush().await;
         assert!(spooled(&dir).is_empty(), "the next flush finishes it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clickhouse_can_take_only_the_logs_or_only_the_metrics() {
+        let dir = std::env::temp_dir().join(format!("atalaya-sink-signals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sink = |logs_only: bool| {
+            Sink::new(
+                "http://127.0.0.1:1/".into(),
+                "collector".into(),
+                test_password(),
+                "atalaya".into(),
+                dir.join(if logs_only { "logs" } else { "metrics" }),
+                1 << 20,
+            )
+            .unwrap()
+            .clickhouse_signals(!logs_only, logs_only)
+        };
+        let rows = |s: &Sink| {
+            s.push("series", json!({"SeriesId": 1, "Metric": "up"}));
+            s.push("points", json!({"SeriesId": 1, "Time": 1, "Value": 1.0}));
+            s.push("stale", json!({"Metric": "up", "SeriesId": 1, "Time": 2}));
+            s.push("logs", json!({"Body": "hello"}));
+        };
+        let logs = sink(true);
+        rows(&logs);
+        assert_eq!((logs.pending_rows("series"), logs.pending_rows("points")), (0, 0), "no metric rows");
+        assert!(logs.stale_rows().is_empty(), "no staleness markers either: they belong to the metrics");
+        assert_eq!(logs.pending_rows("logs"), 1);
+        let metrics = sink(false);
+        rows(&metrics);
+        assert_eq!((metrics.pending_rows("series"), metrics.pending_rows("points")), (1, 1));
+        assert_eq!(metrics.stale_rows().len(), 1);
+        assert_eq!(metrics.pending_rows("logs"), 0, "no log lines");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

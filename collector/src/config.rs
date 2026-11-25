@@ -72,6 +72,21 @@ impl Config {
         if let Some(c) = &self.clickhouse {
             parse_duration(&c.flush_interval).context("clickhouse.flush_interval")?;
             check_url("clickhouse.url", &c.url)?;
+            anyhow::ensure!(c.metrics || c.logs, "clickhouse sends neither metrics nor logs: remove the section instead");
+        }
+        // Taking metrics or logs away from ClickHouse without sending them to Victoria would drop
+        // them quietly: a configuration mistake
+        if let Some(c) = &self.clickhouse {
+            let vm = self.victoria.as_ref().is_some_and(|v| v.metrics_url.is_some());
+            let vl = self.victoria.as_ref().is_some_and(|v| v.logs_url.is_some());
+            anyhow::ensure!(
+                c.metrics || vm,
+                "clickhouse.metrics is false and there is no victoria.metrics_url: metrics would go nowhere"
+            );
+            anyhow::ensure!(
+                c.logs || vl,
+                "clickhouse.logs is false and there is no victoria.logs_url: logs would go nowhere"
+            );
         }
         if let Some(v) = &self.victoria {
             parse_duration(&v.flush_interval).context("victoria.flush_interval")?;
@@ -146,6 +161,12 @@ pub(crate) struct ClickHouseConfig {
     /// is what writes the most to disk.
     #[serde(default = "default_flush")]
     pub(crate) flush_interval: String,
+    /// What goes to ClickHouse: metrics, logs or both (both by default). With metrics on
+    /// VictoriaMetrics, logs alone keep ClickHouse's logs table without its metrics tables
+    #[serde(default = "yes")]
+    pub(crate) metrics: bool,
+    #[serde(default = "yes")]
+    pub(crate) logs: bool,
 }
 pub(crate) fn default_flush() -> String {
     "30s".into()
@@ -382,6 +403,8 @@ mod tests {
             "victoria: { metrics_url: 'http://vm:8428', logs_url: 'http://vl:9428' }\n",
             "victoria: { logs_url: 'http://vl:9428' }\n",
             "clickhouse: { url: 'http://c:8123/', user: u }\nvictoria: { metrics_url: 'http://vm:8428' }\n",
+            // Metrics only to VictoriaMetrics, logs only to ClickHouse
+            "clickhouse: { url: 'http://c:8123/', user: u, metrics: false }\nvictoria: { metrics_url: 'http://vm:8428' }\n",
         ];
         for y in ok {
             let cfg: Config = serde_saphyr::from_str(&format!("{base}{y}")).unwrap();
@@ -398,6 +421,15 @@ mod tests {
             ("", "nowhere to send"),
             ("victoria: {}\n", "metrics_url, logs_url or both"),
             ("victoria: { metrics_url: 'http:///' }\n", "victoria.metrics_url"),
+            ("clickhouse: { url: 'http://c:8123/', user: u, metrics: false }\n", "metrics would go nowhere"),
+            (
+                "clickhouse: { url: 'http://c:8123/', user: u, logs: false }\nvictoria: { metrics_url: 'http://vm:8428' }\n",
+                "logs would go nowhere",
+            ),
+            (
+                "clickhouse: { url: 'http://c:8123/', user: u, metrics: false, logs: false }\n",
+                "neither metrics nor logs",
+            ),
         ] {
             let cfg: Config = serde_saphyr::from_str(&format!("{base}{y}")).unwrap();
             let e = format!("{:#}", cfg.validate().unwrap_err());
