@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared server state and environment configuration.
-
 use std::{path::PathBuf, sync::Arc};
 
 use serde_json::Value;
@@ -17,7 +15,6 @@ pub struct App {
     pub dashboards: PathBuf,
     /// overview.yaml: what the home page shows for each service
     pub overview: PathBuf,
-    /// timeline.yaml: timeline lanes
     pub timeline: PathBuf,
     /// Data written by the server (notebooks, saved searches, alert state): a volume in production
     pub data: PathBuf,
@@ -25,7 +22,6 @@ pub struct App {
     pub promql: promql::Backend,
     /// Logs on VictoriaLogs (ATALAYA_VICTORIA_LOGS_URL) instead of ClickHouse's logs table
     pub vlogs: Option<crate::vlogs::VictoriaLogs>,
-    /// Alert rules, their state and notifications
     pub alerts: alerts::Alerts,
     /// The home page is the same for everyone: cached for 10 s per range
     pub overview_cache: tokio::sync::Mutex<std::collections::HashMap<i64, (std::time::Instant, Value)>>,

@@ -49,7 +49,6 @@ pub fn filters_sql(filters: &[String], params: &mut Vec<Param>) -> Result<Vec<St
             Some(r) => (true, r),
             None => (false, f),
         };
-        // Operator: the first one that appears
         let pos = f
             .find(|c| ":~<>=".contains(c))
             .ok_or_else(|| anyhow::anyhow!("filter without operator: {raw}"))?;

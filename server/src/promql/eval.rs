@@ -141,8 +141,6 @@ impl Collector {
     }
 }
 
-// ── Functions over a window of samples ──────────────────────────────────────
-
 /// rate/increase/delta as in Prometheus: extrapolates to the window edges when
 /// samples do not reach them, and corrects counter resets.
 fn extrapolated(ts: &[i64], vs: &[f64], from: i64, to: i64, counter: bool, is_rate: bool) -> Option<f64> {
@@ -247,9 +245,8 @@ fn quantile(q: f64, vals: &mut [f64]) -> f64 {
     vals[lo] * (1.0 - w) + vals[hi] * w
 }
 
-/// A total order on f64 with NaN before every number. A comparator that is not a total order (as
-/// `partial_cmp(..).unwrap_or(..)` with NaN) makes `sort_by` panic since Rust 1.81, and a panic in an
-/// alert rule ended the evaluation loop
+/// A total order on f64 with NaN before every number: `sort_by` panics on a comparator that is not
+/// a total order (as `partial_cmp(..).unwrap_or(..)` with NaN)
 fn nan_first(a: f64, b: f64) -> std::cmp::Ordering {
     match (a.is_nan(), b.is_nan()) {
         (true, true) => std::cmp::Ordering::Equal,
@@ -435,12 +432,10 @@ impl Evaluator<'_> {
             .collect()
     }
 
-    /// Applies `f` to the window (t - range, t] of each series at each step
     /// over_range for a result that grows with the window: an increase, a delta, a sum, a count.
     /// A window shorter than `min_range` is widened so the sparse samples of a grouped tier still
     /// fall in it, and the result is then for the widened window: it is scaled back to the window
-    /// asked for. Without that, increase(x[1m]) at a 60 s step on the 1-minute tier was twice the
-    /// real increase, and an hourly increase with a 3 h step three times
+    /// asked for
     fn over_range_extensive(&self, ms: &MatrixSelector, keep_name: bool, f: impl Fn(&[i64], &[f64], i64, i64) -> Option<f64>) -> Vec<Series> {
         let asked = ms.range.as_secs() as i64;
         let range = asked.max(self.min_range);
@@ -491,7 +486,6 @@ impl Evaluator<'_> {
             _ => None,
         };
 
-        // Groups: key → series
         let mut groups: Vec<(Labels, Vec<usize>)> = Vec::new();
         let mut gidx: HashMap<Labels, usize> = HashMap::new();
         for (i, s) in input.iter().enumerate() {
@@ -658,8 +652,7 @@ impl Evaluator<'_> {
         }
 
         let mut c = Collector::new(self.n);
-        // The output series of each (many, one) pair, resolved once: cloning and hashing its labels
-        // at every step was most of the time and memory of a large join
+        // The output series of each (many, one) pair, resolved once rather than at every step
         let mut slots: HashMap<(usize, usize), usize> = HashMap::new();
         // One-to-one: each signature may appear only once per step on the left side. Only the
         // signatures several left series share can break that, and only those keep a row per step
@@ -1205,10 +1198,6 @@ mod tests {
         assert_eq!(mounts(r#"sort_by_label_desc(used, "mount")"#), ["/d", "/c", "/b", "/a"]);
     }
 
-    /// On a grouped tier a short window is widened to `min_range` (two buckets) so the sparse
-    /// samples still fall in it. What grows with the window comes back scaled to the window asked
-    /// for: increase(x[1m]) at a 60 s step on the 1-minute tier was twice the real increase (and
-    /// twenty times at a 600 s step on the 10-minute tier). A rate is per second already
     #[test]
     fn widened_windows_do_not_inflate_increases_sums_or_counts() {
         // A counter growing 15/s, one sample a minute (the 1-minute tier)
@@ -1243,9 +1232,6 @@ mod tests {
         assert!(eval("increase(c_total[5m])").iter().all(|v| (v - 4500.0).abs() < 1e-6), "increase over 5m");
     }
 
-    /// topk, bottomk and quantile over values with NaN (0/0 in a ratio): sort_by panicked on the
-    /// comparators, which are not a total order with NaN, and a panic in an alert rule ended the
-    /// evaluation loop. NaN goes last, as in Prometheus
     #[test]
     fn rankings_and_quantiles_over_nan_do_not_panic() {
         let used = |i: usize| Samples {

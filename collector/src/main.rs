@@ -40,7 +40,6 @@ use crate::sink::Sink;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,atalaya_collector=info".into()))
-        // No colours outside a terminal: under Nomad the output ends up in atalaya's logs
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
@@ -49,10 +48,7 @@ async fn main() -> Result<()> {
     cfg.validate()?;
     std::fs::create_dir_all(&cfg.state_dir)?;
     let interval = parse_duration(&cfg.scrape.interval)?;
-    // ClickHouse, Victoria or both (validate checked there is at least one and that the URLs have
-    // a host), each with its own disk spool
     let victoria_spool = cfg.state_dir.join("spool-victoria");
-    // vminsert's -httpAuth: the user in the config, the password from the environment
     let victoria_auth = match cfg.victoria.as_ref().and_then(|v| v.user.clone()) {
         Some(user) => {
             let password = std::env::var("VICTORIA_PASSWORD").unwrap_or_default();
@@ -112,8 +108,6 @@ async fn main() -> Result<()> {
     });
     tracing::info!("atalaya-collector on {}: scraping every {:?}", collector.cfg.node, interval);
 
-    // Producers: scraping, SMART, logs and self metrics. On shutdown they are
-    // cancelled first, then the in-flight send is awaited and the rest is flushed.
     let mut producers = Vec::new();
     // A stop signal that is not lost if the task is busy when it arrives
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -210,7 +204,6 @@ async fn main() -> Result<()> {
             }
         }));
     }
-    // Syslog receiver (optional): counted in atalaya_collector_syslog_lines_total
     let syslog_lines = Arc::new(std::sync::atomic::AtomicU64::new(0));
     if let Some(cfg) = collector.cfg.syslog.clone() {
         syslog::run(cfg, sink.clone(), syslog_lines.clone()).await?;

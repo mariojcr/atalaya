@@ -194,7 +194,6 @@ struct LoginParams {
     to: Option<String>,
 }
 
-/// Sends the browser to the provider
 async fn login(State(auth): State<SharedAuth>, Query(p): Query<LoginParams>) -> Response {
     let Ok(d) = auth.discovery().await else {
         return page(StatusCode::BAD_GATEWAY, "The identity provider can't be reached right now.");
@@ -231,7 +230,6 @@ struct CallbackParams {
     error: Option<String>,
 }
 
-/// Back from the provider: the code for a token, who it is, a session
 async fn callback(State(auth): State<SharedAuth>, headers: HeaderMap, Query(p): Query<CallbackParams>) -> Response {
     if let Some(e) = p.error {
         tracing::warn!("sign-in refused by the provider: {e}");

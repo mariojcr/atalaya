@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The collector: scrapes targets, reads the host and writes series and points.
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,7 +40,6 @@ pub(crate) const REFRESH: Duration = Duration::from_secs(3600);
 /// filling the collector's memory
 const MAX_SCRAPE: usize = 32 << 20;
 
-/// A scrape's body, refused past `max` bytes: by its Content-Length, or as it arrives
 /// The client for scrapes: a short deadline, the cluster's CA if there is one,
 /// and no redirects: a target found in Nomad is scraped only at its
 /// allocation's own address, and a redirect would take the scrape anywhere else.
@@ -121,7 +118,6 @@ pub(crate) fn series_id(metric: &str, service: &str, resource: &Labels, labels: 
 pub(crate) struct Collector {
     pub(crate) cfg: Config,
     pub(crate) sink: Arc<Sink>,
-    /// None without the nomad section: static targets only
     pub(crate) nomad: Option<Nomad>,
     pub(crate) http: reqwest::Client,
     pub(crate) rules: Mutex<Rules>,
@@ -152,7 +148,6 @@ fn nomad_resource(host: &Labels, service: &str, alloc: Option<AllocInfo>) -> Lab
     res
 }
 
-/// Most a scrape token file may hold
 const MAX_TOKEN: u64 = 4096;
 
 /// The bearer token in a file: read on every scrape (a few bytes), so a
@@ -191,7 +186,6 @@ impl Collector {
         }
     }
 
-    /// Everything a source wrote is stale: its scrape failed or it is gone
     fn stale_source(&self, reg: &mut Registry, source: &str, now: i64) {
         if let Some(gone) = reg.sources.remove(source) {
             self.mark_stale(gone, now);
@@ -267,8 +261,6 @@ impl Collector {
         );
     }
 
-    /// Scrapes a target, with the bearer token in `token` if it has one (a
-    /// target that asks for a token that cannot be read fails, unsent)
     pub(crate) async fn scrape_one(&self, service: String, url: String, token: Option<PathBuf>, resource: Labels, now: i64) {
         let started = Instant::now();
         let result = async {
@@ -326,7 +318,6 @@ impl Collector {
         self.write(&service, &resource, s, now, Some(&up_source(&url))).await;
     }
 
-    /// A collector self metric, written like any other
     pub(crate) async fn self_metric(&self, metric: &str, resource: &Labels, value: f64, counter: bool, now: i64) {
         let mut s = Scrape::default();
         s.descriptors.insert(
@@ -346,10 +337,8 @@ impl Collector {
         self.write("atalaya-collector", resource, s, now, None).await;
     }
 
-    /// The Nomad targets to scrape this round, and whether the list is complete. After a failed
-    /// discovery (a leader election, a timeout, one service that could not be read) the round used
-    /// to scrape none of them, a gap in every discovered target; now it scrapes the last list that
-    /// worked, and since that list may be out of date nothing counts as gone
+    /// The Nomad targets to scrape this round, and whether the list is complete. A failed discovery
+    /// reuses the last list that worked, which may be out of date, so nothing in it counts as gone
     async fn discovered(&self, found: anyhow::Result<Vec<crate::nomad::Target>>) -> (Vec<crate::nomad::Target>, bool) {
         let mut last = self.last_targets.lock().await;
         match found {
@@ -371,7 +360,6 @@ impl Collector {
         for t in &self.cfg.scrape.static_targets {
             jobs.push((t.service.clone(), t.url.clone(), t.token_file.clone(), host.clone()));
         }
-        // Without a full list of targets (discovery failed), none counts as gone
         let mut complete = true;
         if let Some(nomad) = &self.nomad {
             let (targets, full) = self.discovered(nomad.targets().await).await;
@@ -381,8 +369,7 @@ impl Collector {
                 jobs.push((t.job, t.url, t.token, res));
             }
         }
-        // The time of the samples is when they are taken: discovery goes service by service and can
-        // take seconds, and stamping them with the start of the round skewed rates
+        // Taken after discovery, which can last seconds and would skew rates
         let now = chrono::Utc::now().timestamp();
         let targets: HashSet<String> = jobs.iter().map(|(_, url, _, _)| url.clone()).collect();
         let mut handles: Vec<_> = Vec::new();
@@ -438,7 +425,6 @@ impl Collector {
         })
     }
 
-    /// One SMART pass over all disks, one after another
     pub(crate) async fn smart_all(&self) {
         let now = chrono::Utc::now().timestamp();
         let host: Labels = [("host.name".to_owned(), self.cfg.node.clone())].into();
@@ -490,7 +476,6 @@ impl Collector {
         ] {
             self.self_metric(m, &res, v, c, now).await;
         }
-        // Victoria's own, when it is the second destination (with ClickHouse)
         if let Some(st) = &self.sink.victoria_stats {
             for (m, v, c) in [
                 ("atalaya_collector_victoria_rows_sent_total", st.rows_sent.load(Ordering::Relaxed) as f64, true),
@@ -641,9 +626,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A static target outside Nomad (the plane's /metrics, on its VM) can ask
-    /// for a token too: scrape_all sends it, and a static target without one
-    /// sends nothing
     #[tokio::test]
     async fn a_static_target_sends_its_token_file() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -739,8 +721,6 @@ mod tests {
         out
     }
 
-    /// A failed discovery scrapes the targets found last time (and nothing counts as gone): before,
-    /// the round scraped none of them
     #[tokio::test]
     async fn a_failed_discovery_keeps_the_last_targets() {
         let (c, _) = collector("discovery");
@@ -832,7 +812,6 @@ mod tests {
                 ("nomad.service", "web-metrics")
             ]
         );
-        // Outside `default`, its namespace too
         let scans = AllocInfo {
             namespace: "scans".into(),
             ..Default::default()

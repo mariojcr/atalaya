@@ -40,9 +40,8 @@ use crate::sink::Sink;
 
 pub(crate) const MAX_READ: u64 = 4 << 20;
 
-/// Log lines waiting in the sink past which the tailers stop reading until a flush takes them.
-/// Reading on (a backlog after a restart: up to ten 10 MiB files per stream) filled memory up to the
-/// sink's cap, which dropped lines whose offsets were then saved as read
+/// Log lines waiting in the sink past which the tailers stop reading until a flush takes them: past
+/// the sink's cap, lines would be dropped with their offsets saved as read
 pub(crate) const HIGH_WATER: usize = 100_000;
 const MAX_BODY: usize = 64 << 10;
 /// Log patterns only see the start of a line: enough for a structured line,
@@ -77,7 +76,6 @@ pub struct Tailer {
     /// time does not always go to the same allocations
     passes: usize,
     host: String,
-    /// Jobs whose logs are never read (logs.skip_jobs)
     skip_jobs: HashSet<String>,
     pub lines: u64,
     /// Lines truncated or dropped for being too long
@@ -198,7 +196,6 @@ impl Tailer {
         Some((groups, unreadable))
     }
 
-    /// Reads what is new in every file and sends it to the sink.
     pub async fn poll(&mut self, nomad: &Nomad, sink: &Sink) {
         let Some((groups, unreadable)) = self.scan() else { return };
         // An allocation listed but unreadable this time keeps its offsets
@@ -245,7 +242,6 @@ impl Tailer {
                     break;
                 }
                 let Some((_, path)) = g.files.iter().find(|(n, _)| *n == idx) else {
-                    // The file is gone: move to the next available one
                     match g.files.iter().find(|(n, _)| *n > idx) {
                         Some((n, _)) => {
                             idx = *n;
@@ -298,7 +294,6 @@ impl Tailer {
                 }
                 pos += consumed;
                 if consumed == 0 && has_next {
-                    // End of this file: move to the next
                     idx = g.files.iter().find(|(n, _)| *n > idx).map(|(n, _)| *n).unwrap_or(idx);
                     pos = 0;
                     continue;
@@ -406,7 +401,6 @@ impl Budget {
         }
     }
 
-    /// Time left for a job's lines
     fn left(&self, job: &str) -> Duration {
         self.node.min(self.jobs.get(job).copied().unwrap_or(JOB_PATTERN_TIME))
     }
@@ -436,7 +430,6 @@ impl<'a> LinePatterns<'a> {
         }
     }
 
-    /// The first pattern that matches the text, with its captures
     fn first_match<'t>(&self, text: &'t str) -> Option<(&'a Regex, regex::Captures<'t>)> {
         let mut tried = self.list.iter().take_while(|_| Instant::now() < self.until);
         tried.find_map(|re| re.captures(text).map(|c| (&**re, c)))
@@ -475,14 +468,10 @@ fn json_attributes(obj: Map<String, Value>) -> Vec<(String, String)> {
     out
 }
 
-/// Keys whose value is the line's level
 fn is_level_key(k: &str) -> bool {
     matches!(k, "level" | "lvl" | "severity" | "log.level" | "levelname")
 }
 
-/// A log line in the logs table format: level (from JSON or from the text),
-/// attributes from JSON or from the named groups of the first pattern a
-/// plain-text line matches, and the body truncated to MAX_BODY
 /// `authKey=<value>` never leaves the node: VictoriaMetrics logs the URI of a failed admin call with
 /// it, and a job left out of logs.skip_jobs (or whose allocation Nomad did not describe) would ship it
 fn redact_auth_keys(text: String) -> String {
@@ -543,7 +532,6 @@ pub(crate) fn build_row(host: &str, service: &str, stream: &str, time: DateTime<
     }))
 }
 
-/// The first `max` bytes of a text, or fewer to end at a character boundary
 fn head(text: &str, max: usize) -> &str {
     let mut cut = text.len().min(max);
     while !text.is_char_boundary(cut) {
@@ -613,9 +601,6 @@ mod tests {
         .unwrap()
     }
 
-    /// A backlog (an allocation that wrote while the collector was down) is read as the sink takes
-    /// it: before, a pass read it all into memory, past the sink's cap, which dropped lines whose
-    /// offsets were then saved as read
     #[tokio::test]
     async fn a_backlog_is_read_as_the_sink_takes_it_and_no_line_is_lost() {
         let root = std::env::temp_dir().join(format!("atalaya-backlog-{}", std::process::id()));
@@ -649,8 +634,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A job in logs.skip_jobs is never read, not even what it writes later: its lines can carry an
-    /// admin key, and every Atalaya user reads the logs
     #[tokio::test]
     async fn the_logs_of_a_skipped_job_are_never_read() {
         let root = std::env::temp_dir().join(format!("atalaya-skip-{}", std::process::id()));
@@ -684,8 +667,6 @@ mod tests {
         assert_eq!(redact_auth_keys("nothing to see".into()), "nothing to see");
     }
 
-    /// A pass that cannot list the allocations keeps every offset: before, it dropped them all, and
-    /// the next pass read every log file again from the start
     #[tokio::test]
     async fn a_failed_listing_keeps_the_offsets() {
         let root = std::env::temp_dir().join(format!("atalaya-listing-{}", std::process::id()));

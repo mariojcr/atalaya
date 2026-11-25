@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prometheus HTTP API (PromQL) for dashboards.
-
 use axum::{
     Json, Router,
     extract::{Path, RawQuery, State},
@@ -110,10 +108,8 @@ fn prom_success(data: Value, extra: Value) -> Response {
     Json(json!({ "status": "success", "data": data, "atalaya": extra })).into_response()
 }
 
-/// A matrix result as the Prometheus API writes it, serialized straight from the evaluated series.
-/// Building it first as a serde_json::Value cost ~400 bytes per point (an array, a number and a
-/// string each): 1.4 GiB for an answer of 2.8 million points, when the points themselves take 16
-/// bytes each
+/// A matrix result as the Prometheus API writes it, serialized straight from the evaluated series:
+/// a serde_json::Value tree costs ~400 bytes per point, against 16 for the point itself
 struct MatrixJson(Vec<(promql::Labels, Vec<(i64, f64)>)>);
 
 impl Serialize for MatrixJson {
@@ -293,7 +289,6 @@ async fn prom_series(State(app): State<Shared>, RawQuery(q): RawQuery, body: Str
 mod json_tests {
     use super::*;
 
-    /// The streamed matrix is the same JSON the Value tree produced
     #[test]
     fn a_streamed_matrix_is_the_prometheus_json() {
         let labels: promql::Labels = [("__name__".to_owned(), "up".to_owned()), ("job".to_owned(), "a\"b".to_owned())].into();

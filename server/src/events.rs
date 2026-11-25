@@ -72,7 +72,6 @@ fn short(alloc: &str) -> String {
     alloc.chars().take(8).collect()
 }
 
-/// Event texts per language
 fn tr(lang: &str, key: &str) -> &'static str {
     let es = lang == "es";
     match key {
@@ -186,7 +185,6 @@ fn tr(lang: &str, key: &str) -> &'static str {
     }
 }
 
-/// A PromQL regex matching any of the values literally
 fn promql_alternation(vals: &[String]) -> String {
     vals.iter()
         .map(|v| {
@@ -325,7 +323,6 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
         None => "",
     };
 
-    // ── Allocs: first and last sample in the range ─────────────────────────
     let sql_allocs = format!(
         "SELECT s.Labels['job'] AS job, s.Labels['alloc_id'] AS alloc, s.Resource['host.name'] AS host,
                 toUnixTimestamp(min(p.Time)) AS first, toUnixTimestamp(max(p.Time)) AS last
@@ -336,7 +333,6 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
            AND p.Time >= toDateTime({{start:Int64}}) - {res} AND p.Time <= toDateTime({{end:Int64}}){alloc_cond}
          GROUP BY job, alloc, host"
     );
-    // ── Restarts: counter increments per alloc ─────────────────────────────
     let sql_restarts = format!(
         "SELECT job, alloc, host, toUnixTimestamp(Time) AS t, v - prev AS n FROM (
            SELECT s.Labels['job'] AS job, s.Labels['alloc_id'] AS alloc, s.Resource['host.name'] AS host, p.Time AS Time, p.v AS v,
@@ -352,7 +348,6 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
            WHERE 1{alloc_cond})
          WHERE prev IS NOT NULL AND v > prev AND Time >= toDateTime({{start:Int64}})"
     );
-    // ── Logs per service and bucket: total and errors ──────────────────────
     let sql_logs = format!(
         "SELECT Service AS service, toUnixTimestamp(toStartOfInterval(Time, INTERVAL {{bucket:Int64}} SECOND)) AS t,
                 count() AS n, countIf(Level IN ('ERROR', 'FATAL')) AS errors,
@@ -417,7 +412,6 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
             "title": format!("{job} · {} {}", tr(lang, "restart"), short(alloc)), "detail": if n > 1 { tr(lang, "restarts_in_bucket").replace("{n}", &n.to_string()) } else { tr(lang, "restart_detail").to_owned() } }));
     }
 
-    // Log lanes, plus error and burst events
     let mut lanes: BTreeMap<String, Vec<(i64, i64, i64)>> = BTreeMap::new();
     let mut hosts: HashMap<String, String> = HashMap::new();
     for r in &logs {
@@ -477,7 +471,6 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
         }
     }
 
-    // Real alerts in the range (from alerts.yaml), with their severity
     events.extend(app.alerts.events(start, end, lang).await);
 
     // Deploying a system job yields one new alloc, one stop and one restart per
@@ -536,7 +529,6 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
     events.sort_by_key(|e| std::cmp::Reverse(e["time"].as_i64().unwrap_or(0)));
     events.truncate(MAX_EVENTS);
 
-    // Log lanes to return: the configured ones or those with most lines
     let lane_names: Vec<String> = if cfg.log_lanes.is_empty() {
         let mut v: Vec<(&String, i64)> = lanes.iter().map(|(s, p)| (s, p.iter().map(|x| x.1).sum())).collect();
         v.sort_by_key(|x| std::cmp::Reverse(x.1));
@@ -553,7 +545,6 @@ pub async fn events(app: &App, start: i64, end: i64, service: Option<&str>, lang
         })
         .collect();
 
-    // Metric lanes
     let lanes_cfg: &[Lane] = if with_lanes { &cfg.lanes } else { &[] };
     let metric_lanes = futures::future::join_all(lanes_cfg.iter().map(|l| async move {
         let series = match app.promql.range(&l.query, start, end, bucket).await {

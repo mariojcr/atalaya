@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cloud Monitoring-style metrics: descriptors, labels and timeSeries:query.
-
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -33,7 +31,6 @@ struct DescriptorParams {
     brief: Option<String>,
 }
 
-/// Metric descriptors with their number of active series
 async fn metric_descriptors(State(app): State<Shared>, Query(p): Query<DescriptorParams>) -> ApiResult<Value> {
     if matches!(app.promql, atalaya::promql::Backend::Victoria(_)) {
         return Ok(Json(json!({ "metricDescriptors": victoria_descriptors(&app, &p.q).await? })));
@@ -65,7 +62,6 @@ struct LabelParams {
     metric: String,
 }
 
-/// Label keys of a metric with their most frequent values
 async fn labels(State(app): State<Shared>, Query(p): Query<LabelParams>) -> ApiResult<Value> {
     if matches!(app.promql, atalaya::promql::Backend::Victoria(_)) {
         return Ok(Json(json!({ "labels": victoria_labels(&app, &p.metric).await? })));

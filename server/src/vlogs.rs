@@ -81,19 +81,16 @@ impl VictoriaLogs {
             .collect())
     }
 
-    /// How many lines match
     pub async fn count(&self, filter: &str) -> Result<u64> {
         let r = self.query(format!("{filter} | stats count() as n")).await?;
         Ok(r.first().map(|v| num(&v["n"]) as u64).unwrap_or(0))
     }
 }
 
-/// A LogsQL string literal
 pub fn quote(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
-/// A regular expression that matches `s` literally (RE2)
 fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

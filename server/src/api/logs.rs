@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Log explorer: search, fields, values, context and saved searches.
-
 use axum::{
     Json, Router,
     body::Bytes,
@@ -57,7 +55,6 @@ struct LogParams {
     docs_only: bool,
 }
 
-/// Every value of a repeatable URL parameter
 fn query_all(q: &Option<String>, key: &str) -> Vec<String> {
     form_urlencoded::parse(q.as_deref().unwrap_or("").as_bytes())
         .filter(|(k, _)| k == key)
@@ -65,7 +62,6 @@ fn query_all(q: &Option<String>, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Structured `f=` filters from the URL (repeatable)
 fn log_filters(q: &Option<String>) -> Vec<String> {
     query_all(q, "f")
 }
@@ -127,7 +123,6 @@ async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq
     if p.docs_only {
         return Ok(Json(json!({ "start": start, "end": end, "logs": rows })));
     }
-    // Counts per interval for the histogram
     let step = ((end - start) / 120).max(1);
     let mut hp = params.clone();
     hp.push(("step".into(), step.to_string()));
@@ -156,7 +151,6 @@ async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq
             &params[..2],
         )
         .await?;
-    // Histogram breakdown by one field
     let breakdown = if p.breakdown.is_empty() {
         Value::Null
     } else {
@@ -181,8 +175,6 @@ async fn logs(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq
     ))
 }
 
-/// Fields present in the logs matching the filters, with counts and their most
-/// frequent values (the Discover-style fields panel)
 async fn log_fields(State(app): State<Shared>, Query(p): Query<LogParams>, RawQuery(rq): RawQuery) -> ApiResult<Value> {
     let (start, end) = log_range(p.start, p.end, p.range.as_deref())?;
     if let Some(vl) = &app.vlogs {
@@ -223,7 +215,6 @@ struct CountsParams {
 
 /// At most this many points per series, as in the PromQL API
 const MAX_POINTS: i64 = 11_000;
-/// At most this many `by` fields
 const MAX_BY: usize = 3;
 
 /// Line counts for dashboards, as series in the PromQL API's shape: grouped by
@@ -410,14 +401,10 @@ async fn log_context(State(app): State<Shared>, Query(p): Query<ContextParams>) 
     Ok(Json(json!({ "before": before.into_iter().rev().collect::<Vec<_>>(), "after": after })))
 }
 
-// ── VictoriaLogs ─────────────────────────────────────────────────────────────
-
-/// LogsQL filters joined, the empty ones left out
 fn join(parts: &[String]) -> String {
     parts.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" ")
 }
 
-/// A regular expression matching `s` literally
 fn regex_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -429,7 +416,6 @@ fn regex_literal(s: &str) -> String {
     out
 }
 
-/// Unix milliseconds as RFC 3339, for a LogsQL time range
 fn rfc3339_ms(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .unwrap_or_default()
@@ -437,7 +423,6 @@ fn rfc3339_ms(ms: i64) -> String {
         .to_string()
 }
 
-/// Seconds of a stats bucket's `_time`
 fn bucket(r: &Value) -> i64 {
     vlogs::millis(&r["_time"]).div_euclid(1000)
 }
@@ -569,7 +554,6 @@ async fn vl_count_rows(vl: &vlogs::VictoriaLogs, filter: &str, by: &[String], to
     if tops.is_empty() {
         return Ok(vec![]);
     }
-    // Only the top groups, bucketed
     let groups: Vec<String> = tops
         .iter()
         .map(|r| {
@@ -588,8 +572,6 @@ async fn vl_count_rows(vl: &vlogs::VictoriaLogs, filter: &str, by: &[String], to
     out.sort_by_key(|r| r["ts"].as_i64());
     Ok(out)
 }
-
-// ── Saved searches (log explorer) ────────────────────────────────────────────
 
 async fn sv_list(State(app): State<Shared>) -> ApiResult<Value> {
     Ok(Json(json!({ "searches": notebooks::list(&app.data.join("searches"))?["notebooks"] })))
@@ -642,8 +624,8 @@ mod tests {
     fn count_series_fill_the_buckets_without_lines() {
         let by = ["host".to_owned()];
         let rows = [
-            json!({"ts": 1200, "k0": "Thor", "n": 3}),
-            json!({"ts": 1800, "k0": "Thor", "n": 1}),
+            json!({"ts": 1200, "k0": "node-1", "n": 3}),
+            json!({"ts": 1800, "k0": "node-1", "n": 1}),
             json!({"ts": 1800, "k0": "Odin", "n": 2}),
         ];
         // Buckets start at the one holding `start` and stop before `end`
@@ -651,7 +633,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                json!({"labels": {"host": "Thor"}, "points": [[1200, 3], [1800, 1]]}),
+                json!({"labels": {"host": "node-1"}, "points": [[1200, 3], [1800, 1]]}),
                 json!({"labels": {"host": "Odin"}, "points": [[1200, 0], [1800, 2]]}),
             ]
         );
@@ -663,7 +645,7 @@ mod tests {
             "the bucket holding start, then MAX_POINTS more"
         );
         // Without a step: one count per group, at the end
-        let got = count_series(&by, &[json!({"k0": "Thor", "n": 4})], 0, 3600, None);
-        assert_eq!(got, [json!({"labels": {"host": "Thor"}, "points": [[3600, 4]]})]);
+        let got = count_series(&by, &[json!({"k0": "node-1", "n": 4})], 0, 3600, None);
+        assert_eq!(got, [json!({"labels": {"host": "node-1"}, "points": [[3600, 4]]})]);
     }
 }

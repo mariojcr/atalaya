@@ -71,8 +71,6 @@ pub struct Scrape {
 }
 
 impl Scrape {
-    /// Adds a sample, and its metric's descriptor the first time; a value that
-    /// is not finite is skipped
     pub fn put(&mut self, metric: &str, kind: Kind, unit: &str, help: &str, labels: Labels, value: f64) {
         if !value.is_finite() {
             return;
@@ -91,7 +89,6 @@ impl Scrape {
     }
 }
 
-/// A Prometheus metric name: `[a-zA-Z_:][a-zA-Z0-9_:]*`
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == ':') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
@@ -122,7 +119,6 @@ fn parse_sample(line: &str) -> Option<Sample> {
     let rest = if let Some(body) = rest.strip_prefix('{') {
         let mut chars = body.char_indices().peekable();
         let end = loop {
-            // spaces and commas
             while let Some(&(_, c)) = chars.peek() {
                 if c == ',' || c.is_whitespace() {
                     chars.next();
@@ -143,7 +139,7 @@ fn parse_sample(line: &str) -> Option<Sample> {
                 key.push(c);
                 chars.next();
             }
-            chars.next(); // '='
+            chars.next();
             if chars.next().map(|(_, c)| c) != Some('"') {
                 return None;
             }

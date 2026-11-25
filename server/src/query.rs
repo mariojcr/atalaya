@@ -569,7 +569,6 @@ pub async fn run(ch: &ClickHouse, db: &str, q: &TimeSeriesQuery) -> Result<Query
 
     let rows = ch.rows(&sql, &params).await?;
 
-    // Group rows into series
     let mut out: BTreeMap<String, TimeSeries> = BTreeMap::new();
     for r in rows {
         let ts = r["ts"].as_i64().unwrap_or(0);

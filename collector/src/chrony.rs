@@ -55,7 +55,6 @@ const TRACKING_LEN: usize = 76;
 const SOURCESTATS_LEN: usize = 56;
 const SERVER_STATS_LEN: usize = 168;
 
-/// IPAddr families
 const FAMILY_UNSPEC: u16 = 0;
 const FAMILY_INET4: u16 = 1;
 const FAMILY_INET6: u16 = 2;
@@ -72,13 +71,11 @@ const TIMEOUT: Duration = Duration::from_millis(500);
 /// A whole reading, whatever answers on the command port
 const BUDGET: Duration = Duration::from_secs(3);
 
-/// Upper bound on the sources read in one pass
 const MAX_SOURCES: u32 = 256;
 
 #[derive(Debug)]
 enum Fail {
     Io(io::Error),
-    /// chronyd answered with this status instead of the data
     Status(u16),
     Bad(&'static str),
 }
@@ -165,7 +162,6 @@ fn request(command: u16, sequence: u32, data: &[u8], reply_len: usize) -> Vec<u8
     p
 }
 
-/// Checks a reply's header and returns its data
 fn parse_reply(b: &[u8], command: u16, reply: u16, reply_len: usize) -> Result<&[u8], Fail> {
     if b.len() < REPLY_HEADER {
         return Err(Fail::Bad("shorter than a header"));
@@ -189,7 +185,6 @@ fn parse_reply(b: &[u8], command: u16, reply: u16, reply_len: usize) -> Result<&
 struct Client {
     sock: UdpSocket,
     sequence: u32,
-    /// End of the reading's budget
     deadline: Instant,
 }
 
@@ -212,7 +207,6 @@ impl Client {
         })
     }
 
-    /// Sends a command and returns the data of its reply
     fn call(&mut self, command: u16, data: &[u8], reply: u16, reply_len: usize) -> Result<Vec<u8>, Fail> {
         // Datagrams that are not the reply do not extend the wait, and nothing
         // is sent once the reading's budget is spent
@@ -243,7 +237,6 @@ impl Client {
     }
 }
 
-/// tracking: the state of the system clock
 fn tracking(o: &mut Scrape, d: &[u8], now: f64) {
     let correction = float(d, 40);
     let ref_time = timespec(d, 28);
@@ -363,7 +356,6 @@ fn sourcestats(o: &mut Scrape, d: &[u8], l: &Labels) {
     );
 }
 
-/// serverstats: what chronyd served as an NTP server
 fn server_stats(o: &mut Scrape, d: &[u8]) {
     for (metric, at, help) in [
         ("host_chrony_server_ntp_requests_total", 0, "Valid NTP requests received."),

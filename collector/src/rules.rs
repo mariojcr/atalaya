@@ -131,14 +131,12 @@ impl Rules {
     pub fn apply(&mut self, service: &str, target: &str, mut s: Scrape) -> Scrape {
         let now = Instant::now();
         self.prune_slow(now);
-        // The service's allowlist (if any) is evaluated before everything else
         let allowed: Vec<&Vec<Regex>> = self.allow.iter().filter(|(svc, _)| svc.is_match(service)).map(|(_, k)| k).collect();
         if !allowed.is_empty() {
             let pass = |metric: &str| allowed.iter().any(|keep| keep.iter().any(|r| r.is_match(metric)));
             s.scalars.retain(|x| pass(&x.metric));
             s.distributions.retain(|x| pass(&x.metric));
         }
-        // Slow metrics not yet due for this source
         let mut skip_slow = |metric: &str| -> bool {
             let Some((interval, res)) = &self.slow else { return false };
             if !res.iter().any(|r| r.is_match(metric)) {
@@ -171,7 +169,6 @@ impl Rules {
         s.scalars.retain(|x| keep(&x.metric, &x.labels));
         s.distributions.retain(|x| keep(&x.metric, &x.labels));
 
-        // Aggregation: sum the series that differ only in the removed labels
         if !self.aggregate.is_empty() {
             let mut merged: Vec<Scalar> = Vec::with_capacity(s.scalars.len());
             let mut index: HashMap<(String, Labels), usize> = HashMap::new();

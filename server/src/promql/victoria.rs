@@ -89,13 +89,11 @@ impl VictoriaMetrics {
         })
     }
 
-    /// Basic auth on every request (vmselect's -httpAuth.username and -httpAuth.password)
     pub fn with_basic_auth(mut self, user: String, password: String) -> Self {
         self.auth = Some((user, password));
         self
     }
 
-    /// The periods VictoriaMetrics downsamples with (`parse_downsampling`)
     pub fn with_downsampling(mut self, periods: Vec<(i64, i64)>) -> Self {
         self.downsampling = periods;
         self
@@ -195,7 +193,6 @@ impl VictoriaMetrics {
         Ok(data.as_array().map(|a| a.iter().map(labels).collect()).unwrap_or_default())
     }
 
-    /// Metric names, for the metrics explorer
     pub async fn metric_names(&self, from: i64) -> Result<Vec<String>> {
         self.label_values("__name__", &[], from).await
     }
@@ -233,7 +230,6 @@ fn point(v: &Value) -> Option<(i64, f64)> {
     Some((t.floor() as i64, x))
 }
 
-/// A vector or matrix answer as series with their points
 fn matrix(data: &Value) -> Result<Output> {
     let result = data["result"].as_array().ok_or_else(|| anyhow!("answer without result"))?;
     let series = result
@@ -352,7 +348,7 @@ mod tests {
             "the oldest possible time: the coarsest interval, no overflow"
         );
         // 6 h from 60 days ago at a 1-minute step: a window of 4 samples of 10 minutes, as the
-        // engine does on its 10-minute tier (with 15 s it was 1 minute: most steps came out empty)
+        // engine does on its 10-minute tier
         let res = vm.resolution(now - 60 * 86400, now);
         assert_eq!(expand_macros("rate(x[$__rate_interval])", 60, res, 6 * 3600), "rate(x[2400s])");
         assert_eq!(VictoriaMetrics::new("http://127.0.0.1:1").unwrap().resolution(now - 60 * 86400, now), RES);

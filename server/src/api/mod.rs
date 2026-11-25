@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Mario Campos <https://github.com/mariojcr>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Server HTTP routes, grouped by area.
-
 mod alerts;
 mod assets;
 mod dashboards;
@@ -57,7 +55,6 @@ pub(crate) fn lang_of(p: &Option<String>) -> &'static str {
     }
 }
 
-/// All API and UI routes
 pub fn router(app: Shared) -> Router {
     Router::new()
         .merge(assets::routes())

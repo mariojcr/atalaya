@@ -26,11 +26,9 @@ use super::Labels;
 /// Retention of each tier (must match the schema TTLs)
 pub const RAW_DAYS: i64 = 7;
 pub const ONE_MINUTE_DAYS: i64 = 42;
-/// Maximum series per selector
 const MAX_SERIES: usize = 20_000;
 /// Series ids per sample query: ~45 KiB of URL (see `samples`)
 const IDS_PER_QUERY: usize = 2_000;
-/// Chunks of one selector read at the same time
 const CHUNKS_AT_ONCE: usize = 4;
 
 /// What one chunk of ids brings: scalar rows, distribution rows and staleness markers per id
@@ -128,7 +126,6 @@ impl Catalog {
     }
 }
 
-/// A series as PromQL sees it
 pub struct SeriesRef {
     pub labels: Labels,
     id: u64,
@@ -148,7 +145,6 @@ pub struct Samples {
     pub stale: Vec<i64>,
 }
 
-/// Resolved series rows of a query (cached for 60 s)
 type SeriesList = Arc<Vec<serde_json::Value>>;
 /// What is wanted from a stored metric: PromQL name, kind and field
 type Wanted = (String, Kind, Option<Field>);
@@ -176,8 +172,7 @@ pub struct Store {
     db: String,
     catalog: Mutex<Option<(Instant, Arc<Catalog>)>>,
     /// `series` rows per filter: every dashboard query and alert rule repeats
-    /// the same selectors and the list rarely changes (5 min; at 60 s the
-    /// alerts, evaluated every 30 s, missed it every other round)
+    /// the same selectors and the list rarely changes
     series_cache: Mutex<HashMap<String, (Instant, SeriesList)>>,
 }
 const SERIES_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -559,9 +554,8 @@ impl Store {
         let has_dist = series.iter().any(|s| s.kind == Kind::Distribution);
         let has_scalar = series.iter().any(|s| s.kind != Kind::Distribution);
         let res = tier.res();
-        // The ids go in the URL (param_ids), and ClickHouse rejects a form field longer than
-        // 128 KiB: past ~5,700 series a selector failed with a 502 (and reqwest refuses a URL past
-        // 64 KiB before that). Bounded chunks, a few at a time, keep each query and its URL small
+        // The ids go in the URL (param_ids): ClickHouse rejects a form field longer than 128 KiB
+        // and reqwest a URL past 64 KiB, so they are read in bounded chunks, a few at a time
         let mut scalar: HashMap<u64, Vec<ScalarRow>> = HashMap::new();
         let mut dist: HashMap<u64, Vec<DistRow>> = HashMap::new();
         let mut stale: HashMap<u64, Vec<i64>> = HashMap::new();
@@ -619,7 +613,6 @@ impl Store {
             .collect())
     }
 
-    /// The rows of one chunk of series ids: scalar points, distributions and staleness markers
     #[allow(clippy::too_many_arguments)]
     async fn samples_chunk(
         &self,
@@ -666,7 +659,7 @@ impl Store {
             self.ch.bytes(&stale_sql, &params, &[]),
         );
         // id → times it went stale. Without them (a schema from before the
-        // stale table) series only end with the lookback, as before.
+        // stale table) series only end with the lookback.
         let mut stale: HashMap<u64, Vec<i64>> = HashMap::new();
         match c {
             Ok(body) => {
@@ -701,7 +694,6 @@ impl Store {
         Ok((scalar, dist, stale))
     }
 
-    /// Values of a label among the series matching the selectors
     pub async fn label_values(&self, label: &str, selectors: &[(Option<String>, Matchers)], from: i64) -> Result<Vec<String>> {
         let mut vals = std::collections::BTreeSet::new();
         if label == "__name__" && selectors.is_empty() {
@@ -752,11 +744,6 @@ impl Store {
     }
 }
 
-/// Queries for the samples: scalar rows of (SeriesId, t, gauge value, counter
-/// value, minimum of its last bucket) and distribution rows of (SeriesId, t,
-/// count, sum, buckets). With `group` above the tier resolution a row is a group
-/// of buckets, and scalar rows add their first bucket: the time of its last
-/// sample and its minimum.
 /// About how many samples reading these series over (from, to] brings: one per scrape on the raw
 /// tier (15 s), one per bucket or group on the others, and twice that for counters (their bucket
 /// minimum at its start)
@@ -780,10 +767,7 @@ fn sample_queries(db: &str, tier: Tier, group: i64) -> (String, String) {
     let res = tier.res();
     let sfx = tier.suffix();
     // A raw point is a sample at its Time, but an aggregated row is a bucket that
-    // starts at its Time: the one starting at `to` holds nothing from before it (a
-    // sample exactly at `to` at most), and reading it put up to a whole bucket
-    // from after the window into the last step (an hourly bar on the 10-minute
-    // tier also counted the next 10 minutes)
+    // starts at its Time: the one starting at `to` would bring data from after the window
     let upper = if tier == Tier::Raw { "<=" } else { "<" };
     let filter = format!(
         "Metric IN {{metrics:Array(String)}} AND SeriesId IN {{ids:Array(UInt64)}}
@@ -839,7 +823,6 @@ fn sample_queries(db: &str, tier: Tier, group: i64) -> (String, String) {
     }
 }
 
-/// Scalar rows of `sample_queries` per series
 fn read_scalar_rows(body: &[u8], tier: Tier, grouped: bool) -> Result<HashMap<u64, Vec<ScalarRow>>> {
     let res = tier.res();
     let mut out: HashMap<u64, Vec<ScalarRow>> = HashMap::new();
@@ -885,11 +868,8 @@ fn read_scalar_rows(body: &[u8], tier: Tier, grouped: bool) -> Result<HashMap<u6
 /// In the aggregated tiers a row also starts with its first bucket's minimum (the
 /// counter's value at its first sample), one second after that bucket starts:
 /// windows are open at their start, so a bucket aligned with a step would
-/// otherwise start in the window before. With only each row's end, a window
-/// (t - range, t] began at the end of its first row and only extrapolated what
-/// the counter gained before (half the window with hourly steps on the
-/// 10-minute tier, where a row is half an hour), and a new series' first row
-/// was its baseline: what it counted in its first bucket was lost.
+/// otherwise start in the window before. Without it, a window would begin at
+/// the end of its first row and lose what the counter gained within it.
 fn counter_samples(rows: &[ScalarRow], span: i64) -> (Vec<i64>, Vec<f64>) {
     let mut ts = Vec::with_capacity(2 * rows.len());
     let mut vals = Vec::with_capacity(2 * rows.len());
@@ -1102,8 +1082,6 @@ mod counter_tests {
     #[test]
     fn hourly_increase_counts_the_first_bucket_of_a_new_counter() {
         let got = hourly_increase(&new_series(), hm(13, 0, 0), hm(16, 0, 0));
-        // 14:00 had a single row (no value, a bar of 0) and the burst early in
-        // the 15:00 and 16:00 hours was outside their windows (0 and 2 × 0.34)
         assert_close(
             &got,
             &[
@@ -1127,7 +1105,6 @@ mod counter_tests {
             rows.push(half_hour(r.t, base(r.c), base(r.mn), (r.first.0, base(r.first.1).max(1000.0))));
         }
         let got = hourly_increase(&rows, hm(14, 0, 0), hm(16, 0, 0));
-        // It read only the second half of each hour, twice: 3.32, 0 and 0.68
         assert_close(&got, &[(hm(14, 0, 0), Some(1.66)), (hm(15, 0, 0), Some(0.06)), (hm(16, 0, 0), Some(0.84))]);
     }
 }
@@ -1302,8 +1279,6 @@ mod chunk_tests {
         (format!("http://{addr}/"), longest)
     }
 
-    /// A selector over more series than fit in one URL is read in chunks: before, past ~5,700 ids
-    /// the query failed (ClickHouse rejects the param_ids field, reqwest a URL over 64 KiB)
     #[tokio::test]
     async fn a_selector_over_many_series_is_read_in_chunks() {
         let (url, longest) = fake_clickhouse().await;
