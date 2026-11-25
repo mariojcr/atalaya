@@ -25,6 +25,8 @@ clickhouse:                    # ClickHouse, Victoria or both: at least one
 victoria:                      # VictoriaMetrics and VictoriaLogs (see "Sending to Victoria")
   metrics_url: http://victoriametrics:8428   # points, to /api/v1/import
   logs_url: http://victorialogs:9428         # log lines, to /insert/jsonline
+  user: writer                 # optional: basic auth (-httpAuth) for both, with the password in
+                               # VICTORIA_PASSWORD; never in the URLs, which are refused with credentials
   flush_interval: 15s          # used only without clickhouse (default 15s)
   max_spool_mb: 1024           # disk queue limit, split between metrics and logs (default 1024)
 

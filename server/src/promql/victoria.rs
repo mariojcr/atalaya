@@ -35,6 +35,8 @@ const RES: i64 = 15;
 pub struct VictoriaMetrics {
     http: reqwest::Client,
     url: String,
+    /// vmselect's -httpAuth (user, password)
+    auth: Option<(String, String)>,
     /// (age, interval) in seconds, by age: data older than `age` keeps one sample per `interval`
     downsampling: Vec<(i64, i64)>,
 }
@@ -82,8 +84,15 @@ impl VictoriaMetrics {
                 .pool_idle_timeout(Duration::from_secs(5))
                 .build()?,
             url: url.trim_end_matches('/').to_owned(),
+            auth: None,
             downsampling: Vec::new(),
         })
+    }
+
+    /// Basic auth on every request (vmselect's -httpAuth.username and -httpAuth.password)
+    pub fn with_basic_auth(mut self, user: String, password: String) -> Self {
+        self.auth = Some((user, password));
+        self
     }
 
     /// The periods VictoriaMetrics downsamples with (`parse_downsampling`)
@@ -106,13 +115,11 @@ impl VictoriaMetrics {
 
     /// GET <path> with the parameters; the `data` of a successful answer
     async fn get(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
-        let resp = self
-            .http
-            .get(format!("{}{path}", self.url))
-            .query(params)
-            .send()
-            .await
-            .map_err(|e| anyhow!(Unavailable(format!("unreachable: {e}"))))?;
+        let mut req = self.http.get(format!("{}{path}", self.url)).query(params);
+        if let Some((user, password)) = &self.auth {
+            req = req.basic_auth(user, Some(password));
+        }
+        let resp = req.send().await.map_err(|e| anyhow!(Unavailable(format!("unreachable: {e}"))))?;
         let status = resp.status();
         let body = resp.text().await.map_err(|e| anyhow!(Unavailable(format!("reading the answer: {e}"))))?;
         if status.is_server_error() || status.as_u16() == 429 {
@@ -255,6 +262,54 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A VictoriaMetrics that answers only with the right basic auth, and 401 otherwise
+    async fn guarded(expected: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = s.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let ok = head.lines().any(|l| {
+                        l.split_once(':')
+                            .is_some_and(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.trim() == expected)
+                    });
+                    let body = r#"{"status":"success","data":{"resultType":"scalar","result":[1700000000,"1"]}}"#;
+                    let resp = if ok {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 12\r\nconnection: close\r\n\r\nUnauthorized".to_owned()
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn queries_carry_the_basic_auth_vmselect_asks_for() {
+        let url = guarded("Basic cmVhZGVyOnMzY3JldA==").await; // reader:s3cret
+        let vm = VictoriaMetrics::new(&url).unwrap().with_basic_auth("reader".into(), "s3cret".into());
+        vm.instant("1", 1700000000).await.unwrap();
+        let anonymous = VictoriaMetrics::new(&url).unwrap();
+        let err = anonymous.instant("1", 1700000000).await.err().expect("an anonymous query has to fail");
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+    }
 
     #[test]
     fn prometheus_answers_become_the_engines_output() {

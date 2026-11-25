@@ -28,6 +28,8 @@
 //!   ATALAYA_REFRESH           seconds between refreshes of the pages that are not dashboards (60)
 //!   ATALAYA_VICTORIA_METRICS_URL  VictoriaMetrics (http://host:8428): PromQL runs there instead of on
 //!                             ClickHouse, for the dashboards, the home page, the timeline and the alert rules
+//!   ATALAYA_VICTORIA_USER         basic auth user for it (vmselect's -httpAuth.username), with its
+//!   ATALAYA_VICTORIA_PASSWORD     password; never in the URL, which is logged
 //!   ATALAYA_VICTORIA_DOWNSAMPLING its -downsampling.period (7d:1m,42d:10m), so rate windows over old
 //!                             data are as wide as its samples are apart
 //!   ATALAYA_VICTORIA_LOGS_URL     VictoriaLogs (http://host:9428): logs are read there instead of from
@@ -82,9 +84,21 @@ async fn main() -> anyhow::Result<()> {
     let promql = if vm_url.is_empty() {
         promql::Backend::Native(Box::new(promql::Engine::new(promql::store::Store::new(ch.clone(), db.clone()))))
     } else {
+        let parsed = reqwest::Url::parse(&vm_url).context("ATALAYA_VICTORIA_METRICS_URL")?;
+        anyhow::ensure!(
+            parsed.username().is_empty() && parsed.password().is_none(),
+            "ATALAYA_VICTORIA_METRICS_URL carries credentials: use ATALAYA_VICTORIA_USER and ATALAYA_VICTORIA_PASSWORD"
+        );
         tracing::info!("PromQL on VictoriaMetrics at {vm_url}");
         let periods = promql::victoria::parse_downsampling(&env("ATALAYA_VICTORIA_DOWNSAMPLING", "")).context("ATALAYA_VICTORIA_DOWNSAMPLING")?;
-        promql::Backend::Victoria(promql::victoria::VictoriaMetrics::new(&vm_url)?.with_downsampling(periods))
+        let mut vm = promql::victoria::VictoriaMetrics::new(&vm_url)?.with_downsampling(periods);
+        let user = env("ATALAYA_VICTORIA_USER", "");
+        if !user.is_empty() {
+            let password = std::env::var("ATALAYA_VICTORIA_PASSWORD").unwrap_or_default();
+            anyhow::ensure!(!password.is_empty(), "ATALAYA_VICTORIA_USER is set and ATALAYA_VICTORIA_PASSWORD is empty");
+            vm = vm.with_basic_auth(user, password);
+        }
+        promql::Backend::Victoria(vm)
     };
     let vlogs = if vl_url.is_empty() {
         None
